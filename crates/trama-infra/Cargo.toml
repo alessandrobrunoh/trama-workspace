@@ -1,0 +1,17 @@
+[package]
+name = "trama-infra"
+description = "Infrastructure adapters: Claude Code stream-json driver, git, runners, MCP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+trama-domain = { path = "../trama-domain" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+async-channel = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "trama-protocol"
+description = "Versioned IPC protocol between desktop UI, daemon and remote runner."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+trama-domain = { path = "../trama-domain" }
+serde = { workspace = true }
+serde_json = { workspace = true }

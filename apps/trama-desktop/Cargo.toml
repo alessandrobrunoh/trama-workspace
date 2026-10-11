@@ -1,0 +1,16 @@
+[package]
+name = "trama-desktop"
+description = "TramaWorkspace desktop app (GPUI Kit)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "TramaWorkspace"
+path = "src/main.rs"
+
+[dependencies]
+trama-domain = { path = "../../crates/trama-domain" }
+serde_json = { workspace = true }
+async-channel = { workspace = true }

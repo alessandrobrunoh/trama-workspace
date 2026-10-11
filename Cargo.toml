@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+repository = "https://github.com/alessandrobrunoh/trama-workspace"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+async-channel = "2"
+ulid = { version = "1", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+
+# GPUI is slow unoptimized; optimize dependencies in dev builds.
+[profile.dev.package."*"]
+opt-level = 2

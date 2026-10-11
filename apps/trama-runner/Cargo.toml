@@ -1,0 +1,10 @@
+[package]
+name = "trama-runner"
+description = "Remote execution daemon (static binary, RPC over SSH stdio). Phase 4."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }

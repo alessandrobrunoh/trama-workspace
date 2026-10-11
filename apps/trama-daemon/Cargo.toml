@@ -1,0 +1,13 @@
+[package]
+name = "trama-daemon"
+description = "Local session manager: owns agent processes, survives UI restarts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+trama-domain = { path = "../../crates/trama-domain" }
+trama-protocol = { path = "../../crates/trama-protocol" }
+serde_json = { workspace = true }
+tokio = { workspace = true }
