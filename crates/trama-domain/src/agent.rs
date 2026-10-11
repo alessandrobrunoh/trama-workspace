@@ -149,3 +149,157 @@ pub trait AgentAdapter: Send + Sync {
     async fn interrupt(&self, session: &AgentSession) -> Result<()>;
     async fn shutdown(&self, session: &AgentSession) -> Result<()>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip<T>(value: &T) -> T
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let json = serde_json::to_string(value).unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    fn assert_stable<T>(value: &T, expected: &str)
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let json = serde_json::to_string(value).unwrap();
+        assert_eq!(json, expected, "stable json shape");
+        let back: T = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(value).unwrap()
+        );
+        let again = serde_json::to_string(&roundtrip(value)).unwrap();
+        assert_eq!(again, expected);
+    }
+
+    #[test]
+    fn agent_event_serde_roundtrip_every_variant() {
+        assert_stable(
+            &AgentEvent::SessionStarted {
+                external_session_id: Some("ext-1".into()),
+                model: Some("claude".into()),
+            },
+            r#"{"type":"session_started","external_session_id":"ext-1","model":"claude"}"#,
+        );
+        assert_stable(
+            &AgentEvent::SessionStarted {
+                external_session_id: None,
+                model: None,
+            },
+            r#"{"type":"session_started","external_session_id":null,"model":null}"#,
+        );
+        assert_stable(
+            &AgentEvent::TextDelta {
+                text: "hello".into(),
+            },
+            r#"{"type":"text_delta","text":"hello"}"#,
+        );
+        assert_stable(
+            &AgentEvent::ReasoningDelta {
+                text: "think".into(),
+            },
+            r#"{"type":"reasoning_delta","text":"think"}"#,
+        );
+        assert_stable(
+            &AgentEvent::ToolCallStarted {
+                tool_use_id: "t1".into(),
+                name: "bash".into(),
+                input_json: serde_json::json!({"cmd": "ls"}),
+            },
+            r#"{"type":"tool_call_started","tool_use_id":"t1","name":"bash","input_json":{"cmd":"ls"}}"#,
+        );
+        assert_stable(
+            &AgentEvent::ToolCallFinished {
+                tool_use_id: "t1".into(),
+                output_json: serde_json::json!("ok"),
+                is_error: false,
+            },
+            r#"{"type":"tool_call_finished","tool_use_id":"t1","output_json":"ok","is_error":false}"#,
+        );
+        assert_stable(
+            &AgentEvent::ApprovalRequested {
+                request_id: "r1".into(),
+                tool_name: "edit".into(),
+                input_json: serde_json::json!({"path": "a.rs"}),
+            },
+            r#"{"type":"approval_requested","request_id":"r1","tool_name":"edit","input_json":{"path":"a.rs"}}"#,
+        );
+        assert_stable(
+            &AgentEvent::SubagentStarted {
+                parent_tool_use_id: Some("t1".into()),
+                label: Some("explore".into()),
+            },
+            r#"{"type":"subagent_started","parent_tool_use_id":"t1","label":"explore"}"#,
+        );
+        assert_stable(
+            &AgentEvent::SubagentFinished {
+                parent_tool_use_id: None,
+            },
+            r#"{"type":"subagent_finished","parent_tool_use_id":null}"#,
+        );
+        assert_stable(
+            &AgentEvent::UsageReported {
+                report: UsageReport {
+                    model: "claude".into(),
+                    input_tokens: 10,
+                    output_tokens: 4,
+                    cache_read_tokens: 1,
+                    cache_write_tokens: 2,
+                },
+            },
+            r#"{"type":"usage_reported","report":{"model":"claude","input_tokens":10,"output_tokens":4,"cache_read_tokens":1,"cache_write_tokens":2}}"#,
+        );
+        assert_stable(
+            &AgentEvent::TurnCompleted {
+                num_turns: 3,
+                cost_usd_micros: Some(42),
+            },
+            r#"{"type":"turn_completed","num_turns":3,"cost_usd_micros":42}"#,
+        );
+        assert_stable(
+            &AgentEvent::Failed {
+                message: "boom".into(),
+            },
+            r#"{"type":"failed","message":"boom"}"#,
+        );
+    }
+
+    #[test]
+    fn session_config_and_related_enums_roundtrip() {
+        let config = SessionConfig {
+            cwd: PathBuf::from("/tmp/ws"),
+            model: Some("opus".into()),
+            permission_mode: PermissionMode::AcceptEdits,
+            allowed_tools: vec!["bash".into()],
+            disallowed_tools: vec![],
+            extra_dirs: vec![PathBuf::from("/tmp/extra")],
+            mcp_config_path: None,
+            append_system_prompt: Some("be brief".into()),
+            max_turns: Some(8),
+            env: BTreeMap::from([("FOO".into(), "bar".into())]),
+            resume_external_session: None,
+        };
+        let back = roundtrip(&config);
+        assert_eq!(back.cwd, config.cwd);
+        assert_eq!(back.permission_mode, PermissionMode::AcceptEdits);
+        assert_eq!(roundtrip(&AgentKind::ClaudeCode), AgentKind::ClaudeCode);
+        assert_eq!(roundtrip(&AgentKind::Acp), AgentKind::Acp);
+        assert_eq!(
+            roundtrip(&ApprovalDecision::AllowOnce),
+            ApprovalDecision::AllowOnce
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentKind::ClaudeCode).unwrap(),
+            r#""claude_code""#
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionMode::Bypass).unwrap(),
+            r#""bypass""#
+        );
+    }
+}

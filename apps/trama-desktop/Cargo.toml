@@ -14,3 +14,4 @@ path = "src/main.rs"
 trama-domain = { path = "../../crates/trama-domain" }
 serde_json = { workspace = true }
 async-channel = { workspace = true }
+gpui-kit = "=0.7.1"

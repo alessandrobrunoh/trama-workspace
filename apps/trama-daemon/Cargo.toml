@@ -11,3 +11,4 @@ trama-domain = { path = "../../crates/trama-domain" }
 trama-protocol = { path = "../../crates/trama-protocol" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+thiserror = { workspace = true }

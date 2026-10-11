@@ -87,3 +87,71 @@ pub trait ExecutionRuntime: Send + Sync {
     async fn list_dir(&self, path: &Path) -> Result<Vec<DirEntry>>;
     async fn watch(&self, path: &Path, events: Sender<WatchEvent>) -> Result<WatchHandle>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_stable<T>(value: &T, expected: &str)
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let json = serde_json::to_string(value).unwrap();
+        assert_eq!(json, expected, "stable json shape");
+        let back: T = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(value).unwrap()
+        );
+    }
+
+    #[test]
+    fn exec_spec_serde_roundtrip() {
+        let spec = ExecSpec {
+            argv: vec!["git".into(), "status".into()],
+            cwd: PathBuf::from("/tmp/work"),
+            env: BTreeMap::from([("GIT_DIR".into(), "/tmp/work/.git".into())]),
+            pty: true,
+        };
+        assert_stable(
+            &spec,
+            r#"{"argv":["git","status"],"cwd":"/tmp/work","env":{"GIT_DIR":"/tmp/work/.git"},"pty":true}"#,
+        );
+
+        let defaults: ExecSpec = serde_json::from_str(r#"{"argv":["true"],"cwd":"/"}"#).unwrap();
+        assert!(defaults.env.is_empty());
+        assert!(!defaults.pty);
+    }
+
+    #[test]
+    fn exec_event_serde_roundtrip_every_variant() {
+        assert_stable(
+            &ExecEvent::Started { pid: Some(42) },
+            r#"{"type":"started","pid":42}"#,
+        );
+        assert_stable(
+            &ExecEvent::Started { pid: None },
+            r#"{"type":"started","pid":null}"#,
+        );
+        assert_stable(
+            &ExecEvent::Stdout {
+                bytes: b"hello".to_vec(),
+            },
+            r#"{"type":"stdout","bytes":[104,101,108,108,111]}"#,
+        );
+        assert_stable(
+            &ExecEvent::Stderr {
+                bytes: vec![1, 2, 3],
+            },
+            r#"{"type":"stderr","bytes":[1,2,3]}"#,
+        );
+        assert_stable(
+            &ExecEvent::Exit { code: Some(0) },
+            r#"{"type":"exit","code":0}"#,
+        );
+        assert_stable(
+            &ExecEvent::Exit { code: None },
+            r#"{"type":"exit","code":null}"#,
+        );
+    }
+}
