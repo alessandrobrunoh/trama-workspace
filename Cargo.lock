@@ -7099,10 +7099,17 @@ dependencies = [
 name = "trama-daemon"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
+ "async-trait",
+ "chrono",
+ "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "trama-db",
  "trama-domain",
+ "trama-infra",
  "trama-protocol",
 ]
 
@@ -7129,7 +7136,9 @@ dependencies = [
  "async-channel",
  "gpui-kit",
  "serde_json",
+ "tokio",
  "trama-domain",
+ "trama-protocol",
 ]
 
 [[package]]

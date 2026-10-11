@@ -60,7 +60,7 @@ where
                             &out_tx,
                             &mut subscriptions,
                             &shutdown,
-                        ) {
+                        ).await {
                             Ok(ConnectionControl::Continue) => {}
                             Ok(ConnectionControl::Close) => break,
                             Err(err) => {
@@ -109,7 +109,7 @@ async fn write_msg<W: AsyncWrite + Unpin>(writer: &mut W, msg: &DaemonMessage) -
     Ok(())
 }
 
-fn handle_line(
+async fn handle_line(
     line: &str,
     sessions: &SessionManager,
     out_tx: &mpsc::UnboundedSender<DaemonMessage>,
@@ -135,24 +135,24 @@ fn handle_line(
             });
         }
         ClientMessage::ListWorkspaces => {
-            let _ = out_tx.send(DaemonMessage::Workspaces(sessions.list_workspaces()));
+            let _ = out_tx.send(DaemonMessage::Workspaces(sessions.list_workspaces().await?));
         }
         ClientMessage::ListThreads { workspace_id } => {
-            let threads = sessions.list_threads(&workspace_id)?;
+            let threads = sessions.list_threads(&workspace_id).await?;
             let _ = out_tx.send(DaemonMessage::Threads(threads));
         }
         ClientMessage::CreateThread {
             workspace_id,
             title,
         } => {
-            let snapshot = sessions.create_thread(workspace_id, title)?;
+            let snapshot = sessions.create_thread(workspace_id, title).await?;
             let _ = out_tx.send(DaemonMessage::ThreadCreated(snapshot));
         }
         ClientMessage::SubscribeThread { thread_id } => {
             if subscriptions.contains_key(&thread_id) {
                 return Ok(ConnectionControl::Continue);
             }
-            let sub_id = sessions.subscribe(&thread_id, out_tx.clone())?;
+            let sub_id = sessions.subscribe(&thread_id, out_tx.clone()).await?;
             subscriptions.insert(thread_id, sub_id);
         }
         ClientMessage::UnsubscribeThread { thread_id } => {
@@ -161,17 +161,19 @@ fn handle_line(
             }
         }
         ClientMessage::SendPrompt { thread_id, text } => {
-            sessions.send_prompt(thread_id, text)?;
+            sessions.send_prompt(thread_id, text).await?;
         }
         ClientMessage::Interrupt { thread_id } => {
-            sessions.interrupt(&thread_id)?;
+            sessions.interrupt(&thread_id).await?;
         }
         ClientMessage::RespondApproval {
             thread_id,
             request_id,
             decision,
         } => {
-            sessions.respond_approval(&thread_id, &request_id, decision)?;
+            sessions
+                .respond_approval(&thread_id, &request_id, decision)
+                .await?;
         }
         ClientMessage::Shutdown => {
             let _ = shutdown.send(true);
@@ -185,13 +187,34 @@ fn handle_line(
 mod tests {
     use super::*;
     use crate::session::SessionManager;
+    use crate::testing::FakeAdapter;
+    use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex};
     use tokio::sync::{mpsc, watch};
     use tokio::time::{Duration, timeout};
+    use trama_db::TramaDb;
     use trama_domain::agent::AgentEvent;
+    use trama_domain::workspace::{Repository, Workspace, WorkspaceMembership};
     use trama_protocol::{
         ClientMessage, DaemonMessage, PROTOCOL_VERSION, decode_json_line, encode_json_line,
     };
+
+    async fn test_sessions() -> SessionManager {
+        let db = TramaDb::open_in_memory().unwrap();
+        let workspace = Workspace::new("Default");
+        db.create_workspace(&workspace).await.unwrap();
+        let repo = Repository::new(None, Some(std::env::temp_dir()), Some("main".into()));
+        db.create_repository(&repo).await.unwrap();
+        db.add_membership(&WorkspaceMembership {
+            workspace_id: workspace.id,
+            repository_id: repo.id,
+            alias: Some("repo".into()),
+            default_enabled: true,
+        })
+        .await
+        .unwrap();
+        SessionManager::new(db, Arc::new(FakeAdapter::scripted()))
+    }
 
     async fn write_client<W: AsyncWrite + Unpin>(writer: &mut W, msg: &ClientMessage) {
         let bytes = encode_json_line(msg).unwrap();
@@ -211,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn hello_send_prompt_interrupt_over_duplex() {
         let (client, server) = duplex(64 * 1024);
-        let sessions = SessionManager::new();
+        let sessions = test_sessions().await;
         let (shutdown, _rx) = watch::channel(false);
         tokio::spawn(async move {
             let _ = handle_connection(server, sessions, shutdown).await;
@@ -309,7 +332,6 @@ mod tests {
         .await;
 
         tokio::time::sleep(Duration::from_millis(350)).await;
-        // Drain anything already buffered; TurnCompleted should not appear after interrupt.
         let (drain_tx, mut drain_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             loop {
@@ -345,7 +367,7 @@ mod tests {
     #[tokio::test]
     async fn mismatched_hello_is_rejected() {
         let (client, server) = duplex(4096);
-        let sessions = SessionManager::new();
+        let sessions = test_sessions().await;
         let (shutdown, _rx) = watch::channel(false);
         tokio::spawn(async move {
             let _ = handle_connection(server, sessions, shutdown).await;
@@ -369,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn first_message_must_be_hello() {
         let (client, server) = duplex(4096);
-        let sessions = SessionManager::new();
+        let sessions = test_sessions().await;
         let (shutdown, _rx) = watch::channel(false);
         tokio::spawn(async move {
             let _ = handle_connection(server, sessions, shutdown).await;

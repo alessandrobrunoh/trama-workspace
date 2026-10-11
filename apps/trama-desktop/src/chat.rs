@@ -10,9 +10,13 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use trama_domain::agent::{AgentEvent, UsageReport};
+use trama_domain::ids::ThreadId;
+use trama_domain::message::{ContentBlock, Message, Role};
+use trama_protocol::{ClientMessage, DaemonMessage};
 
 use crate::agent::{ChatAgent, FakeAgent};
 use crate::composer::Composer;
+use crate::net::DaemonClient;
 
 pub enum AgentStatus {
     Idle,
@@ -39,6 +43,9 @@ pub struct ChatPanel {
     entries: Vec<ChatEntry>,
     composer: Composer,
     agent: Box<dyn ChatAgent>,
+    client: DaemonClient,
+    connected: bool,
+    selected_thread: Option<ThreadId>,
     pub status: AgentStatus,
     pub usage: Option<UsageReport>,
     pub cost_usd_micros: Option<u64>,
@@ -49,7 +56,7 @@ pub struct ChatPanel {
 }
 
 impl ChatPanel {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>, client: DaemonClient) -> Self {
         let composer = Composer::new(window, cx);
         let enter = composer.subscribe_enter(window, cx, |this, window, cx| {
             this.submit(window, cx);
@@ -59,6 +66,9 @@ impl ChatPanel {
             entries: Vec::new(),
             composer,
             agent: Box::new(FakeAgent),
+            client,
+            connected: false,
+            selected_thread: None,
             status: AgentStatus::Idle,
             usage: None,
             cost_usd_micros: None,
@@ -73,6 +83,79 @@ impl ChatPanel {
         matches!(self.status, AgentStatus::Running)
     }
 
+    pub fn set_connected(&mut self, connected: bool, cx: &mut Context<Self>) {
+        let was_connected = self.connected;
+        self.connected = connected;
+        if connected && !was_connected {
+            // Re-subscribe replay will refill; drop anything streamed while offline.
+            self.clear_transcript();
+        }
+        if !connected && self.is_running() && was_connected {
+            self.finish_turn();
+        }
+        cx.notify();
+    }
+
+    pub fn set_thread(&mut self, thread: Option<ThreadId>, cx: &mut Context<Self>) {
+        if self.selected_thread == thread {
+            return;
+        }
+        self.selected_thread = thread;
+        self.clear_transcript();
+        cx.notify();
+    }
+
+    fn clear_transcript(&mut self) {
+        self.entries.clear();
+        self.status = AgentStatus::Idle;
+        self.usage = None;
+        self.cost_usd_micros = None;
+        self.turns = None;
+        self._event_task = None;
+    }
+
+    pub fn handle_daemon(&mut self, message: DaemonMessage, cx: &mut Context<Self>) {
+        match message {
+            DaemonMessage::MessageAppended { thread_id, message } => {
+                if !self.thread_matches(&thread_id) {
+                    return;
+                }
+                self.append_stored_message(message);
+                cx.notify();
+            }
+            DaemonMessage::AgentEventEnvelope { thread_id, event } => {
+                if !self.thread_matches(&thread_id) {
+                    return;
+                }
+                self.apply_event(event);
+                cx.notify();
+            }
+            DaemonMessage::UsageSnapshot { thread_id, totals } => {
+                if !self.thread_matches(&thread_id) {
+                    return;
+                }
+                self.model = Some(totals.model.clone());
+                self.usage = Some(totals);
+                cx.notify();
+            }
+            DaemonMessage::Error { message, .. } => {
+                if self.is_running() {
+                    self.apply_event(AgentEvent::Failed { message });
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn thread_matches(&self, thread_id: &ThreadId) -> bool {
+        self.selected_thread.as_ref() == Some(thread_id)
+    }
+
+    fn uses_daemon(&self) -> bool {
+        self.connected && self.selected_thread.is_some()
+    }
+
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_running() {
             return;
@@ -85,19 +168,154 @@ impl ChatPanel {
         self.status = AgentStatus::Running;
         self.composer.set_disabled(true, cx);
 
-        let rx = self.agent.send(prompt);
-        self._event_task = Some(cx.spawn(async move |this, cx| {
-            while let Ok(event) = rx.recv().await {
-                let alive = this.update(cx, |this, cx| {
-                    this.apply_event(event);
-                    cx.notify();
-                });
-                if alive.is_err() {
-                    break;
+        if let (true, Some(thread_id)) = (self.connected, self.selected_thread.clone()) {
+            self.client.send(ClientMessage::SendPrompt {
+                thread_id,
+                text: prompt,
+            });
+            self._event_task = None;
+        } else {
+            let rx = self.agent.send(prompt);
+            self._event_task = Some(cx.spawn(async move |this, cx| {
+                while let Ok(event) = rx.recv().await {
+                    let alive = this.update(cx, |this, cx| {
+                        this.apply_event(event);
+                        cx.notify();
+                    });
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        cx.notify();
+    }
+
+    fn append_stored_message(&mut self, message: Message) {
+        match message.role {
+            Role::User => {
+                let text = message.text();
+                if let Some(ChatEntry::User(existing)) = self.entries.last() {
+                    if existing == &text {
+                        return;
+                    }
+                }
+                self.entries.push(ChatEntry::User(text));
+            }
+            Role::Assistant => {
+                if self.is_running() {
+                    self.finalize_live_assistant(&message);
+                } else {
+                    self.expand_message_blocks(&message);
                 }
             }
-        }));
-        cx.notify();
+            Role::Tool | Role::System => {
+                if !self.is_running() {
+                    self.expand_message_blocks(&message);
+                }
+            }
+        }
+    }
+
+    fn finalize_live_assistant(&mut self, message: &Message) {
+        let text = message.text();
+        if let Some(ChatEntry::Assistant {
+            markdown,
+            streaming,
+        }) = self.entries.iter_mut().rev().find(|entry| {
+            matches!(
+                entry,
+                ChatEntry::Assistant {
+                    streaming: true,
+                    ..
+                }
+            )
+        }) {
+            if markdown.is_empty() {
+                *markdown = text;
+            }
+            *streaming = false;
+            return;
+        }
+        if !text.is_empty() {
+            let already = self.entries.iter().rev().any(|entry| {
+                matches!(
+                    entry,
+                    ChatEntry::Assistant { markdown, .. } if markdown == &text
+                )
+            });
+            if !already {
+                self.entries.push(ChatEntry::Assistant {
+                    markdown: text,
+                    streaming: false,
+                });
+            }
+        }
+    }
+
+    fn expand_message_blocks(&mut self, message: &Message) {
+        for block in &message.content {
+            match block {
+                ContentBlock::Text { text } => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    match self.entries.last_mut() {
+                        Some(ChatEntry::Assistant {
+                            markdown,
+                            streaming,
+                        }) => {
+                            markdown.push_str(text);
+                            *streaming = false;
+                        }
+                        _ => self.entries.push(ChatEntry::Assistant {
+                            markdown: text.clone(),
+                            streaming: false,
+                        }),
+                    }
+                }
+                ContentBlock::ToolUse { id, name, input } => {
+                    if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
+                        *streaming = false;
+                    }
+                    self.entries.push(ChatEntry::ToolCall {
+                        tool_use_id: id.clone(),
+                        name: name.clone(),
+                        input_json: input.clone(),
+                        finished: false,
+                        is_error: false,
+                        expanded: false,
+                    });
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    ..
+                } => {
+                    self.finish_tool(tool_use_id, *is_error);
+                }
+                ContentBlock::Thinking { .. } => {}
+            }
+        }
+    }
+
+    fn finish_tool(&mut self, tool_use_id: &str, is_error: bool) {
+        if let Some(call) = self.entries.iter_mut().rev().find_map(|entry| match entry {
+            ChatEntry::ToolCall {
+                tool_use_id: id, ..
+            } if id == tool_use_id => Some(entry),
+            _ => None,
+        }) {
+            if let ChatEntry::ToolCall {
+                finished,
+                is_error: err,
+                ..
+            } = call
+            {
+                *finished = true;
+                *err = is_error;
+            }
+        }
     }
 
     fn apply_event(&mut self, event: AgentEvent) {
@@ -139,22 +357,7 @@ impl ChatPanel {
                 is_error,
                 ..
             } => {
-                if let Some(call) = self.entries.iter_mut().rev().find_map(|entry| match entry {
-                    ChatEntry::ToolCall {
-                        tool_use_id: id, ..
-                    } if *id == tool_use_id => Some(entry),
-                    _ => None,
-                }) {
-                    if let ChatEntry::ToolCall {
-                        finished,
-                        is_error: err,
-                        ..
-                    } = call
-                    {
-                        *finished = true;
-                        *err = is_error;
-                    }
-                }
+                self.finish_tool(&tool_use_id, is_error);
             }
             AgentEvent::UsageReported { report } => {
                 self.model = Some(report.model.clone());
@@ -202,6 +405,7 @@ impl Render for ChatPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.is_running();
         self.composer.set_disabled(running, cx);
+        let uses_daemon = self.uses_daemon();
 
         let messages = v_flex()
             .id("chat-messages")
@@ -224,11 +428,11 @@ impl Render for ChatPanel {
                                 .with_size(px(28.)),
                         )
                         .child("Send a message to start a turn.")
-                        .child(
-                            div()
-                                .text_xs()
-                                .child("The fake agent streams markdown, then an Edit tool call."),
-                        ),
+                        .child(div().text_xs().child(if uses_daemon {
+                            "Prompts go to the local daemon for this thread."
+                        } else {
+                            "The fake agent streams markdown, then an Edit tool call."
+                        })),
                 )
             })
             .children(

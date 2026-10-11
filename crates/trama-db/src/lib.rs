@@ -305,4 +305,141 @@ mod tests {
         .await
         .unwrap();
     }
+
+    #[tokio::test]
+    async fn workspace_repo_thread_and_session_lookups() {
+        let db = TramaDb::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: WorkspaceId::generate(),
+            name: "LaFraternita".into(),
+            settings: WorkspaceSettings::default(),
+        };
+        db.create_workspace(&workspace).await.unwrap();
+        assert_eq!(
+            db.get_workspace_by_name("LaFraternita")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            workspace.id
+        );
+        db.update_workspace_settings(
+            &workspace.id,
+            &WorkspaceSettings {
+                default_model: Some("opus".into()),
+                extra: json!({"permission_mode": "accept_edits"}),
+            },
+        )
+        .await
+        .unwrap();
+        let loaded = db.get_workspace(&workspace.id).await.unwrap().unwrap();
+        assert_eq!(loaded.settings.default_model.as_deref(), Some("opus"));
+
+        let backend = Repository {
+            id: RepositoryId::generate(),
+            canonical_remote: None,
+            local_path: Some(PathBuf::from("/tmp/backend")),
+            default_branch: Some("main".into()),
+        };
+        let frontend = Repository {
+            id: RepositoryId::generate(),
+            canonical_remote: None,
+            local_path: Some(PathBuf::from("/tmp/frontend")),
+            default_branch: Some("main".into()),
+        };
+        db.create_repository(&backend).await.unwrap();
+        db.create_repository(&frontend).await.unwrap();
+        assert_eq!(
+            db.get_repository_by_local_path(PathBuf::from("/tmp/backend").as_path())
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            backend.id
+        );
+
+        let membership = WorkspaceMembership {
+            workspace_id: workspace.id.clone(),
+            repository_id: backend.id.clone(),
+            alias: Some("backend".into()),
+            default_enabled: true,
+        };
+        db.upsert_membership(&membership).await.unwrap();
+        db.upsert_membership(&WorkspaceMembership {
+            alias: Some("api".into()),
+            ..membership.clone()
+        })
+        .await
+        .unwrap();
+        let memberships = db.list_memberships(&workspace.id).await.unwrap();
+        assert_eq!(memberships.len(), 1);
+        assert_eq!(memberships[0].alias.as_deref(), Some("api"));
+
+        let thread = Thread {
+            id: ThreadId::generate(),
+            workspace_id: Some(workspace.id.clone()),
+            parent_thread_id: None,
+            kind: ThreadKind::Top,
+            title: Some("work".into()),
+            repo_attachments: vec![
+                ThreadRepositoryAttachment {
+                    repository_id: backend.id.clone(),
+                    base_revision: None,
+                    checkout_id: None,
+                    attach_mode: AttachMode::Isolated,
+                },
+                ThreadRepositoryAttachment {
+                    repository_id: frontend.id.clone(),
+                    base_revision: None,
+                    checkout_id: None,
+                    attach_mode: AttachMode::Isolated,
+                },
+            ],
+        };
+        db.create_thread(&thread).await.unwrap();
+        let got = db.get_thread(&thread.id).await.unwrap().unwrap();
+        assert_eq!(got.title.as_deref(), Some("work"));
+        let repos = db.list_thread_repositories(&thread.id).await.unwrap();
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0].id, backend.id);
+        assert_eq!(repos[1].id, frontend.id);
+
+        let session = AgentSession {
+            id: AgentSessionId::generate(),
+            external_session_id: None,
+            model: Some("fake".into()),
+            cwd: PathBuf::from("/tmp/backend"),
+        };
+        db.create_agent_session(&thread.id, &session, "claude_code")
+            .await
+            .unwrap();
+        db.set_agent_session_external(&session.id, Some("ext-9".into()), Some("opus".into()))
+            .await
+            .unwrap();
+        let latest = db
+            .latest_agent_session_for_thread(&thread.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.external_session_id.as_deref(), Some("ext-9"));
+        assert_eq!(latest.model.as_deref(), Some("opus"));
+
+        db.record_usage(
+            &session.id,
+            &thread.id,
+            &UsageReport {
+                model: "opus".into(),
+                input_tokens: 3,
+                output_tokens: 4,
+                cache_read_tokens: 1,
+                cache_write_tokens: 2,
+            },
+        )
+        .await
+        .unwrap();
+        let totals = db.usage_totals_for_thread(&thread.id).await.unwrap();
+        assert_eq!(totals.input_tokens, 3);
+        assert_eq!(totals.output_tokens, 4);
+        assert_eq!(totals.model, "opus");
+    }
 }

@@ -1,6 +1,7 @@
 mod agent;
 mod chat;
 mod composer;
+mod net;
 mod workspace;
 
 use gpui_kit::component::TitleBar;

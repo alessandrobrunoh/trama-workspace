@@ -1,23 +1,54 @@
-//! Local TramaWorkspace daemon: Unix-socket JSON-lines server and mock sessions.
+//! Local TramaWorkspace daemon: Unix-socket JSON-lines server and real sessions.
 
+mod claude;
+mod config;
 mod connection;
 mod error;
 mod log;
 mod session;
 
+#[cfg(test)]
+mod testing;
+
 pub use error::{DaemonError, Result};
 pub use session::SessionManager;
 
+use crate::claude::ProductionAdapter;
+use crate::config::{load_or_init_config, seed_from_config};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::sync::watch;
+use trama_db::TramaDb;
 
-/// `$HOME/Library/Application Support/TramaWorkspace/daemon.sock`
-pub fn default_socket_path() -> Result<PathBuf> {
+/// `$HOME/Library/Application Support/TramaWorkspace`
+pub fn default_app_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| {
         DaemonError::Invalid("HOME is not set; cannot locate Application Support".into())
     })?;
-    Ok(PathBuf::from(home).join("Library/Application Support/TramaWorkspace/daemon.sock"))
+    Ok(PathBuf::from(home).join("Library/Application Support/TramaWorkspace"))
+}
+
+/// `$HOME/Library/Application Support/TramaWorkspace/daemon.sock`
+pub fn default_socket_path() -> Result<PathBuf> {
+    Ok(default_app_dir()?.join("daemon.sock"))
+}
+
+pub fn default_config_path() -> Result<PathBuf> {
+    Ok(default_app_dir()?.join("config.json"))
+}
+
+pub fn default_db_path() -> Result<PathBuf> {
+    Ok(default_app_dir()?.join("trama.db"))
+}
+
+pub async fn bootstrap_sessions() -> Result<SessionManager> {
+    let dir = default_app_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let config = load_or_init_config(&dir.join("config.json"))?;
+    let db = TramaDb::open(&dir.join("trama.db"))?;
+    seed_from_config(&db, &config).await?;
+    Ok(SessionManager::new(db, Arc::new(ProductionAdapter::new())))
 }
 
 pub async fn run() -> Result<()> {
@@ -25,6 +56,11 @@ pub async fn run() -> Result<()> {
 }
 
 pub async fn run_on_socket(socket_path: &Path) -> Result<()> {
+    let sessions = bootstrap_sessions().await?;
+    serve_on_socket(socket_path, sessions).await
+}
+
+pub async fn serve_on_socket(socket_path: &Path, sessions: SessionManager) -> Result<()> {
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -41,7 +77,6 @@ pub async fn run_on_socket(socket_path: &Path) -> Result<()> {
     }
     crate::log::info(format!("listening on {}", socket_path.display()));
 
-    let sessions = SessionManager::new();
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
     loop {

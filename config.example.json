@@ -1,0 +1,12 @@
+{
+  "workspaces": [
+    {
+      "name": "LaFraternita",
+      "permission_mode": "accept_edits",
+      "repos": [
+        { "name": "backend", "path": "/abs/path" },
+        { "name": "frontend", "path": "/abs/path" }
+      ]
+    }
+  ]
+}

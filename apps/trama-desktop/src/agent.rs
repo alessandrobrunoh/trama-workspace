@@ -10,8 +10,8 @@ use std::time::Duration;
 use async_channel::Receiver;
 use trama_domain::agent::{AgentEvent, UsageReport};
 
-/// Prompt → event stream. Implemented by [`FakeAgent`] until a real adapter
-/// is wired in.
+/// Prompt → event stream. Implemented by [`FakeAgent`] when the daemon is
+/// offline or no thread is selected.
 pub trait ChatAgent {
     fn send(&mut self, prompt: String) -> Receiver<AgentEvent>;
 }
@@ -139,5 +139,3 @@ fn chunk_text(text: &str, size: usize) -> Vec<String> {
     }
     chunks
 }
-
-// TODO: wire real ClaudeAdapter from trama-infra
