@@ -995,6 +995,26 @@ async fn claims_left_open_by_a_restart_become_ambiguous() {
 }
 
 #[tokio::test]
+async fn operator_commands_next_to_a_live_server_keep_open_claims() {
+    // `docker compose exec collab trama-collab create-user` opens the same
+    // database as the running server and must not abandon its live claims.
+    let h = Harness::new().await;
+    let alice = h.login("alice").await;
+    let thread = h.create_thread(&alice).await;
+    let token = h.runner_token(&alice, "laptop").await;
+    let mut runner = h.runner(&token).await;
+    h.send(&alice, &thread, "t", "x").await;
+    send_json(&mut runner, json!({"type": "claim", "command_id": "t"})).await;
+    assert_eq!(next_of(&mut runner, "claimed").await["type"], "claimed");
+
+    let admin = AuthService::open_admin(&h.path, AuthConfig::default()).unwrap();
+    admin.create_user("dave", "dave-secret-123").await.unwrap();
+    admin.create_runner("dave", "ci").await.unwrap();
+
+    assert_eq!(h.commands(&alice, &thread).await[0]["state"], "claimed");
+}
+
+#[tokio::test]
 async fn drafts_are_broadcast_last_write_wins_but_never_logged() {
     let h = Harness::new().await;
     let alice = h.login("alice").await;

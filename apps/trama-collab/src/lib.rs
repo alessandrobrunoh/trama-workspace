@@ -14,7 +14,7 @@ use argon2::{
 use axum::{
     Json, Router,
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
-    http::{StatusCode, header::AUTHORIZATION},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -28,9 +28,11 @@ use tokio::sync::Semaphore;
 
 mod collab;
 mod live;
+mod proxy;
 mod sockets;
 
 use live::Hub;
+pub use proxy::{ForwardedHeader, IpCidr, ProxyTrust};
 
 const MAX_BODY_BYTES: usize = 4096;
 const MAX_USERNAME_BYTES: usize = 64;
@@ -87,6 +89,9 @@ struct AppState {
     throttle: Arc<Mutex<ThrottleState>>,
     /// Live fan-out, ephemeral drafts/presence and the event write lock.
     hub: Arc<Hub>,
+    /// Set only when the service runs behind a trusted reverse proxy; absent,
+    /// forwarding headers are never read.
+    proxy: Option<Arc<ProxyTrust>>,
 }
 
 /// An authenticated user session.
@@ -97,7 +102,7 @@ struct Identity {
 }
 
 /// In-memory sliding-window login attempt tracking. All state is lost when
-/// the process restarts; this is a local development control only.
+/// the process restarts and is per process (one instance is expected).
 #[derive(Default)]
 struct ThrottleState {
     by_key: HashMap<(String, IpAddr), Vec<i64>>,
@@ -163,7 +168,21 @@ impl IntoResponse for AuthError {
 }
 
 impl AuthService {
+    /// Opens the service for serving: also marks turns that were claimed when
+    /// the previous process stopped as ambiguous.
     pub fn open(path: impl AsRef<Path>, config: AuthConfig) -> Result<Self, String> {
+        Self::open_inner(path.as_ref(), config, true)
+    }
+
+    /// Opens the database for operator commands (`create-user`,
+    /// `create-runner`, `backup`) that may run next to a live server. Unlike
+    /// [`AuthService::open`] it never touches runner claims, which belong to
+    /// the running process.
+    pub fn open_admin(path: impl AsRef<Path>, config: AuthConfig) -> Result<Self, String> {
+        Self::open_inner(path.as_ref(), config, false)
+    }
+
+    fn open_inner(path: &Path, config: AuthConfig, recover_claims: bool) -> Result<Self, String> {
         if config.session_ttl.is_zero() || config.session_ttl > MAX_SESSION_TTL {
             return Err("session TTL must be between one second and 30 days".into());
         }
@@ -174,7 +193,7 @@ impl AuthService {
         {
             return Err("login throttle settings must be nonzero".into());
         }
-        let path = path.as_ref().to_path_buf();
+        let path = path.to_path_buf();
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -217,8 +236,10 @@ impl AuthService {
         collab::migrate(&connection)?;
         // A claim that was open when the previous process stopped has an
         // unknown outcome: mark it ambiguous instead of offering it again.
-        collab::abandon_all_claims(&connection, (config.clock)())
-            .map_err(|_| "recover runner claims".to_owned())?;
+        if recover_claims {
+            collab::abandon_all_claims(&connection, (config.clock)())
+                .map_err(|_| "recover runner claims".to_owned())?;
+        }
         drop(connection);
         let mut dummy_password = [0_u8; 32];
         random_fill(&mut dummy_password).map_err(|e| format!("prepare dummy password: {e}"))?;
@@ -252,6 +273,38 @@ impl AuthService {
             } else { format!("create user: {e}") })?;
             Ok(())
         }).await.map_err(|e| format!("create-user task failed: {e}"))?
+    }
+
+    /// Writes a consistent snapshot of the database to `destination`
+    /// (SQLite `VACUUM INTO`, safe while the server is running). The file is
+    /// created owner-only and an existing path is never overwritten.
+    pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<(), String> {
+        let destination = destination.as_ref();
+        destination
+            .to_str()
+            .filter(|text| !text.is_empty() && !text.starts_with("file:"))
+            .ok_or_else(|| "backup path must be a plain, non-empty UTF-8 file path".to_owned())?;
+        create_private_file(destination)
+            .map_err(|e| format!("create backup file (it must not exist): {e}"))?;
+        let result = std::fs::canonicalize(destination)
+            .map_err(|e| format!("resolve backup path: {e}"))
+            .and_then(|resolved| {
+                // SQLite is opened with NOFOLLOW, which also rejects symlinked
+                // parents such as /var on macOS; hand it the resolved path.
+                let resolved = resolved
+                    .to_str()
+                    .ok_or_else(|| "backup path must be UTF-8".to_owned())?
+                    .to_owned();
+                let connection = open_connection(&self.database)?;
+                connection
+                    .execute("VACUUM INTO ?1", [resolved])
+                    .map(|_| ())
+                    .map_err(|e| format!("write backup: {e}"))
+            });
+        if result.is_err() {
+            let _ = std::fs::remove_file(destination);
+        }
+        result
     }
 
     fn cleanup_expired(&self) -> Result<(), String> {
@@ -388,12 +441,21 @@ impl AuthService {
     }
 }
 
+/// The service for direct (loopback) use: forwarding headers are ignored.
 pub fn router(auth: AuthService) -> Router {
+    router_with_proxy(auth, None)
+}
+
+/// The service behind a reverse proxy. With `Some(trust)`, the client address
+/// used for login throttling is taken from the configured forwarding header,
+/// but only when the TCP peer is a trusted proxy (see [`ProxyTrust`]).
+pub fn router_with_proxy(auth: AuthService, proxy: Option<ProxyTrust>) -> Router {
     let state = AppState {
         auth,
         hash_slots: Arc::new(Semaphore::new(8)),
         throttle: Arc::new(Mutex::new(ThrottleState::default())),
         hub: Arc::new(Hub::default()),
+        proxy: proxy.map(Arc::new),
     };
     let auth_routes = Router::new()
         .route("/auth/login", post(login))
@@ -401,6 +463,7 @@ pub fn router(auth: AuthService) -> Router {
         .route("/auth/logout", post(logout))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
     auth_routes
+        .route("/healthz", get(healthz))
         .merge(collab::routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -426,13 +489,46 @@ async fn acquire_hash_slot(
     response
 }
 
+/// Liveness and database reachability for container health checks. It is
+/// unauthenticated and returns no data; the proxy should not publish it.
+async fn healthz(State(state): State<AppState>) -> Response {
+    let database = state.auth.database.clone();
+    let healthy = tokio_blocking(move || {
+        open_connection(&database)
+            .and_then(|connection| {
+                connection
+                    .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                    .map_err(|e| e.to_string())
+            })
+            .map(|_| ())
+            .map_err(|_| AuthError::Database)
+    })
+    .await
+    .is_ok();
+    if healthy {
+        (StatusCode::OK, "ok").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response()
+    }
+}
+
+/// The address a request counts as coming from for throttling.
+fn client_ip(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    match &state.proxy {
+        Some(trust) => trust.client_ip(peer.ip(), headers),
+        None => peer.ip(),
+    }
+}
+
 async fn login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(input): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, AuthError> {
     validate_credentials(&input.username, &input.password).map_err(|_| AuthError::InvalidInput)?;
-    if !allowed_attempt(&state, &input.username, peer.ip()) {
+    let ip = client_ip(&state, peer, &headers);
+    if !allowed_attempt(&state, &input.username, ip) {
         return Err(AuthError::Throttled);
     }
     state
@@ -598,6 +694,110 @@ fn open_connection(path: &Path) -> Result<Connection, String> {
     Ok(connection)
 }
 
+/// Creates a new empty file readable by its owner only; fails if the path
+/// exists (symlinks included). Missing parent directories are created 0700.
+fn create_private_file(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    let created = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path);
+    created.map(|_| ())
+}
+
+/// Replaces the database at `database` with the snapshot in `backup`
+/// (made by [`AuthService::backup_to`]).
+///
+/// The snapshot must pass SQLite's integrity check and look like a
+/// collaboration database. An existing database is kept next to the new one
+/// as `<name>.before-restore-<unix time>`. Run it while the service is
+/// stopped: the service holds no lock between requests, so a running one
+/// would not notice the file being swapped.
+pub fn restore_database(database: &Path, backup: &Path) -> Result<(), String> {
+    let metadata =
+        std::fs::symlink_metadata(backup).map_err(|e| format!("inspect backup file: {e}"))?;
+    if !metadata.is_file() {
+        return Err("backup path must be a regular file, not a symlink".into());
+    }
+    let resolved =
+        std::fs::canonicalize(backup).map_err(|e| format!("resolve backup path: {e}"))?;
+    let source = Connection::open_with_flags(
+        &resolved,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("open backup: {e}"))?;
+    let verdict: String = source
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|e| format!("check backup: {e}"))?;
+    if verdict != "ok" {
+        return Err("the backup failed SQLite's integrity check; nothing was changed".into());
+    }
+    let tables: i64 = source
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' \
+             AND name IN ('auth_users', 'auth_sessions')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("check backup: {e}"))?;
+    if tables != 2 {
+        return Err("that file is not a trama-collab database; nothing was changed".into());
+    }
+
+    let kept = if std::fs::symlink_metadata(database).is_ok() {
+        let name = database
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "database path must name a file".to_owned())?;
+        let kept = database.with_file_name(format!("{name}.before-restore-{}", unix_time()));
+        std::fs::rename(database, &kept)
+            .map_err(|e| format!("move the current database aside: {e}"))?;
+        Some(kept)
+    } else {
+        None
+    };
+    let undo = |error: String| {
+        let _ = std::fs::remove_file(database);
+        if let Some(kept) = &kept {
+            let _ = std::fs::rename(kept, database);
+        }
+        error
+    };
+    create_private_file(database).map_err(|e| undo(format!("create database file: {e}")))?;
+    let target = std::fs::canonicalize(database)
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_owned))
+        .ok_or_else(|| undo("resolve database path".into()))?;
+    source
+        .execute("VACUUM INTO ?1", [target])
+        .map_err(|e| undo(format!("write database: {e}")))?;
+    Ok(())
+}
+
 /// Secures the database file before SQLite writes password hashes to it:
 /// new files are pre-created owner-only (never the default 0644), existing
 /// paths must be regular files (symlinks, dangling or not, are rejected)
@@ -685,13 +885,49 @@ fn unix_time() -> i64 {
         .as_secs() as i64
 }
 
+/// Direct (no proxy) serving is loopback only: the service speaks plain HTTP
+/// and bearer tokens must not cross a network in clear text. Binding anything
+/// else requires the explicit reverse-proxy opt-in in the `serve` command
+/// (`--behind-proxy`), which skips this check and enables [`ProxyTrust`].
 pub fn validate_bind(address: SocketAddr) -> Result<(), String> {
     if address.ip().is_loopback() {
         Ok(())
     } else {
-        Err(
-            "external bind addresses are disabled; use loopback until TLS ingress is configured"
-                .into(),
-        )
+        Err(format!(
+            "refusing to bind {address}: the service speaks plain HTTP and only loopback \
+             addresses are allowed by default. Behind a TLS reverse proxy on a private \
+             network, opt in explicitly with `serve --behind-proxy` \
+             (or TRAMA_COLLAB_BEHIND_PROXY=1)"
+        ))
+    }
+}
+
+/// One-shot `GET /healthz` over plain TCP, for container health checks where
+/// no `curl` exists. `Ok` only for an HTTP 200 reply.
+pub fn probe_health(address: SocketAddr, timeout: Duration) -> Result<(), String> {
+    use std::io::Write;
+    use std::net::TcpStream;
+    let mut stream = TcpStream::connect_timeout(&address, timeout)
+        .map_err(|e| format!("connect {address}: {e}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .map_err(|e| e.to_string())?;
+    write!(
+        stream,
+        "GET /healthz HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    )
+    .map_err(|e| format!("send request: {e}"))?;
+    let mut head = Vec::new();
+    stream
+        .take(64)
+        .read_to_end(&mut head)
+        .map_err(|e| format!("read reply: {e}"))?;
+    let head = String::from_utf8_lossy(&head);
+    let status = head.lines().next().unwrap_or_default();
+    if status.split_whitespace().nth(1) == Some("200") {
+        Ok(())
+    } else {
+        Err(format!("unhealthy reply: {status:?}"))
     }
 }

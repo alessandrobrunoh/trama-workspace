@@ -9,7 +9,9 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use tower::ServiceExt;
-use trama_collab::{AuthConfig, AuthService, router};
+use trama_collab::{
+    AuthConfig, AuthService, ForwardedHeader, ProxyTrust, probe_health, router, router_with_proxy,
+};
 
 async fn request(
     app: axum::Router,
@@ -270,6 +272,144 @@ async fn login_throttles_and_bounds_request_body() {
     );
 }
 
+/// A login attempt from TCP peer `peer`, optionally with `X-Forwarded-For`.
+async fn login_attempt(
+    app: axum::Router,
+    peer: &str,
+    forwarded_for: Option<&str>,
+    username: &str,
+) -> StatusCode {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/auth/login")
+        .header("content-type", "application/json");
+    if let Some(value) = forwarded_for {
+        builder = builder.header("x-forwarded-for", value);
+    }
+    let body = json!({"username": username, "password": "wrong-password"});
+    let mut request = builder.body(Body::from(body.to_string())).unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+    app.oneshot(request).await.unwrap().status()
+}
+
+fn one_attempt_service(dir: &std::path::Path) -> AuthService {
+    let mut config = AuthConfig::default();
+    config.max_login_attempts = 1;
+    config.max_peer_attempts = 2;
+    AuthService::open(dir.join("auth.sqlite"), config).unwrap()
+}
+
+fn proxy() -> Option<ProxyTrust> {
+    Some(ProxyTrust::new(
+        ProxyTrust::default_networks(),
+        ForwardedHeader::XForwardedFor,
+    ))
+}
+
+#[tokio::test]
+async fn forwarding_headers_are_ignored_without_the_proxy_opt_in() {
+    let dir = tempdir().unwrap();
+    let app = router(one_attempt_service(dir.path()));
+    // Even a loopback peer cannot choose its throttle key.
+    let first = login_attempt(app.clone(), "127.0.0.1:1", Some("198.51.100.1"), "a").await;
+    let second = login_attempt(app, "127.0.0.1:1", Some("198.51.100.2"), "a").await;
+    assert_eq!(first, StatusCode::UNAUTHORIZED);
+    assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn spoofed_forwarding_header_from_an_untrusted_peer_is_ignored() {
+    let dir = tempdir().unwrap();
+    let app = router_with_proxy(one_attempt_service(dir.path()), proxy());
+    // A direct internet peer rotates the header to dodge the per-key limit.
+    let first = login_attempt(app.clone(), "203.0.113.9:1", Some("10.9.9.1"), "a").await;
+    let second = login_attempt(app.clone(), "203.0.113.9:1", Some("10.9.9.2"), "a").await;
+    assert_eq!(first, StatusCode::UNAUTHORIZED);
+    assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn throttling_keys_on_the_forwarded_address_from_a_trusted_proxy() {
+    let dir = tempdir().unwrap();
+    let app = router_with_proxy(one_attempt_service(dir.path()), proxy());
+    let proxy_peer = "172.18.0.2:5000";
+    // Same username from two real clients behind one proxy: independent.
+    assert_eq!(
+        login_attempt(app.clone(), proxy_peer, Some("198.51.100.1"), "a").await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        login_attempt(app.clone(), proxy_peer, Some("198.51.100.2"), "a").await,
+        StatusCode::UNAUTHORIZED
+    );
+    // The same real client is throttled even though the TCP peer is shared.
+    assert_eq!(
+        login_attempt(app.clone(), proxy_peer, Some("198.51.100.1"), "a").await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // A client-supplied left-most entry does not create a fresh key.
+    assert_eq!(
+        login_attempt(app.clone(), proxy_peer, Some("6.6.6.6, 198.51.100.1"), "a").await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // The per-address total across usernames applies to the forwarded address.
+    assert_eq!(
+        login_attempt(app.clone(), proxy_peer, Some("198.51.100.3"), "b").await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        login_attempt(app.clone(), proxy_peer, Some("198.51.100.3"), "c").await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        login_attempt(app, proxy_peer, Some("198.51.100.3"), "d").await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn healthz_is_unauthenticated_and_probeable_over_tcp() {
+    let dir = tempdir().unwrap();
+    let app = router(service(&dir.path().join("auth.sqlite")));
+    let mut request = Request::builder()
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:43210".parse::<SocketAddr>().unwrap(),
+    ));
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"ok");
+
+    // The container health check: a real TCP round trip on loopback.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    tokio::task::spawn_blocking(move || probe_health(address, Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn probe_health_fails_when_nothing_listens() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    assert!(probe_health(address, Duration::from_secs(1)).is_err());
+}
+
 #[tokio::test]
 async fn public_signup_is_not_exposed() {
     let dir = tempdir().unwrap();
@@ -291,7 +431,17 @@ async fn public_signup_is_not_exposed() {
 #[test]
 fn listener_must_be_loopback() {
     assert!(trama_collab::validate_bind("127.0.0.1:9000".parse().unwrap()).is_ok());
-    assert!(trama_collab::validate_bind("0.0.0.0:9000".parse().unwrap()).is_err());
+    assert!(trama_collab::validate_bind("[::1]:9000".parse().unwrap()).is_ok());
+    for external in [
+        "0.0.0.0:9000",
+        "[::]:9000",
+        "10.0.0.5:9000",
+        "192.0.2.1:9000",
+    ] {
+        let error = trama_collab::validate_bind(external.parse().unwrap()).unwrap_err();
+        // The refusal names the explicit opt-in.
+        assert!(error.contains("--behind-proxy"), "{error}");
+    }
 }
 
 #[cfg(unix)]
