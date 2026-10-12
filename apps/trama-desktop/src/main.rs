@@ -3,6 +3,7 @@ mod chat;
 mod composer;
 mod copies;
 mod dialog;
+mod diff;
 mod editor;
 mod net;
 mod onboarding;
