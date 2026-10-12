@@ -34,6 +34,7 @@ async fn claude_print_say_hi() {
         resume_external_session: None,
         billing: Default::default(),
         approval_hook: None,
+        fork_session: false,
     };
 
     let session = adapter.start(config, tx).await.expect("start claude");

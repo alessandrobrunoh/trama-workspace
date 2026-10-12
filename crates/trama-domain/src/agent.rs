@@ -92,6 +92,11 @@ pub struct SessionConfig {
     /// being denied by the non-interactive CLI.
     #[serde(default)]
     pub approval_hook: Option<ApprovalHookConfig>,
+    /// With `resume_external_session`, continue under a new session id
+    /// instead of appending to the resumed one (Claude `--fork-session`).
+    /// Subthreads use it to inherit their parent's conversation.
+    #[serde(default)]
+    pub fork_session: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,8 +373,14 @@ mod tests {
                 args: vec!["approval-hook".into()],
                 timeout_secs: 60,
             }),
+            fork_session: true,
         };
         let back = roundtrip(&config);
+        assert!(back.fork_session);
+        let mut legacy = serde_json::to_value(&config).unwrap();
+        legacy.as_object_mut().unwrap().remove("fork_session");
+        let legacy: SessionConfig = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.fork_session);
         assert_eq!(back.cwd, config.cwd);
         assert_eq!(back.billing, BillingMode::ApiKey);
         assert_eq!(back.approval_hook, config.approval_hook);

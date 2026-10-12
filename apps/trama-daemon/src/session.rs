@@ -1576,6 +1576,7 @@ impl SessionManager {
             resume_external_session,
             billing: self.billing,
             approval_hook: None,
+            fork_session: false,
         })
     }
 

@@ -1,9 +1,11 @@
 use crate::agent::ApprovalDecision;
 use crate::checkpoint::Checkpoint;
+use crate::checkpoint::RepoState;
 use crate::comment::Comment;
 use crate::ids::{AgentSessionId, RepositoryId, ThreadId, WorkspaceId};
 use crate::message::{Actor, Message};
 use crate::revision::FileRevision;
+use crate::subthread::{LandOutcome, RepoForkPoint, RepoPullResult, ReviewVerdict};
 use crate::thread::Thread;
 use crate::workspace::Workspace;
 use async_trait::async_trait;
@@ -122,6 +124,38 @@ pub enum DomainEvent {
     CheckpointCreated {
         checkpoint: Checkpoint,
     },
+    /// A subthread copied its parent's checkouts (and, when available, its
+    /// agent conversation). Recorded on the subthread aggregate after its
+    /// `ThreadCreated`.
+    SubthreadForked {
+        thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        repos: Vec<RepoForkPoint>,
+        parent_external_session_id: Option<String>,
+    },
+    /// A review subthread's verdict, recorded on the parent aggregate.
+    /// `snapshot` holds one snapshot commit per repository of what the
+    /// review itself changed, so the parent can pull those changes later.
+    ReviewVerdictRecorded {
+        review_thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        verdict: ReviewVerdict,
+        snapshot: Vec<RepoState>,
+    },
+    /// A subthread's changes were applied to its parent's checkouts. Nothing
+    /// was committed. Recorded on the parent aggregate.
+    ChangesPulled {
+        from_thread_id: ThreadId,
+        into_thread_id: ThreadId,
+        repos: Vec<RepoPullResult>,
+    },
+    /// A land subthread reported its result. Recorded on the parent aggregate.
+    LandResultRecorded {
+        land_thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        outcome: LandOutcome,
+        summary: String,
+    },
 }
 
 impl DomainEvent {
@@ -137,6 +171,10 @@ impl DomainEvent {
             Self::FileRevisionRecorded { .. } => "file.revision_recorded",
             Self::CommentCreated { .. } => "comment.created",
             Self::CheckpointCreated { .. } => "checkpoint.created",
+            Self::SubthreadForked { .. } => "subthread.forked",
+            Self::ReviewVerdictRecorded { .. } => "review.verdict_recorded",
+            Self::ChangesPulled { .. } => "changes.pulled",
+            Self::LandResultRecorded { .. } => "land.result_recorded",
         }
     }
 }
@@ -169,6 +207,7 @@ mod tests {
         AgentSessionId, CheckpointId, CommentId, RepositoryId, ThreadId, WorkspaceId,
     };
     use crate::message::Message;
+    use crate::subthread::{FileChangeStatus, PullFileOutcome, PullFileResult};
     use crate::thread::{AttachMode, Thread, ThreadKind, ThreadRepositoryAttachment};
     use crate::workspace::Workspace;
     use std::path::PathBuf;
@@ -255,6 +294,8 @@ mod tests {
         let cmt = comment(th.id.clone());
         let rev = revision();
         let ckpt = checkpoint(th.id.clone());
+        let sub = ThreadId::generate();
+        let repo = RepositoryId::generate();
         vec![
             (
                 DomainEvent::WorkspaceCreated {
@@ -337,8 +378,65 @@ mod tests {
             ),
             (
                 DomainEvent::CheckpointCreated { checkpoint: ckpt },
-                Aggregate::Thread { id: th.id },
+                Aggregate::Thread { id: th.id.clone() },
                 "checkpoint.created",
+            ),
+            (
+                DomainEvent::SubthreadForked {
+                    thread_id: sub.clone(),
+                    parent_thread_id: th.id.clone(),
+                    repos: vec![RepoForkPoint {
+                        repository_id: repo.clone(),
+                        base_revision: "abc".into(),
+                        fork_commit: "def".into(),
+                    }],
+                    parent_external_session_id: Some("ext".into()),
+                },
+                Aggregate::Thread { id: sub.clone() },
+                "subthread.forked",
+            ),
+            (
+                DomainEvent::ReviewVerdictRecorded {
+                    review_thread_id: sub.clone(),
+                    parent_thread_id: th.id.clone(),
+                    verdict: ReviewVerdict::RequestChanges {
+                        summary: "fix".into(),
+                    },
+                    snapshot: vec![RepoState {
+                        repository_id: repo.clone(),
+                        commit: Some("abc".into()),
+                        tree: Some("def".into()),
+                        working_changes: WorkingChanges::Dirty,
+                    }],
+                },
+                Aggregate::Thread { id: th.id.clone() },
+                "review.verdict_recorded",
+            ),
+            (
+                DomainEvent::ChangesPulled {
+                    from_thread_id: sub.clone(),
+                    into_thread_id: th.id.clone(),
+                    repos: vec![RepoPullResult {
+                        repository_id: repo,
+                        files: vec![PullFileResult {
+                            path: "a.txt".into(),
+                            change: FileChangeStatus::Added,
+                            outcome: PullFileOutcome::Applied,
+                        }],
+                    }],
+                },
+                Aggregate::Thread { id: th.id.clone() },
+                "changes.pulled",
+            ),
+            (
+                DomainEvent::LandResultRecorded {
+                    land_thread_id: sub,
+                    parent_thread_id: th.id.clone(),
+                    outcome: LandOutcome::Landed,
+                    summary: "merged".into(),
+                },
+                Aggregate::Thread { id: th.id },
+                "land.result_recorded",
             ),
         ]
     }

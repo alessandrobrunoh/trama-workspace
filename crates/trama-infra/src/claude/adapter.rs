@@ -189,6 +189,9 @@ pub fn claude_cli_args(config: &SessionConfig) -> Vec<String> {
     {
         args.push("--resume".to_string());
         args.push(resume.clone());
+        if config.fork_session {
+            args.push("--fork-session".to_string());
+        }
     }
     if let Some(hook) = &config.approval_hook {
         // `--settings` overlays the user's settings for this session only;
@@ -514,7 +517,29 @@ mod tests {
             resume_external_session: Some("ses_resume".into()),
             billing: BillingMode::Subscription,
             approval_hook: None,
+            fork_session: false,
         }
+    }
+
+    #[test]
+    fn fork_session_is_emitted_only_with_resume() {
+        let mut config = sample_config();
+        assert!(
+            !claude_cli_args(&config)
+                .iter()
+                .any(|a| a == "--fork-session")
+        );
+        config.fork_session = true;
+        let args = claude_cli_args(&config);
+        let resume = args.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(args[resume + 1], "ses_resume");
+        assert_eq!(args[resume + 2], "--fork-session");
+        config.resume_external_session = None;
+        assert!(
+            !claude_cli_args(&config)
+                .iter()
+                .any(|a| a == "--fork-session")
+        );
     }
 
     #[test]
@@ -766,6 +791,7 @@ mod tests {
             resume_external_session: None,
             billing: BillingMode::Subscription,
             approval_hook: None,
+            fork_session: false,
         };
         let session = adapter.start(config, tx).await.unwrap();
 
