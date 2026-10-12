@@ -65,6 +65,52 @@ Build profiles and editor-check settings are described in
 
 The UI and daemon speak newline-delimited JSON (`crates/trama-protocol`). First message on a connection must be `Hello` with `protocol_version = 8`. A mismatch is rejected at the handshake; it does not rewrite stored threads or workspace ids. See [onboarding and legacy migration](docs/onboarding-and-migration.md).
 
+## Try sharing locally
+
+Two people on one Mac, each with their own daemon and app instance. The
+collaboration service only listens on loopback.
+
+```bash
+cargo build -p trama-collab -p trama-daemon -p trama-desktop
+
+# 1. Collaboration service with two users (passwords are prompted, not echoed)
+./target/debug/trama-collab --db /tmp/trama-collab.sqlite create-user --username alice
+./target/debug/trama-collab --db /tmp/trama-collab.sqlite create-user --username bob
+./target/debug/trama-collab --db /tmp/trama-collab.sqlite serve   # http://127.0.0.1:8787
+
+# 2. Alice: your normal daemon and app
+./target/debug/trama-daemon
+./target/debug/TramaWorkspace
+
+# 3. Bob: a second, isolated instance (own socket, database and checkouts)
+TRAMA_DATA_DIR=/tmp/trama-bob ./target/debug/trama-daemon
+TRAMA_DATA_DIR=/tmp/trama-bob ./target/debug/TramaWorkspace
+```
+
+In each app:
+
+1. **Sign in.** ⌘K → *Connect to collaboration server* (also under Manage
+   projects → Collaboration). Enter `http://127.0.0.1:8787`, the username and
+   password. The password goes to the daemon once and is not stored; the
+   daemon provisions a runner unless you paste a runner token. The dialog
+   shows who is signed in and whether the runner is online, with
+   *Disconnect* and *Forget*.
+2. **Share (Alice).** Select a thread and press **Share** in the title bar
+   (⌘⇧S). Invite `bob` by username, or choose *Anyone with the link* and
+   **Copy link**: the `trama-join:` link carries the server, the thread id and
+   the link token, and is shown only once.
+3. **Join (Bob).** Invited threads appear under *Shared with me* in the
+   sidebar; click one to join it into the selected project. With a link, use
+   ⌘K → *Join shared thread…* and paste it. The joined thread opens with its
+   own isolated checkouts.
+4. **Work together.** The title bar shows who is here; drafts appear as
+   "*bob is typing*" above the composer; the other person's messages and their
+   Claude's answers stream into your transcript under their name. Each
+   person's turns run on their own machine with their own Claude Code login
+   (ADR 0008): Bob's run in the checkouts of the project he joined into.
+   Turning the link off or removing a member revokes access at once; local
+   history stays.
+
 ## Roadmap
 
 | Phase | Focus |
