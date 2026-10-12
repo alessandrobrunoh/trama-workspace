@@ -2,7 +2,7 @@ use crate::agent::ApprovalDecision;
 use crate::checkpoint::Checkpoint;
 use crate::checkpoint::RepoState;
 use crate::comment::Comment;
-use crate::ids::{AgentSessionId, RepositoryId, ThreadId, WorkspaceId};
+use crate::ids::{AgentSessionId, CommentId, MessageId, RepositoryId, ThreadId, WorkspaceId};
 use crate::message::{Actor, Message};
 use crate::revision::FileRevision;
 use crate::subthread::{LandOutcome, RepoForkPoint, RepoPullResult, ReviewVerdict};
@@ -121,6 +121,42 @@ pub enum DomainEvent {
     CommentCreated {
         comment: Comment,
     },
+    /// Pending comments were sent to the agent with the user prompt
+    /// `message_id` (the thread's `turn`-th prompt).
+    CommentsDelivered {
+        thread_id: ThreadId,
+        comment_ids: Vec<CommentId>,
+        message_id: MessageId,
+        turn: u32,
+    },
+    /// The turn that carried `delivered_message_id` ended with the assistant
+    /// message `answer_message_id`.
+    CommentsAnswered {
+        thread_id: ThreadId,
+        delivered_message_id: MessageId,
+        answer_message_id: MessageId,
+    },
+    /// The prompt carrying these comments never reached the agent (the turn
+    /// failed before it was accepted), so they are pending again.
+    CommentDeliveryFailed {
+        thread_id: ThreadId,
+        comment_ids: Vec<CommentId>,
+        message_id: MessageId,
+    },
+    CommentResolved {
+        thread_id: ThreadId,
+        comment_id: CommentId,
+        resolved_at: DateTime<Utc>,
+    },
+    CommentReopened {
+        thread_id: ThreadId,
+        comment_id: CommentId,
+    },
+    /// Pending comments removed by their author (a root with its replies).
+    CommentsDeleted {
+        thread_id: ThreadId,
+        comment_ids: Vec<CommentId>,
+    },
     CheckpointCreated {
         checkpoint: Checkpoint,
     },
@@ -170,6 +206,12 @@ impl DomainEvent {
             Self::ApprovalResolved { .. } => "agent.approval_resolved",
             Self::FileRevisionRecorded { .. } => "file.revision_recorded",
             Self::CommentCreated { .. } => "comment.created",
+            Self::CommentsDelivered { .. } => "comment.delivered",
+            Self::CommentsAnswered { .. } => "comment.answered",
+            Self::CommentDeliveryFailed { .. } => "comment.delivery_failed",
+            Self::CommentResolved { .. } => "comment.resolved",
+            Self::CommentReopened { .. } => "comment.reopened",
+            Self::CommentsDeleted { .. } => "comment.deleted",
             Self::CheckpointCreated { .. } => "checkpoint.created",
             Self::SubthreadForked { .. } => "subthread.forked",
             Self::ReviewVerdictRecorded { .. } => "review.verdict_recorded",
@@ -204,7 +246,7 @@ mod tests {
     use crate::checkpoint::{Checkpoint, CheckpointLabel, RepoState, WorkingChanges};
     use crate::comment::{CodeAnchor, Comment, CommentTarget};
     use crate::ids::{
-        AgentSessionId, CheckpointId, CommentId, RepositoryId, ThreadId, WorkspaceId,
+        AgentSessionId, CheckpointId, CommentId, MessageId, RepositoryId, ThreadId, WorkspaceId,
     };
     use crate::message::Message;
     use crate::subthread::{FileChangeStatus, PullFileOutcome, PullFileResult};
@@ -255,6 +297,8 @@ mod tests {
             body: "nit".into(),
             created_at: Utc::now(),
             resolved_at: None,
+            parent_id: None,
+            excerpt: Some("let x = 1;".into()),
         }
     }
 
@@ -372,9 +416,64 @@ mod tests {
                 "file.revision_recorded",
             ),
             (
-                DomainEvent::CommentCreated { comment: cmt },
+                DomainEvent::CommentCreated {
+                    comment: cmt.clone(),
+                },
                 Aggregate::Thread { id: th.id.clone() },
                 "comment.created",
+            ),
+            (
+                DomainEvent::CommentsDelivered {
+                    thread_id: th.id.clone(),
+                    comment_ids: vec![cmt.id.clone()],
+                    message_id: MessageId::from("m1"),
+                    turn: 2,
+                },
+                Aggregate::Thread { id: th.id.clone() },
+                "comment.delivered",
+            ),
+            (
+                DomainEvent::CommentsAnswered {
+                    thread_id: th.id.clone(),
+                    delivered_message_id: MessageId::from("m1"),
+                    answer_message_id: MessageId::from("m2"),
+                },
+                Aggregate::Thread { id: th.id.clone() },
+                "comment.answered",
+            ),
+            (
+                DomainEvent::CommentDeliveryFailed {
+                    thread_id: th.id.clone(),
+                    comment_ids: vec![cmt.id.clone()],
+                    message_id: MessageId::from("m1"),
+                },
+                Aggregate::Thread { id: th.id.clone() },
+                "comment.delivery_failed",
+            ),
+            (
+                DomainEvent::CommentResolved {
+                    thread_id: th.id.clone(),
+                    comment_id: cmt.id.clone(),
+                    resolved_at: Utc::now(),
+                },
+                Aggregate::Thread { id: th.id.clone() },
+                "comment.resolved",
+            ),
+            (
+                DomainEvent::CommentReopened {
+                    thread_id: th.id.clone(),
+                    comment_id: cmt.id.clone(),
+                },
+                Aggregate::Thread { id: th.id.clone() },
+                "comment.reopened",
+            ),
+            (
+                DomainEvent::CommentsDeleted {
+                    thread_id: th.id.clone(),
+                    comment_ids: vec![cmt.id],
+                },
+                Aggregate::Thread { id: th.id.clone() },
+                "comment.deleted",
             ),
             (
                 DomainEvent::CheckpointCreated { checkpoint: ckpt },

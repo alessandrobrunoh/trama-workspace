@@ -8,8 +8,10 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeAnchor {
     pub repository_id: RepositoryId,
+    /// Relative to the repository's checkout root.
     pub path: PathBuf,
     /// `FileRevision` number the comment was created against.
+    #[serde(default)]
     pub revision: u64,
     pub start_line: u32,
     pub end_line: u32,
@@ -59,6 +61,27 @@ pub struct Comment {
     pub body: String,
     pub created_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
+    /// Set on a reply: the comment it answers. Replies share the parent's
+    /// target; resolution applies to the root comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<CommentId>,
+    /// The anchored passage captured when the comment was created: the
+    /// transcript slice, the code lines, or the diff hunk. Quoted back to the
+    /// agent, so feedback stays tied to what the person actually saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+}
+
+/// When and with which prompt a comment reached the agent. `turn` counts the
+/// thread's user prompts (1-based); `answer_message_id` is the assistant
+/// message that ended that turn, once it completed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommentDelivery {
+    pub message_id: MessageId,
+    pub turn: u32,
+    pub delivered_at: DateTime<Utc>,
+    #[serde(default)]
+    pub answer_message_id: Option<MessageId>,
 }
 
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
@@ -87,7 +110,6 @@ fn split_lines(content: &str) -> Vec<&str> {
     content.lines().collect()
 }
 
-#[cfg(test)]
 fn line_range_text(lines: &[&str], start_line: u32, end_line: u32) -> Option<String> {
     if start_line == 0 || end_line < start_line {
         return None;
@@ -97,7 +119,6 @@ fn line_range_text(lines: &[&str], start_line: u32, end_line: u32) -> Option<Str
     lines.get(start_idx..=end_idx).map(join_lines)
 }
 
-#[cfg(test)]
 fn context_lines<'a>(lines: &[&'a str], start_line: u32, end_line: u32) -> Vec<&'a str> {
     if start_line == 0 {
         return Vec::new();
@@ -159,6 +180,43 @@ fn find_text_range(
     best.map(|(line, _)| line)
 }
 
+/// Anchor lines `start_line..=end_line` (1-based, inclusive) of `content`.
+/// Returns the anchor (with text and context hashes) and the anchored text,
+/// or `None` when the range is empty or outside the file.
+pub fn capture_anchor(
+    repository_id: RepositoryId,
+    path: PathBuf,
+    revision: u64,
+    content: &str,
+    start_line: u32,
+    end_line: u32,
+) -> Option<(CodeAnchor, String)> {
+    let lines = split_lines(content);
+    let text = line_range_text(&lines, start_line, end_line)?;
+    let context = context_lines(&lines, start_line, end_line);
+    let context_hash = (!context.is_empty()).then(|| hash_text(&join_lines(&context)));
+    Some((
+        CodeAnchor {
+            repository_id,
+            path,
+            revision,
+            start_line,
+            end_line,
+            text_hash: Some(hash_text(&text)),
+            context_hash,
+        },
+        text,
+    ))
+}
+
+/// Lines `start_line..start_line + len` (1-based) of `content`, if present.
+pub fn excerpt_lines(content: &str, start_line: u32, len: u32) -> Option<String> {
+    if len == 0 {
+        return None;
+    }
+    line_range_text(&split_lines(content), start_line, start_line + len - 1)
+}
+
 /// Relocate a code comment after `new_content` replaced the file.
 ///
 /// 1. If any window of the original line-range length still hashes to
@@ -192,6 +250,31 @@ pub fn relocate_anchor(anchor: &CodeAnchor, new_content: &str) -> AnchorStatus {
 mod tests {
     use super::*;
     use crate::ids::RepositoryId;
+
+    #[test]
+    fn capture_anchor_matches_manual_hashes() {
+        let (anchor, text) = capture_anchor(
+            RepositoryId::from("repo"),
+            PathBuf::from("src/lib.rs"),
+            1,
+            ORIGINAL,
+            4,
+            5,
+        )
+        .unwrap();
+        assert_eq!(text, "TARGET ONE\nTARGET TWO");
+        let manual = anchor_for(ORIGINAL, 4, 5);
+        assert_eq!(anchor.text_hash, manual.text_hash);
+        assert_eq!(anchor.context_hash, manual.context_hash);
+        assert!(capture_anchor(RepositoryId::from("r"), "x".into(), 0, ORIGINAL, 0, 1).is_none());
+        assert!(capture_anchor(RepositoryId::from("r"), "x".into(), 0, ORIGINAL, 8, 9).is_none());
+        assert!(capture_anchor(RepositoryId::from("r"), "x".into(), 0, ORIGINAL, 3, 2).is_none());
+        assert_eq!(
+            excerpt_lines(ORIGINAL, 7, 2).as_deref(),
+            Some("delta\nfooter")
+        );
+        assert!(excerpt_lines(ORIGINAL, 8, 2).is_none());
+    }
 
     fn anchor_for(content: &str, start_line: u32, end_line: u32) -> CodeAnchor {
         let lines = split_lines(content);
