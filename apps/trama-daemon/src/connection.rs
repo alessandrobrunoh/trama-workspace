@@ -658,6 +658,48 @@ async fn handle_line(
         ClientMessage::SetCollabPresence { thread_id, state } => {
             collab.set_presence(&thread_id, state)?;
         }
+        ClientMessage::GetDiskUsage { workspace_id } => {
+            let items = sessions.disk_usage(workspace_id.as_ref()).await?;
+            let _ = out_tx.send(DaemonMessage::DiskUsage {
+                workspace_id,
+                items,
+            });
+        }
+        ClientMessage::ArchiveThread {
+            thread_id,
+            delete_checkouts,
+            force,
+        } => {
+            let reply = match sessions
+                .archive_thread(&thread_id, delete_checkouts, force)
+                .await?
+            {
+                Ok((thread, removed)) => DaemonMessage::ThreadArchived { thread, removed },
+                Err(checkouts) => DaemonMessage::CheckoutRemovalRefused {
+                    thread_id,
+                    checkouts,
+                },
+            };
+            let _ = out_tx.send(reply);
+        }
+        ClientMessage::UnarchiveThread { thread_id } => {
+            let thread = sessions.unarchive_thread(&thread_id).await?;
+            let _ = out_tx.send(DaemonMessage::ThreadUnarchived(thread));
+        }
+        ClientMessage::DeleteThreadCheckouts { thread_id, force } => {
+            let reply = match sessions.delete_thread_checkouts(&thread_id, force).await? {
+                crate::session::RemovalOutcome::Removed(removed) => {
+                    DaemonMessage::ThreadCheckoutsDeleted { thread_id, removed }
+                }
+                crate::session::RemovalOutcome::Refused(checkouts) => {
+                    DaemonMessage::CheckoutRemovalRefused {
+                        thread_id,
+                        checkouts,
+                    }
+                }
+            };
+            let _ = out_tx.send(reply);
+        }
         ClientMessage::Shutdown => {
             let _ = shutdown.send(true);
             return Ok(ConnectionControl::Close);

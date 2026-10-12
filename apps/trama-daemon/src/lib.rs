@@ -61,7 +61,8 @@ pub async fn bootstrap_sessions() -> Result<SessionManager> {
     Ok(
         SessionManager::with_checkout_root(db, Arc::new(ProductionAdapter::new()), dir)
             .with_billing(config.billing)
-            .with_subagent_settings(config.subagents),
+            .with_subagent_settings(config.subagents)
+            .with_checkout_copy(config.checkouts),
     )
 }
 

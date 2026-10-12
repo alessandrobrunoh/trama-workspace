@@ -16,7 +16,7 @@ pub(super) const LAND_RESULT_MARKER: &str = "TRAMA_LAND_RESULT:";
 const REVIEW_VERDICT_REF: &str = "refs/trama/review-verdict";
 
 /// Releases `Reservation::Checkouts` on the reserved threads when dropped.
-struct CheckoutsGuard {
+pub(super) struct CheckoutsGuard {
     inner: Arc<Mutex<Inner>>,
     threads: Vec<ThreadId>,
 }
@@ -89,7 +89,7 @@ pub(super) struct ResolvedCheckout {
 impl SessionManager {
     /// Reserve threads before any await so a turn, migration, fork or pull
     /// cannot run concurrently on them. Released by the returned guard.
-    fn reserve_checkouts(&self, threads: &[ThreadId]) -> Result<CheckoutsGuard> {
+    pub(super) fn reserve_checkouts(&self, threads: &[ThreadId]) -> Result<CheckoutsGuard> {
         let mut inner = self.lock();
         if threads.iter().any(|id| {
             inner
@@ -109,9 +109,12 @@ impl SessionManager {
     }
 
     /// Validated managed checkouts of `thread`, in attachment order.
+    /// Checkouts removed to free disk are not recreated here (see
+    /// [`Self::resolve_checkouts_restoring`]).
     pub(super) async fn resolve_checkouts(&self, thread: &Thread) -> Result<Vec<ResolvedCheckout>> {
         // A scout's checkouts are its parent's.
         let owner = self.checkout_owner(thread).await?;
+        self.reject_removed_checkouts(&owner).await?;
         let thread = &owner;
         let memberships = match &thread.workspace_id {
             Some(workspace) => self.db.list_memberships(workspace).await?,
@@ -181,6 +184,17 @@ impl SessionManager {
         Ok(out)
     }
 
+    /// [`Self::resolve_checkouts`], recreating checkouts that were removed
+    /// to free disk first (work is about to run in them).
+    pub(super) async fn resolve_checkouts_restoring(
+        &self,
+        thread: &Thread,
+    ) -> Result<Vec<ResolvedCheckout>> {
+        let owner = self.checkout_owner(thread).await?;
+        self.ensure_checkouts_present(&owner).await?;
+        self.resolve_checkouts(thread).await
+    }
+
     /// Thread snapshots with the latest verdict filled in for review threads,
     /// the nesting depth, and the subagent state of spawned threads.
     pub(super) async fn thread_snapshots(&self, threads: &[Thread]) -> Result<Vec<ThreadSnapshot>> {
@@ -188,9 +202,11 @@ impl SessionManager {
             .iter()
             .map(|thread| (thread.id.clone(), thread.parent_thread_id.clone()))
             .collect();
+        let archived = self.db.archived_thread_ids().await?;
         let mut out = Vec::with_capacity(threads.len());
         for thread in threads {
             let mut snapshot = thread_snapshot(thread);
+            snapshot.archived = archived.contains(&thread.id);
             snapshot.model = self.db.thread_model(&thread.id).await?;
             if thread.kind == ThreadKind::Review {
                 snapshot.review_verdict = self
@@ -334,7 +350,7 @@ impl SessionManager {
     ) -> Result<ForkedChild> {
         let mut thread = Thread::new_subthread(parent, request.kind, Some(request.title))?;
         let reservation = self.reserve_parent(&parent.id, request.allow_parent_turn)?;
-        let parent_checkouts = self.resolve_checkouts(parent).await?;
+        let parent_checkouts = self.resolve_checkouts_restoring(parent).await?;
 
         let checkout_manager = self.checkout_manager.clone();
         let thread_id = thread.id.clone();
@@ -742,8 +758,8 @@ impl SessionManager {
             vec![parent.id.clone(), sub.id.clone()]
         };
         let _reservation = self.reserve_checkouts(&reserved)?;
-        let sub_checkouts = self.resolve_checkouts(&sub).await?;
-        let parent_checkouts = self.resolve_checkouts(&parent).await?;
+        let sub_checkouts = self.resolve_checkouts_restoring(&sub).await?;
+        let parent_checkouts = self.resolve_checkouts_restoring(&parent).await?;
         let mut requests = Vec::with_capacity(sub_checkouts.len());
         for checkout in sub_checkouts {
             let fork_commit = fork

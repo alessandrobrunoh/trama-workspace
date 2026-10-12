@@ -24,6 +24,10 @@ pub struct FileConfig {
     /// tool stays available.
     #[serde(default)]
     pub subagents: crate::session::SubagentSettings,
+    /// How thread checkouts are copied: `{"mode": "copy_on_write" | "git",
+    /// "exclude": ["relative/path", ...]}` (ADR 0012).
+    #[serde(default)]
+    pub checkouts: trama_infra::checkout::CopyOptions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -434,6 +438,25 @@ mod tests {
         assert!(names.contains(&"From UI".to_string()));
         assert!(names.contains(&"From file".to_string()));
         assert_eq!(db.list_memberships(&workspace.id).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn checkout_copy_settings_parse_with_defaults() {
+        let config: FileConfig = serde_json::from_str(r#"{"workspaces":[]}"#).unwrap();
+        assert_eq!(
+            config.checkouts.mode,
+            trama_infra::checkout::CopyMode::CopyOnWrite
+        );
+        assert!(config.checkouts.exclude.is_empty());
+        let config: FileConfig = serde_json::from_str(
+            r#"{"checkouts":{"mode":"git","exclude":["target/debug/incremental",".venv"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.checkouts.mode, trama_infra::checkout::CopyMode::Git);
+        assert_eq!(
+            config.checkouts.exclude,
+            vec!["target/debug/incremental".to_owned(), ".venv".to_owned()]
+        );
     }
 
     #[test]

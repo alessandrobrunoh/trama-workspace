@@ -6,6 +6,9 @@ mod activity_tests;
 mod agents;
 #[cfg(test)]
 mod agents_tests;
+mod archive;
+#[cfg(test)]
+mod archive_tests;
 mod comments;
 #[cfg(test)]
 mod composer_tests;
@@ -23,6 +26,7 @@ pub(crate) use context::model_choices;
 pub use context::{NoCollaborators, PeopleSource, Person, PromptContext};
 
 pub use agents::SubagentSettings;
+pub use archive::RemovalOutcome;
 
 use crate::approval::{self, ApprovalHookSettings, HookDecision};
 
@@ -213,6 +217,12 @@ impl SessionManager {
         }
     }
 
+    /// How new checkouts are copied (`config.json` `checkouts`).
+    pub fn with_checkout_copy(mut self, copy: trama_infra::checkout::CopyOptions) -> Self {
+        self.checkout_manager = self.checkout_manager.clone().with_copy_options(copy);
+        self
+    }
+
     /// Billing for new agent sessions. Defaults to the subscription.
     pub fn with_billing(mut self, billing: BillingMode) -> Self {
         self.billing = billing;
@@ -336,7 +346,18 @@ impl SessionManager {
                 ))
             })?;
             let source = std::fs::canonicalize(&source).unwrap_or(source);
-            let (status, checkout_path, detail) = if let (Some(_id), Some(base)) = (
+            let removed = match attachment.checkout_id.as_ref() {
+                Some(id) => self.db.removed_checkout(id).await?.is_some(),
+                None => false,
+            };
+            let (status, checkout_path, detail) = if removed {
+                let detail = if self.db.is_thread_archived(thread_id).await? {
+                    archive::ARCHIVED_DETAIL
+                } else {
+                    archive::REMOVED_DETAIL
+                };
+                (CheckoutStatus::Removed, None, Some(detail.to_owned()))
+            } else if let (Some(_id), Some(base)) = (
                 attachment.checkout_id.as_ref(),
                 attachment.base_revision.as_ref(),
             ) {
@@ -1786,6 +1807,8 @@ impl SessionManager {
         }
         // A scout works in its parent's checkouts.
         let owner = self.checkout_owner(&thread).await?;
+        // Checkouts removed to free disk come back before the turn.
+        self.ensure_checkouts_present(&owner).await?;
         let mut paths = Vec::with_capacity(owner.repo_attachments.len());
         let mut validations = Vec::new();
         for attachment in &owner.repo_attachments {
