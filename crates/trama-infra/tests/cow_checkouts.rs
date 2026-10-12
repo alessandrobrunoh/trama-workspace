@@ -409,3 +409,175 @@ fn linked_and_excluded_paths_are_not_cloned() {
             .is_symlink()
     );
 }
+
+#[test]
+fn archive_remove_and_restore_a_thread_checkout() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = source_repo(temp.path());
+    write_random(&source.join("target/out.bin"), 1 << 20, 3);
+    let manager = CheckoutManager::new(temp.path().join("data"));
+    let (thread, repo, checkout_id) = ids("arch");
+    let provisioned = manager
+        .provision_repo_local(&source, &thread, &repo, &checkout_id)
+        .unwrap();
+    let checkout = provisioned.path.clone();
+    git(&checkout, &["switch", "-q", "-c", "thread/work"]);
+    fs::write(checkout.join("committed.txt"), "committed\n").unwrap();
+    git(&checkout, &["add", "committed.txt"]);
+    git(&checkout, &["commit", "-q", "-m", "thread commit"]);
+    let thread_head = git(&checkout, &["rev-parse", "HEAD"]);
+    fs::write(checkout.join("README.md"), "uncommitted edit\n").unwrap();
+    fs::write(checkout.join("new.txt"), "untracked\n").unwrap();
+
+    let report = manager.removal_report(&source, &checkout).unwrap();
+    assert!(report.has_unsaved_work());
+    assert_eq!(report.changed_file_count, 2, "{report:?}");
+    assert_eq!(report.commits_not_in_source, 1);
+    let clean = provision(&manager, &source, "clean");
+    assert!(
+        !manager
+            .removal_report(&source, &clean)
+            .unwrap()
+            .has_unsaved_work()
+    );
+
+    let archived = manager
+        .archive_repo_local(&source, &thread, &checkout_id, &checkout)
+        .unwrap();
+    assert!(archived.bundle.exists());
+    assert_eq!(archived.head_ref.as_deref(), Some("refs/heads/thread/work"));
+    let bundle_size = fs::metadata(&archived.bundle).unwrap().len();
+    assert!(bundle_size < 64 * 1024, "bundle is {bundle_size} bytes");
+    // Only the managed checkout directory can be removed.
+    assert!(manager.remove_repo_local(&source, &source).is_err());
+    manager.remove_repo_local(&source, &checkout).unwrap();
+    assert!(!checkout.exists());
+
+    // The source moves on and is dirty: neither leaks into the restore.
+    fs::write(source.join("src/lib.rs"), "pub fn one() -> u8 { 9 }\n").unwrap();
+    fs::write(source.join("stray.txt"), "source only\n").unwrap();
+    let read = manager.read_archive(&thread, &checkout_id).unwrap();
+    assert_eq!(read, archived);
+    let restored = manager
+        .restore_repo_local(&source, &thread, &repo, &checkout_id, &read)
+        .unwrap();
+    assert_eq!(restored, checkout);
+    assert_eq!(git(&restored, &["rev-parse", "HEAD"]), thread_head);
+    assert_eq!(
+        git(&restored, &["symbolic-ref", "HEAD"]),
+        "refs/heads/thread/work"
+    );
+    assert_eq!(
+        fs::read_to_string(restored.join("README.md")).unwrap(),
+        "uncommitted edit\n"
+    );
+    assert_eq!(
+        fs::read_to_string(restored.join("new.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert_eq!(
+        fs::read_to_string(restored.join("src/lib.rs")).unwrap(),
+        "pub fn one() -> u8 { 1 }\n"
+    );
+    assert!(!restored.join("stray.txt").exists());
+    // Build output comes back with the copy-on-write clone of the source.
+    assert!(restored.join("target/out.bin").exists());
+    manager
+        .validate_repo_local(&source, &restored, &provisioned.base_revision)
+        .unwrap();
+    manager.discard_archive(&read);
+    assert!(!read.bundle.exists());
+}
+
+#[test]
+fn removed_subthread_copy_restores_its_fork_point() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = source_repo(temp.path());
+    let manager = CheckoutManager::new(temp.path().join("data"));
+    let parent = provision(&manager, &source, "parent");
+    fs::write(parent.join("parent.txt"), "parent commit\n").unwrap();
+    git(&parent, &["add", "parent.txt"]);
+    git(&parent, &["commit", "-q", "-m", "parent only"]);
+    let (thread, repo, checkout_id) = ids("child");
+    let copy = manager
+        .provision_copy(&parent, &source, &thread, &repo, &checkout_id)
+        .unwrap();
+    fs::write(copy.path.join("child.txt"), "child\n").unwrap();
+    let archived = manager
+        .archive_repo_local(&source, &thread, &checkout_id, &copy.path)
+        .unwrap();
+    manager.remove_repo_local(&source, &copy.path).unwrap();
+    // Remove the parent too: the parent-only commit lives in the bundle.
+    manager.remove_repo_local(&source, &parent).unwrap();
+    let restored = manager
+        .restore_repo_local(&source, &thread, &repo, &checkout_id, &archived)
+        .unwrap();
+    assert_eq!(
+        git(
+            &restored,
+            &["rev-parse", trama_infra::changes::FORK_POINT_REF]
+        ),
+        copy.fork_commit
+    );
+    assert_eq!(
+        fs::read_to_string(restored.join("parent.txt")).unwrap(),
+        "parent commit\n"
+    );
+    assert_eq!(
+        fs::read_to_string(restored.join("child.txt")).unwrap(),
+        "child\n"
+    );
+    manager
+        .validate_repo_local(&source, &restored, &copy.base_revision)
+        .unwrap();
+}
+
+/// Manual measurement on a real repository (never run by default):
+/// `TRAMA_COW_MEASURE_SOURCE=<clean repo> TRAMA_COW_MEASURE_COUNT=20 cargo test
+/// -p trama-infra --test cow_checkouts -- --ignored --nocapture measure`.
+/// Checkouts are created under the source's `.trama/worktrees/measure-*` and
+/// removed at the end unless `TRAMA_COW_MEASURE_KEEP` is set.
+#[test]
+#[ignore]
+fn measure_real_repository() {
+    let Some(source) = std::env::var_os("TRAMA_COW_MEASURE_SOURCE") else {
+        return;
+    };
+    let source = PathBuf::from(source).canonicalize().unwrap();
+    let count: usize = std::env::var("TRAMA_COW_MEASURE_COUNT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20);
+    let data = tempfile::tempdir().unwrap();
+    let manager = CheckoutManager::new(data.path());
+    let source_usage = disk_usage(&source).unwrap();
+    let free_before = free_bytes(&source);
+    let mut checkouts = Vec::new();
+    let started = Instant::now();
+    for index in 0..count {
+        let one = Instant::now();
+        checkouts.push(provision(&manager, &source, &format!("measure-{index}")));
+        eprintln!("checkout {index}: {:?}", one.elapsed());
+    }
+    let elapsed = started.elapsed();
+    let free_after = free_bytes(&source);
+    let (mut apparent, mut private) = (0, 0);
+    for checkout in &checkouts {
+        let usage = disk_usage(checkout).unwrap();
+        apparent += usage.apparent_bytes;
+        private += usage.private_bytes;
+    }
+    eprintln!(
+        "source apparent {} MiB; {count} checkouts in {elapsed:?} ({:?} each): apparent {} MiB, private {} KiB, free space delta {} KiB",
+        source_usage.apparent_bytes >> 20,
+        elapsed / count as u32,
+        apparent >> 20,
+        private >> 10,
+        free_before.saturating_sub(free_after) >> 10
+    );
+    if std::env::var_os("TRAMA_COW_MEASURE_KEEP").is_none() {
+        for checkout in &checkouts {
+            manager.remove_repo_local(&source, checkout).unwrap();
+        }
+    }
+}
