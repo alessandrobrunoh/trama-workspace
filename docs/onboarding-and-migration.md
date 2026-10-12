@@ -4,7 +4,7 @@ The database under Application Support is the source of truth. Do not hand-edit
 `config.json` to create a workspace or attach a repository. An empty config
 file does not delete workspaces, repositories, or threads created from the UI.
 
-Protocol version is 9. `Hello` / `Welcome` carry that version. A rejected
+Protocol version is 10. `Hello` / `Welcome` carry that version. A rejected
 handshake means the app and the daemon were not restarted together. It does
 not rewrite stored ids or messages.
 
