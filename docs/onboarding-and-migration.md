@@ -34,10 +34,12 @@ is that membership count.
 
 ### Project setup in new checkouts
 
-Ignored files (`node_modules`, `target/`, `.env`) are not cloned. Commit
-`.agents/linked` and an executable `.agents/prepare` to link or rebuild them in
-every new thread checkout and subthread copy; see
-[project setup](project-setup.md). Migrating a legacy thread does not run them.
+On APFS a checkout is a copy-on-write clone that includes ignored files
+(`node_modules`, `target/`, `.env`) at almost no disk cost; with the
+`git clone` fallback they are missing. Commit `.agents/linked` and an
+executable `.agents/prepare` to link or rebuild what a checkout needs in every
+new thread checkout and subthread copy; see [project setup](project-setup.md)
+and [ADR 0012](adr/0012-copy-on-write-checkouts.md). Migrating a legacy thread does not run them.
 
 ### Which checkout is the cwd
 
@@ -70,8 +72,11 @@ The one permitted nested checkout root is exactly this `.trama/worktrees`
 layout. The daemon rejects tracked `.trama` content and unsafe/symlinked
 pre-existing paths, and adds `/.trama/` to that repository's Git
 `info/exclude` (not its tracked `.gitignore`). The source must otherwise be
-clean before provisioning; ignored files are not copied. The clone uses
-`--no-hardlinks` and retains its local remote.
+clean before provisioning. The checkout is a copy-on-write clone of the source
+(ignored build output included, `.trama/` excluded) reset to a clean tree at
+the source's `HEAD`, or a `git clone` (hardlinked objects, no ignored files)
+where clones are unsupported; its `local` remote is the source and `origin`
+the source's `origin` (ADR 0012).
 
 Existing Application Support checkouts remain at their original paths. Rows
 without a concrete path record use the historical global resolver, and a

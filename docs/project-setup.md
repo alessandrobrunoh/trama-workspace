@@ -1,11 +1,21 @@
 # Project setup: `.agents/prepare` and `.agents/linked`
 
-A thread's checkout is a fresh `git clone` of the repository you added
+A thread's checkout lives beside the repository you added
 (`<source>/.trama/worktrees/<thread>/<checkout>`), and a subthread's checkout
-is a copy of its parent's. Clones do not contain ignored files, so
-`node_modules`, `target/`, `.env` and similar are missing. A repository can
-commit two files that Trama runs in every **new** checkout, using the same
-names as Delta:
+is a copy of its parent's. On APFS (every Mac) a new checkout is a
+**copy-on-write clone** of the whole working tree, ignored files included:
+`target/`, `node_modules/`, `.venv/` and `.env` are there from the start and
+share their disk blocks with the original until one side writes (see
+[ADR 0012](adr/0012-copy-on-write-checkouts.md)). Twenty threads of a 20 GB
+project cost about what they change, not 20 × 20 GB, and the first build in a
+thread is incremental. Heavy directories therefore no longer need to be linked
+or cloned by `prepare`.
+
+Where clones are not supported (another file system) the checkout is a
+`git clone` instead: committed files and history only, no ignored files. The
+two files below fill that gap and handle per-checkout setup. A repository can
+commit them, using the same names as Delta, and Trama runs them in every
+**new** checkout:
 
 | File | Override | Purpose |
 |---|---|---|
@@ -62,9 +72,9 @@ Treat these values as data: quote them (`"$TRAMA_THREAD_TITLE"`) and never pass
 them to `eval`. A symlinked script, or one that is not executable, is reported
 as a failure without running.
 
-Example: clone dependencies and build output from the primary checkout with
-APFS copy-on-write (`cp -c`) when the lockfile matches, else install. Clones
-share blocks until either side writes, so they cost almost no disk.
+Example: on APFS the checkout already has `node_modules` and `target/`, so a
+script only installs when they are missing (a `git clone` fallback) or when
+the lockfile differs from the primary checkout's:
 
 ```sh
 #!/bin/sh
@@ -72,17 +82,9 @@ set -eu
 src="$TRAMA_SOURCE_PATH"
 
 if [ -f package-lock.json ]; then
-  if [ -d "$src/node_modules" ] && cmp -s package-lock.json "$src/package-lock.json"; then
-    cp -c -R "$src/node_modules" node_modules
-  else
+  if [ ! -d node_modules ] || ! cmp -s package-lock.json "$src/package-lock.json"; then
     npm ci --no-audit --no-fund
   fi
-fi
-
-if [ -f Cargo.lock ] && [ -d "$src/target" ]; then
-  cp -c -R "$src/target" target
-  # Incremental state diverges fastest; Cargo regenerates it.
-  find target -type d -name incremental -prune -exec rm -rf {} +
 fi
 ```
 
@@ -123,8 +125,48 @@ when it:
 
 Every checkout that links a path shares it: writes from one thread are visible
 in all of them. Do not link files whose values must differ per checkout (ports,
-database names), and prefer `prepare` with `cp -c` for `node_modules` or
-`target/`, which differ per branch and would serialize parallel builds.
+database names). Never link `node_modules` or `target/`: they differ per branch
+and would serialize parallel builds, and the copy-on-write clone already gives
+every checkout its own copy at almost no cost. A copy-on-write checkout drops
+its cloned copy of each linked path before linking it, so the entry does not
+count as "already exists".
+
+## Excluding paths from the copy
+
+`config.json` (next to the daemon's database) controls how checkouts are
+copied:
+
+```json
+{
+  "checkouts": {
+    "mode": "copy_on_write",
+    "exclude": ["target/debug/incremental", ".cache"]
+  }
+}
+```
+
+`mode` is `copy_on_write` (default; falls back to `git clone` where clones are
+not supported) or `git` (always `git clone`). `exclude` lists
+repository-relative literal paths that are never copied: a top-level name is
+skipped while cloning, a nested path is removed from the fresh copy. Tracked
+paths are never excluded. `.trama/` (other threads' checkouts) is never
+copied.
+
+## Disk usage, archiving and removing checkouts
+
+Checkouts are temporary. **Disk usage** (⌘K, or *Manage projects*) lists every
+checkout with its apparent size (what `du` shows, shared blocks counted in
+full) and its private size (what removing it would free). *Archive thread*
+(⌘W, or the thread's context menu) hides the thread, keeps its conversation,
+and removes its checkouts; *Delete copy* removes them without archiving. Both
+refuse while a turn runs, and ask for confirmation (listing the files and
+commits) when a checkout holds work the source repository does not have.
+Before a checkout is removed its whole state (commits, uncommitted and
+untracked files) is saved as a Git bundle in the app data directory
+(`archives/<thread>/<checkout>.bundle`); unarchiving the thread, or its next
+turn, fork or pull, recreates the checkout at the same path from a fresh copy
+of the source plus that bundle, and setup runs again. Ignored files of the
+removed checkout (its own build output, local databases) are not kept.
 
 ## direnv
 

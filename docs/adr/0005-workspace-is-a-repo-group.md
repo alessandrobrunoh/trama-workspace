@@ -26,7 +26,8 @@ share a dirty working tree.
   - per-thread isolated checkouts; legacy `Adopted` attachments require
     explicit preparation before execution;
   - no cross-repo index or combined commit.
-- An isolated attachment is provisioned with `git clone --no-hardlinks`,
+- An isolated attachment is provisioned with `git clone --no-hardlinks`
+  (superseded by ADR 0012: a copy-on-write clone, `git clone` as fallback),
   atomically published at `<source>/.trama/worktrees/<thread>/<checkout>`.
   Concrete paths are persisted with attachment identity. The controlled local
   subtree is ignored in Git `info/exclude`, without changing tracked files.

@@ -5,6 +5,10 @@
     "max_running_total": 8,
     "allow_builtin_subagents": false
   },
+  "checkouts": {
+    "mode": "copy_on_write",
+    "exclude": []
+  },
   "workspaces": [
     {
       "name": "LaFraternita",
