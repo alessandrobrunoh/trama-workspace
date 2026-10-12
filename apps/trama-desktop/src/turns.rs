@@ -1,10 +1,11 @@
-//! Turn rail: the transcript split into turns, the rail's tick geometry,
+//! Turn rail: the transcript split into turns, the rail's dash geometry,
 //! the hover card's text, and bookmarked turns.
 //!
 //! A turn is a prompt and everything the agent did to answer it. The rail
-//! on the transcript's right edge draws one tick per turn, sized by the
-//! turn's share of the scroll content. Geometry works in content pixels
-//! (0 = top of the scroll content) so it can be tested without a window.
+//! on the transcript's right edge stacks one short dash per turn, evenly
+//! spaced; the turn being read gets a longer, brighter dash. Turn extents
+//! work in content pixels (0 = top of the scroll content) so the current
+//! turn and ⌥+scroll targets can be tested without a window.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -251,18 +252,25 @@ impl Span {
     }
 }
 
-/// One tick on the rail, in rail pixels.
+/// One dash on the rail, in rail pixels from the rail's top.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Tick {
+pub struct Dash {
     pub top: f32,
-    pub height: f32,
+    /// The turn being read: drawn longer and brighter.
+    pub current: bool,
     /// Part of the turn is on screen.
     pub in_view: bool,
 }
 
-/// Gap between consecutive ticks and the shortest tick drawn.
-pub const TICK_GAP: f32 = 2.;
-pub const MIN_TICK: f32 = 3.;
+/// Distance between consecutive dashes when the rail has room.
+pub const DASH_PITCH: f32 = 8.;
+/// Closest the dashes get on a crowded rail.
+pub const MIN_DASH_PITCH: f32 = 3.;
+/// Dash lengths: every turn, and the turn being read.
+pub const DASH_LENGTH: f32 = 8.;
+pub const CURRENT_DASH_LENGTH: f32 = 16.;
+/// Dash thickness.
+pub const DASH_THICKNESS: f32 = 2.;
 
 /// Turn extents from where each turn starts and where the content ends.
 pub fn turn_spans(starts: &[f32], content_end: f32) -> Vec<Span> {
@@ -276,22 +284,35 @@ pub fn turn_spans(starts: &[f32], content_end: f32) -> Vec<Span> {
         .collect()
 }
 
-/// Ticks for `spans` on a rail `rail_height` tall that maps the whole
-/// content (`content_height`); `view` is the visible part.
-pub fn rail_ticks(spans: &[Span], content_height: f32, view: Span, rail_height: f32) -> Vec<Tick> {
-    let scale = rail_height / content_height.max(1.);
+/// One dash per turn, evenly spaced whatever the turn's length, stacked
+/// in the middle of a rail `rail_height` tall. The pitch shrinks (down to
+/// [`MIN_DASH_PITCH`]) when the turns would not fit; past that the stack
+/// is clipped at the rail's ends. `view` is the visible part of the
+/// content and `current` the turn being read.
+pub fn rail_dashes(
+    spans: &[Span],
+    view: Span,
+    current: Option<usize>,
+    rail_height: f32,
+) -> Vec<Dash> {
+    let count = spans.len();
+    if count == 0 {
+        return Vec::new();
+    }
+    let pitch = if count > 1 {
+        (rail_height / (count - 1) as f32).clamp(MIN_DASH_PITCH, DASH_PITCH)
+    } else {
+        DASH_PITCH
+    };
+    let stack = pitch * (count - 1) as f32 + DASH_THICKNESS;
+    let first = ((rail_height - stack) / 2.).max(0.);
     spans
         .iter()
-        .map(|span| {
-            let top = (span.top * scale).clamp(0., (rail_height - MIN_TICK).max(0.));
-            let height = ((span.bottom - span.top) * scale - TICK_GAP)
-                .max(MIN_TICK)
-                .min((rail_height - top).max(MIN_TICK));
-            Tick {
-                top,
-                height,
-                in_view: span.overlaps(view),
-            }
+        .enumerate()
+        .map(|(index, span)| Dash {
+            top: first + pitch * index as f32,
+            current: current == Some(index),
+            in_view: span.overlaps(view),
         })
         .collect()
 }
@@ -535,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn ticks_are_proportional_and_mark_the_view() {
+    fn dashes_are_evenly_spaced_and_mark_the_current_turn() {
         let spans = turn_spans(&[0., 100., 400.], 1000.);
         assert_eq!(
             spans,
@@ -545,22 +566,33 @@ mod tests {
                 Span::new(400., 1000.)
             ]
         );
-        let ticks = rail_ticks(&spans, 1000., Span::new(350., 650.), 250.);
-        assert_eq!(ticks.len(), 3);
-        assert_eq!(ticks[0].top, 0.);
-        assert_eq!(ticks[0].height, 25. - TICK_GAP);
-        assert_eq!(ticks[1].top, 25.);
-        assert_eq!(ticks[1].height, 75. - TICK_GAP);
-        assert_eq!(ticks[2].top, 100.);
-        assert_eq!(ticks[2].height, 150. - TICK_GAP);
+        // Same pitch whatever the turn lengths, centered on the rail.
+        let dashes = rail_dashes(&spans, Span::new(350., 650.), Some(1), 200.);
+        assert_eq!(dashes.len(), 3);
+        let pitches: Vec<f32> = dashes.windows(2).map(|w| w[1].top - w[0].top).collect();
+        assert_eq!(pitches, vec![DASH_PITCH, DASH_PITCH]);
+        let stack = 2. * DASH_PITCH + DASH_THICKNESS;
+        assert_eq!(dashes[0].top, (200. - stack) / 2.);
         assert_eq!(
-            ticks.iter().map(|tick| tick.in_view).collect::<Vec<_>>(),
+            dashes.iter().map(|dash| dash.current).collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
+        assert_eq!(
+            dashes.iter().map(|dash| dash.in_view).collect::<Vec<_>>(),
             vec![false, true, true]
         );
-        // Tiny turns still get a visible tick inside the rail.
-        let tiny = rail_ticks(&[Span::new(999., 1000.)], 1000., Span::new(0., 10.), 200.);
-        assert_eq!(tiny[0].height, MIN_TICK);
-        assert!(tiny[0].top + tiny[0].height <= 200.);
+        // A crowded rail tightens the pitch, but never below the minimum.
+        let many: Vec<Span> = (0..100)
+            .map(|n| Span::new(n as f32 * 10., n as f32 * 10. + 10.))
+            .collect();
+        let crowded = rail_dashes(&many, Span::new(0., 10.), None, 300.);
+        let pitch = crowded[1].top - crowded[0].top;
+        assert!(pitch < DASH_PITCH && pitch >= MIN_DASH_PITCH);
+        assert!(crowded.iter().all(|dash| !dash.current));
+        let packed = rail_dashes(&many, Span::new(0., 10.), None, 50.);
+        assert_eq!(packed[1].top - packed[0].top, MIN_DASH_PITCH);
+        assert_eq!(packed[0].top, 0.);
+        assert!(rail_dashes(&[], Span::new(0., 1.), None, 100.).is_empty());
     }
 
     #[test]

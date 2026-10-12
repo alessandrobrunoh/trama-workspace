@@ -2813,10 +2813,11 @@ impl ChatPanel {
 
 // -- turn rail --------------------------------------------------------------
 
-/// Rail width, inset from the top and bottom of the transcript, and the
-/// hover card's width.
-const RAIL_WIDTH: f32 = 18.;
+/// Rail width, inset from the top and bottom of the transcript, the
+/// dashes' distance from the right edge, and the hover card's width.
+const RAIL_WIDTH: f32 = 26.;
 const RAIL_INSET: f32 = 10.;
+const RAIL_DASH_RIGHT: f32 = 8.;
 const RAIL_CARD_WIDTH: f32 = 320.;
 
 impl ChatPanel {
@@ -2928,45 +2929,46 @@ impl ChatPanel {
         if rail_height < 40. || geometry.spans.len() != turn_list.len() {
             return (None, None);
         }
-        let ticks = turns::rail_ticks(
-            &geometry.spans,
-            geometry.content_height,
-            geometry.view,
-            rail_height,
-        );
         let current = turns::current_turn(&geometry.spans, geometry.view, geometry.content_height);
+        let dashes = turns::rail_dashes(&geometry.spans, geometry.view, current, rail_height);
         let marked = |turn: &turns::Turn| match (&self.selected_thread, &turn.message_id) {
             (Some(thread), Some(message)) => self.bookmarks.contains(thread, message),
             _ => false,
         };
+        let pitch = match dashes.as_slice() {
+            [first, second, ..] => second.top - first.top,
+            _ => turns::DASH_PITCH,
+        };
 
         let mut rail = div().relative().size_full();
-        for (index, tick) in ticks.iter().enumerate() {
-            let is_current = current == Some(index);
+        for (index, dash) in dashes.iter().enumerate() {
             let hovered = self.rail.hovered == Some(index);
             let bookmarked = marked(&turn_list[index]);
             let color = if bookmarked {
-                p.warning
-            } else if is_current {
                 p.accent
-            } else if hovered {
+            } else if dash.current || hovered {
+                p.text
+            } else if dash.in_view {
                 p.text_muted
-            } else if tick.in_view {
-                p.text_faint
             } else {
-                p.border_strong
+                p.text_faint
             };
-            let width = if is_current || hovered { 4. } else { 3. };
-            // A taller hit area than the tick so short turns stay easy to hit.
-            let slop = ((8. - tick.height) / 2.).max(0.);
+            let length = if dash.current || hovered {
+                turns::CURRENT_DASH_LENGTH
+            } else {
+                turns::DASH_LENGTH
+            };
+            // The hit area fills the pitch so dense rails stay easy to hit.
+            let slot = pitch.max(turns::DASH_THICKNESS + 2.);
+            let slop = (slot - turns::DASH_THICKNESS) / 2.;
             rail = rail.child(
                 div()
-                    .id(("rail-tick", index))
+                    .id(("rail-dash", index))
                     .absolute()
                     .left_0()
                     .right_0()
-                    .top(px(tick.top - slop))
-                    .h(px(tick.height + 2. * slop))
+                    .top(px(dash.top - slop))
+                    .h(px(slot))
                     .cursor_pointer()
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered {
@@ -2982,11 +2984,11 @@ impl ChatPanel {
                     .child(
                         div()
                             .absolute()
-                            .right(px(6.))
+                            .right(px(RAIL_DASH_RIGHT))
                             .top(px(slop))
-                            .h(px(tick.height))
-                            .w(px(width))
-                            .rounded(px(2.))
+                            .h(px(turns::DASH_THICKNESS))
+                            .w(px(length))
+                            .rounded(px(1.))
                             .bg(color),
                     ),
             );
@@ -3007,7 +3009,7 @@ impl ChatPanel {
             .map(|index| {
                 let at = point(
                     bounds.right() - px(RAIL_WIDTH + 6.),
-                    bounds.top() + px(RAIL_INSET + ticks[index].top - 6.),
+                    bounds.top() + px(RAIL_INSET + dashes[index].top - 10.),
                 );
                 let card = self.turn_card(index, turn_list, marked(&turn_list[index]), p);
                 deferred(
@@ -3103,7 +3105,7 @@ impl ChatPanel {
                                     h_flex()
                                         .gap(theme::sp(1.))
                                         .items_center()
-                                        .text_color(p.warning)
+                                        .text_color(p.accent_text)
                                         .child(Icon::new(IconName::Bookmark).with_size(px(11.)))
                                         .child("Bookmarked"),
                                 )
