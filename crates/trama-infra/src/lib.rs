@@ -7,6 +7,8 @@
 pub mod changes;
 pub mod checkout;
 pub mod claude;
+#[cfg(unix)]
+pub mod pty;
 pub mod setup;
 
 pub use claude::adapter::ClaudeAdapter;
