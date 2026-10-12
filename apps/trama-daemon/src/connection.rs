@@ -436,7 +436,7 @@ async fn handle_line(
             let parent_thread_id = sessions
                 .submit_review_verdict(&review_thread_id, verdict.clone())
                 .await?;
-            collab.publish_verdict(parent_thread_id.clone(), verdict.clone());
+            collab.publish_verdict(review_thread_id.clone());
             let _ = out_tx.send(DaemonMessage::ReviewVerdictPosted {
                 review_thread_id,
                 parent_thread_id,
@@ -507,19 +507,21 @@ async fn handle_line(
         }
         ClientMessage::ResolveComment { comment_id } => {
             let snapshot = sessions.resolve_comment(&comment_id).await?;
-            collab.publish_resolve(comment_id);
+            collab.publish_resolve(snapshot.clone());
             if !subscriptions.contains_key(&snapshot.thread_id) {
                 let _ = out_tx.send(DaemonMessage::CommentUpdated(snapshot));
             }
         }
         ClientMessage::ReopenComment { comment_id } => {
             let snapshot = sessions.reopen_comment(&comment_id).await?;
+            collab.publish_reopen(snapshot.clone());
             if !subscriptions.contains_key(&snapshot.thread_id) {
                 let _ = out_tx.send(DaemonMessage::CommentUpdated(snapshot));
             }
         }
         ClientMessage::DeleteComment { comment_id } => {
             let (thread_id, comment_ids) = sessions.delete_comment(&comment_id).await?;
+            collab.publish_delete(thread_id.clone(), comment_ids.clone());
             if !subscriptions.contains_key(&thread_id) {
                 let _ = out_tx.send(DaemonMessage::CommentDeleted {
                     thread_id,
@@ -699,6 +701,13 @@ async fn handle_line(
                 }
             };
             let _ = out_tx.send(reply);
+        }
+        ClientMessage::GetRemoteChanges { thread_id } => {
+            let snapshots = collab.remote_changes(&thread_id).await?;
+            let _ = out_tx.send(DaemonMessage::RemoteChanges {
+                thread_id,
+                snapshots,
+            });
         }
         ClientMessage::Shutdown => {
             let _ = shutdown.send(true);

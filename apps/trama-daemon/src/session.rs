@@ -56,6 +56,17 @@ use trama_protocol::{DaemonMessage, RepositorySnapshot, ThreadSnapshot, Workspac
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SubscriptionId(u64);
 
+/// What the collab layer learns from a thread's broadcasts, so a shared
+/// thread's family publishes new messages, children, comments and subagent
+/// states (ADR 0013). Sent for every thread; the collab layer filters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CollabSignal {
+    /// Something publishable may have changed in this thread.
+    Changed(ThreadId),
+    /// The task state of this subagent thread changed.
+    SubagentStatus(ThreadId),
+}
+
 struct Subscriber {
     id: SubscriptionId,
     tx: mpsc::UnboundedSender<DaemonMessage>,
@@ -184,6 +195,8 @@ pub struct SessionManager {
     agents_config: Arc<agents::AgentsConfig>,
     /// Subagent tasks, MCP tokens, waiters and agent-message mailboxes.
     agents: Arc<agents::AgentsRuntime>,
+    /// Where [`CollabSignal`]s go (the collab service), if anywhere.
+    collab_observer: Arc<Mutex<Option<mpsc::UnboundedSender<CollabSignal>>>>,
 }
 
 impl SessionManager {
@@ -214,6 +227,40 @@ impl SessionManager {
             billing: BillingMode::default(),
             approval_hook: None,
             composer: Arc::new(context::ComposerState::new()),
+            collab_observer: Arc::default(),
+        }
+    }
+
+    /// Route [`CollabSignal`]s to `tx` (replacing any previous observer).
+    pub(crate) fn set_collab_observer(&self, tx: Option<mpsc::UnboundedSender<CollabSignal>>) {
+        *self
+            .collab_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = tx;
+    }
+
+    fn observe(&self, thread_id: &ThreadId, message: &DaemonMessage) {
+        let signal = match message {
+            DaemonMessage::MessageAppended { .. }
+            | DaemonMessage::SubthreadCreated(_)
+            | DaemonMessage::ReviewVerdictPosted { .. }
+            | DaemonMessage::CommentCreated(_) => CollabSignal::Changed(thread_id.clone()),
+            DaemonMessage::SubagentStatusChanged {
+                thread_id: child, ..
+            } if child == thread_id => CollabSignal::SubagentStatus(child.clone()),
+            DaemonMessage::AgentEventEnvelope {
+                event: AgentEvent::TurnCompleted { .. },
+                ..
+            } => CollabSignal::Changed(thread_id.clone()),
+            _ => return,
+        };
+        if let Some(tx) = self
+            .collab_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = tx.send(signal);
         }
     }
 
@@ -1012,8 +1059,29 @@ impl SessionManager {
         comments_only: bool,
         attached: PromptContext,
     ) -> Result<Message> {
-        self.start_turn_with(thread_id, text, comments_only, attached, None)
+        self.start_turn_with(thread_id, text, comments_only, attached, None, None)
             .await
+    }
+
+    /// [`Self::send_prompt`] with `preamble` placed before the prompt for the
+    /// agent only: the stored message is the participant's text. Used for
+    /// the digest of a shared thread's other participants (ADR 0013), which
+    /// is derived from the transcript the participant already sees.
+    pub(crate) async fn send_prompt_with_preamble(
+        &self,
+        thread_id: ThreadId,
+        text: String,
+        preamble: Option<String>,
+    ) -> Result<Message> {
+        self.start_turn_with(
+            thread_id,
+            text,
+            false,
+            PromptContext::default(),
+            None,
+            preamble,
+        )
+        .await
     }
 
     /// [`Self::start_turn`]; `origin` attributes the stored prompt to another
@@ -1025,6 +1093,7 @@ impl SessionManager {
         comments_only: bool,
         attached: PromptContext,
         origin: Option<agents::PromptOrigin>,
+        preamble: Option<String>,
     ) -> Result<Message> {
         if self.db.get_thread(&thread_id).await?.is_none() {
             return Err(DaemonError::NotFound(format!("thread {thread_id}")));
@@ -1134,6 +1203,12 @@ impl SessionManager {
             .await;
 
         let manager = self.clone();
+        let prompt = match preamble.filter(|p| !p.trim().is_empty()) {
+            Some(preamble) if !context::is_slash_command(&prompt) => {
+                format!("{preamble}\n\n{prompt}")
+            }
+            _ => prompt,
+        };
         tokio::spawn(async move {
             if let Err(failure) = manager.run_turn(thread_id.clone(), prompt).await {
                 manager.handle_turn_failure(&thread_id, failure).await;
@@ -1541,6 +1616,7 @@ impl SessionManager {
     }
 
     fn broadcast(&self, thread_id: &ThreadId, message: DaemonMessage) {
+        self.observe(thread_id, &message);
         let mut inner = self.lock();
         let Some(thread) = inner.threads.get_mut(thread_id) else {
             return;

@@ -175,7 +175,7 @@ trama-workspace
 
 Invariants every change keeps:
 
-- The first message on a connection is `Hello` with `protocol_version = 10`. A mismatch is rejected at the handshake and never rewrites stored data; restart the app and the daemon together after a protocol bump.
+- The first message on a connection is `Hello` with `protocol_version = 12`. A mismatch is rejected at the handshake and never rewrites stored data; restart the app and the daemon together after a protocol bump.
 - TramaDB migrations are applied by position and only ever appended.
 - Agents run in isolated checkouts only; nothing is pushed, merged or landed automatically.
 - Unbuilt features must not look operational.

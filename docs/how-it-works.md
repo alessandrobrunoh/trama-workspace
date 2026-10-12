@@ -70,6 +70,6 @@ Subagents and forks of a shared thread are local threads of the machine that ran
 
 ## Protocol
 
-The UI and daemon speak newline-delimited JSON (`crates/trama-protocol`). The first message on a connection must be `Hello` with `protocol_version = 10`. A mismatch is rejected at the handshake; it does not rewrite stored threads or workspace ids. Stop old app and daemon processes and restart them together after a protocol bump. The crate's doc comments list what each version added.
+The UI and daemon speak newline-delimited JSON (`crates/trama-protocol`). The first message on a connection must be `Hello` with `protocol_version = 12`. A mismatch is rejected at the handshake; it does not rewrite stored threads or workspace ids. Stop old app and daemon processes and restart them together after a protocol bump. The crate's doc comments list what each version added.
 
 The collab service has its own wire version (`COLLAB_PROTOCOL_VERSION` in `crates/trama-collab-protocol`).

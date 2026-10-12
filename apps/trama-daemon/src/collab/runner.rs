@@ -1,7 +1,7 @@
 //! The runner socket: claim and run this user's own turns (ADR 0008).
 
 use super::http::CollabError;
-use super::{CollabService, Connection, truncate, turn_state};
+use super::{CollabService, Connection, digest, history, truncate, turn_state};
 use ::http::Method;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -14,8 +14,7 @@ use trama_collab_protocol::{
 };
 use trama_db::{CollabLink, CollabTurn};
 use trama_domain::agent::AgentEvent;
-use trama_domain::message::Role;
-use trama_protocol::{ChangeBase, CollabRunnerState, DaemonMessage};
+use trama_protocol::{CollabRunnerState, DaemonMessage};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_EVERY: Duration = Duration::from_secs(25);
@@ -26,7 +25,6 @@ const IDLE_POLL: Duration = Duration::from_millis(100);
 /// streamed answer does not become thousands of durable events.
 const DELTA_WINDOW: Duration = Duration::from_millis(250);
 const DELTA_FLUSH_BYTES: usize = 8 * 1024;
-const MAX_REPORT_TEXT_BYTES: usize = 48 * 1024;
 
 enum Ended {
     /// Reconnect after a backoff.
@@ -259,6 +257,10 @@ async fn handle_available(service: CollabService, connection: Connection, turn: 
     }
     claim_and_run(&service, &connection, &turn).await;
     service.end_turn(&turn.command_id);
+    // The thread lock is released: publish the turn's answer and activity.
+    if let Ok(Some(local)) = service.db().collab_turn(&turn.command_id).await {
+        service.signal(local.thread_id);
+    }
 }
 
 async fn claim_and_run(service: &CollabService, connection: &Connection, turn: &PendingTurn) {
@@ -433,17 +435,9 @@ impl Reporter<'_> {
     fn on_message(&mut self, message: DaemonMessage) {
         match message {
             DaemonMessage::AgentEventEnvelope { event, .. } => self.on_event(event),
-            DaemonMessage::MessageAppended { message, .. } => {
-                let text = truncate(&message.text(), MAX_REPORT_TEXT_BYTES);
-                let payload = match message.role {
-                    Role::Assistant => json!({ "type": "message", "text": text }),
-                    Role::System => json!({ "type": "notice", "text": text }),
-                    // The turn's own prompt is already in the shared log.
-                    Role::User | Role::Tool => return,
-                };
-                self.flush_text();
-                self.report(RunnerReportKind::AgentEvent, payload);
-            }
+            // Stored messages (the answer, a failure notice) are published
+            // as history with the turn's activity (ADR 0013), not here.
+            DaemonMessage::MessageAppended { .. } => self.flush_text(),
             _ => {}
         }
     }
@@ -519,33 +513,47 @@ async fn run_claimed(service: &CollabService, local: &CollabTurn) {
         failure: None,
         lost: false,
     };
+    // What the other participants did since this daemon's last turn here.
+    let preamble = digest::build(service.db(), &thread_id).await;
     match sessions
-        .send_prompt(thread_id.clone(), local.text.clone())
+        .send_prompt_with_preamble(thread_id.clone(), local.text.clone(), preamble)
         .await
     {
+        Ok(message) => {
+            // The prompt is in the shared log as this command's
+            // `message_appended`; it is never published again.
+            let _ = service
+                .db()
+                .set_collab_message_origin(
+                    &message.id,
+                    &thread_id,
+                    &history::origin_for_prompt(&local.command_id),
+                )
+                .await;
+            loop {
+                tokio::select! {
+                    message = rx.recv() => match message {
+                        Some(message) => reporter.on_message(message),
+                        None => break,
+                    },
+                    _ = tokio::time::sleep(IDLE_POLL) => {}
+                }
+                reporter.tick();
+                if !sessions.turn_running(&thread_id) {
+                    // Terminal broadcasts are queued before the reservation is
+                    // released, so draining now sees all of them.
+                    while let Ok(message) = rx.try_recv() {
+                        reporter.on_message(message);
+                    }
+                    break;
+                }
+            }
+        }
         Err(err) => {
             let message = format!("The shared turn could not start here: {err}");
             reporter.failure = Some(message.clone());
             sessions.append_system_notice(&thread_id, message).await;
         }
-        Ok(_) => loop {
-            tokio::select! {
-                message = rx.recv() => match message {
-                    Some(message) => reporter.on_message(message),
-                    None => break,
-                },
-                _ = tokio::time::sleep(IDLE_POLL) => {}
-            }
-            reporter.tick();
-            if !sessions.turn_running(&thread_id) {
-                // Terminal broadcasts are queued before the reservation is
-                // released, so draining now sees all of them.
-                while let Ok(message) = rx.try_recv() {
-                    reporter.on_message(message);
-                }
-                break;
-            }
-        },
     }
     // Also drains the failure notice of a turn that never started.
     while let Ok(message) = rx.try_recv() {
@@ -553,11 +561,6 @@ async fn run_claimed(service: &CollabService, local: &CollabTurn) {
     }
     let _ = sessions.unsubscribe(&thread_id, watch);
     reporter.flush_text();
-    if reporter.completed {
-        if let Some(summary) = changes_summary(service, &thread_id).await {
-            reporter.report(RunnerReportKind::ChangesSummary, summary);
-        }
-    }
     let (outcome, result, state) = if reporter.completed && reporter.failure.is_none() {
         (TurnOutcome::Completed, Value::Null, turn_state::COMPLETED)
     } else {
@@ -588,43 +591,6 @@ async fn run_claimed(service: &CollabService, local: &CollabTurn) {
             .await;
     } else {
         service.mark_ambiguous(&local.command_id, &thread_id).await;
-    }
-}
-
-/// Files touched by the last turn, without contents.
-async fn changes_summary(
-    service: &CollabService,
-    thread_id: &trama_domain::ids::ThreadId,
-) -> Option<Value> {
-    let repos = service
-        .sessions()
-        .get_changes(thread_id, ChangeBase::LastTurn)
-        .await
-        .ok()?;
-    let repos: Vec<Value> = repos
-        .into_iter()
-        .filter(|repo| !repo.files.is_empty())
-        .map(|repo| {
-            let files: Vec<Value> = repo
-                .files
-                .iter()
-                .take(200)
-                .map(|file| {
-                    json!({
-                        "path": truncate(&file.path, 512),
-                        "status": file.status,
-                        "additions": file.additions,
-                        "deletions": file.deletions,
-                    })
-                })
-                .collect();
-            json!({ "title": truncate(&repo.title, 120), "files": files, "file_count": repo.files.len() })
-        })
-        .collect();
-    if repos.is_empty() {
-        None
-    } else {
-        Some(json!({ "repos": repos }))
     }
 }
 

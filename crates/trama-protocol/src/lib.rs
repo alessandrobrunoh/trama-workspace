@@ -73,6 +73,11 @@ pub use trama_collab_protocol::{
 
 /// Wire protocol version carried in `Hello` / `Welcome`.
 ///
+/// Version 12 (11 is checkout provisioning) shares a thread's whole family
+/// and history (ADR 0013): `GetRemoteChanges` / `RemoteChanges` (the changes
+/// snapshots other participants published), and `SharedThreadSnapshot`
+/// carries the outbox state. Subthreads and subagents of a shared thread are
+/// shared with it and mirrored as local children.
 /// Version 11 adds checkout disk usage (`GetDiskUsage` / `DiskUsage`: apparent
 /// vs. private bytes of every copy-on-write checkout), archiving
 /// (`ArchiveThread`, `UnarchiveThread`, `ThreadArchived`, `ThreadUnarchived`,
@@ -108,7 +113,7 @@ pub use trama_collab_protocol::{
 /// Version 4 added the Claude approval channel and 3 thread checkout
 /// discovery. It does not migrate stored data; peers with a different version
 /// are rejected at handshake time.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Environment variable that relocates the whole app-data directory (socket,
 /// database, config, legacy checkouts). Use it for isolated test instances
@@ -421,6 +426,12 @@ pub enum ClientMessage {
         thread_id: ThreadId,
         state: CollabPresenceState,
     },
+    /// The changes snapshots other participants published for a shared
+    /// thread (their diff, not this machine's). Answered with
+    /// `RemoteChanges`.
+    GetRemoteChanges {
+        thread_id: ThreadId,
+    },
     /// Fork a child of `thread_id`. Without `at_message_id` this is
     /// `CreateSubthread` (current files and conversation). With it, the
     /// child's conversation is the parent's transcript up to the end of the
@@ -529,6 +540,21 @@ pub struct SharedThreadSnapshot {
     pub access: CollabAccess,
     pub members: Vec<CollabMember>,
     pub link_token: Option<String>,
+    /// Items this daemon has yet to publish (history backfill, comments,
+    /// children); delivered in order as soon as the service is reachable.
+    #[serde(default)]
+    pub pending_publish: u32,
+}
+
+/// Another participant's diff of a shared thread, as their daemon published
+/// it after a turn (or when the thread was shared). Bounded: `truncated`
+/// marks a cut diff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteChangesSnapshot {
+    pub author: String,
+    pub captured_at: DateTime<Utc>,
+    pub base: ChangeBase,
+    pub repos: Vec<RepoChanges>,
 }
 
 /// One entry of `SharedThreads`.
@@ -922,6 +948,12 @@ pub enum DaemonMessage {
     /// stopped. Local history stays.
     CollabAccessRevoked {
         thread_id: ThreadId,
+    },
+    /// Reply to `GetRemoteChanges`, and sent to subscribers whenever another
+    /// participant publishes a new snapshot. Newest first.
+    RemoteChanges {
+        thread_id: ThreadId,
+        snapshots: Vec<RemoteChangesSnapshot>,
     },
     /// Reply to [`ClientMessage::McpToolCall`], sent only on that helper's
     /// connection. `text` is the tool result shown to the agent.
@@ -1483,8 +1515,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_eleven() {
-        assert_eq!(PROTOCOL_VERSION, 11);
+    fn protocol_version_is_twelve() {
+        assert_eq!(PROTOCOL_VERSION, 12);
     }
 
     #[test]
@@ -1913,6 +1945,7 @@ mod tests {
                 via: CollabMemberVia::Invite,
             }],
             link_token: None,
+            pending_publish: 0,
         };
         let daemon = [
             DaemonMessage::CollabStatus(CollabStatusSnapshot {

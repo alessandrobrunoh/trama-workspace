@@ -26,13 +26,30 @@
 //! `collab:<username>` in the same transaction that advances the cursor, so a
 //! reconnect never duplicates or skips one. Live agent output, drafts and
 //! presence are relayed to subscribers and never stored.
+//!
+//! # History and family (ADR 0013)
+//!
+//! Sharing a thread publishes its whole history and its whole family: every
+//! local message with its turn's activity, child threads at any depth
+//! (subthreads, forks, subagents, each its own collab thread under the
+//! root's membership), comments and their resolution, review verdicts,
+//! subagent states and changes snapshots. Everything goes through a durable
+//! outbox (`outbox`) fed by rescans of the family (`family`); the mirror
+//! rebuilds it on every other participant's machine. A shared turn's agent
+//! gets a digest of what the others did since its last turn (`digest`).
 
 mod credentials;
+mod digest;
+pub(crate) mod family;
+mod history;
 mod http;
 mod mirror;
+mod outbox;
 mod runner;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_history;
 
 use crate::error::{DaemonError, Result};
 use crate::session::SessionManager;
@@ -47,13 +64,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use trama_collab_protocol::{
-    ClientFrame, CommandReceipt, CommentRequest, CreateRunnerRequest, CreateThreadRequest,
-    InviteRequest, JoinRequest, ResolveRequest, RunnerClientFrame, RunnerCreated, SendRequest,
-    SetAccessRequest, SetAccessResponse, ThreadDetail, ThreadSummary, Verdict, VerdictRequest,
+    ClientFrame, CommandReceipt, CreateRunnerRequest, CreateThreadRequest, InviteRequest,
+    JoinRequest, RunnerClientFrame, RunnerCreated, SendRequest, SetAccessRequest,
+    SetAccessResponse, ThreadDetail, ThreadSummary,
 };
 use trama_db::{CollabLink, CollabTurn, TramaDb};
 use trama_domain::ids::{CommentId, MessageId, ThreadId, WorkspaceId};
-use trama_domain::subthread::ReviewVerdict;
 use trama_domain::thread::ThreadKind;
 use trama_protocol::{
     CollabAccess, CollabPresenceState, CollabRunnerState, CollabStatusSnapshot, CommentSnapshot,
@@ -97,6 +113,11 @@ struct Inner {
     /// `None` disables collaboration (no app dir, e.g. unit tests).
     credentials_path: Option<PathBuf>,
     state: Mutex<State>,
+    /// Serializes family rescans with the mirror creating children, so a
+    /// thread is never both announced and mirrored.
+    sync_lock: tokio::sync::Mutex<()>,
+    /// Wakes the outbox worker.
+    outbox_notify: tokio::sync::Notify,
 }
 
 struct State {
@@ -109,6 +130,7 @@ struct State {
     runner: CollabRunnerState,
     last_error: Option<String>,
     runner_task: Option<JoinHandle<()>>,
+    outbox_task: Option<JoinHandle<()>>,
     runner_tx: Option<mpsc::UnboundedSender<RunnerClientFrame>>,
     claims: HashMap<String, oneshot::Sender<std::result::Result<(), String>>>,
     finishes: HashMap<String, oneshot::Sender<()>>,
@@ -230,6 +252,7 @@ impl CollabService {
                     runner: CollabRunnerState::Off,
                     last_error: None,
                     runner_task: None,
+                    outbox_task: None,
                     runner_tx: None,
                     claims: HashMap::new(),
                     finishes: HashMap::new(),
@@ -237,8 +260,16 @@ impl CollabService {
                     mirrors: HashMap::new(),
                     thread_locks: HashMap::new(),
                 }),
+                sync_lock: tokio::sync::Mutex::new(()),
+                outbox_notify: tokio::sync::Notify::new(),
             }),
         }
+    }
+
+    /// `trd.<installation id>.`: the prefix of every command id this daemon
+    /// issues.
+    pub(crate) fn own_prefix(&self) -> String {
+        format!("trd.{}.", self.lock().install_id)
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -274,6 +305,9 @@ impl CollabService {
             .await?;
         self.lock().install_id = install;
         self.settle_interrupted_turns().await;
+        let (signals, rx) = mpsc::unbounded_channel();
+        self.inner.sessions.set_collab_observer(Some(signals));
+        tokio::spawn(self.clone().run_signals(rx));
         match credentials::load(&path) {
             Ok(Some(credentials)) if credentials.enabled => self.launch(credentials),
             Ok(Some(credentials)) => self.lock().credentials = Some(credentials),
@@ -346,6 +380,7 @@ impl CollabService {
             if has_runner {
                 state.runner_task = Some(tokio::spawn(runner::run(self.clone(), generation)));
             }
+            state.outbox_task = Some(tokio::spawn(self.clone().run_outbox(generation)));
             generation
         };
         let service = self.clone();
@@ -364,6 +399,9 @@ impl CollabService {
     fn stop_locked(state: &mut State) {
         state.generation += 1;
         if let Some(task) = state.runner_task.take() {
+            task.abort();
+        }
+        if let Some(task) = state.outbox_task.take() {
             task.abort();
         }
         state.runner_tx = None;
@@ -768,6 +806,15 @@ impl CollabService {
             )
             .await
             .map_err(|err| self.request_failed(connection, err))?;
+        let mut family: Vec<ThreadId> = vec![thread_id.clone()];
+        family.extend(
+            self.db()
+                .collab_family_of(thread_id)
+                .await?
+                .into_iter()
+                .map(|row| row.thread_id),
+        );
+        let pending_publish = self.db().collab_outbox_pending_for(&family).await? as u32;
         Ok(SharedThreadSnapshot {
             thread_id: thread_id.clone(),
             collab_thread_id: collab_thread_id.to_owned(),
@@ -776,6 +823,7 @@ impl CollabService {
             access: detail.summary.access,
             members: detail.members,
             link_token,
+            pending_publish,
         })
     }
 
@@ -820,7 +868,8 @@ impl CollabService {
             .ok_or_else(|| DaemonError::NotFound(format!("thread {thread_id}")))?;
         if thread.kind != ThreadKind::Top {
             return Err(DaemonError::Invalid(
-                "only top-level threads can be shared; subthreads stay local".into(),
+                "share the top-level thread: its subthreads and subagents are shared with it"
+                    .into(),
             ));
         }
         let link = match self.db().collab_link(thread_id).await? {
@@ -855,12 +904,15 @@ impl CollabService {
                     .db()
                     .link_collab_thread(thread_id, connection.endpoint.url(), &summary.thread_id)
                     .await?;
-                // Nothing before the link was published; start mirroring the
-                // (empty) log from here on.
+                // Start mirroring the log from here on; the history and the
+                // family are published below.
                 self.ensure_mirror(&link, connection.generation);
                 link
             }
         };
+        // Publish (or resume publishing) the whole history and family.
+        // Idempotent: what was already queued is not queued again.
+        self.sync_family(thread_id, &HashSet::new(), true).await?;
         let cid = link.collab_thread_id.clone();
         let mut link_token = None;
         if let Some(access) = access {
@@ -1024,15 +1076,81 @@ impl CollabService {
             .collect())
     }
 
+    /// Stop mirroring a shared thread and its family here. Local history
+    /// stays; sharing it again publishes everything to a new shared thread.
     pub async fn unlink(&self, thread_id: &ThreadId) -> Result<()> {
         self.credentials_path()?;
-        if !self.db().unlink_collab_thread(thread_id).await? {
+        if self.db().collab_link(thread_id).await?.is_none() {
             return Err(DaemonError::Invalid("this thread is not shared".into()));
         }
-        if let Some(mirror) = self.lock().mirrors.remove(thread_id) {
-            mirror.task.abort();
+        let _serialized = self.inner.sync_lock.lock().await;
+        let mut family: Vec<ThreadId> = vec![thread_id.clone()];
+        family.extend(
+            self.db()
+                .collab_family_of(thread_id)
+                .await?
+                .into_iter()
+                .map(|row| row.thread_id),
+        );
+        self.db().forget_collab_family(&family).await?;
+        let mut state = self.lock();
+        for id in &family {
+            if let Some(mirror) = state.mirrors.remove(id) {
+                mirror.task.abort();
+            }
         }
         Ok(())
+    }
+
+    /// Other participants' changes snapshots of `thread_id`, newest first.
+    pub async fn remote_changes(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Vec<trama_protocol::RemoteChangesSnapshot>> {
+        if self.inner.credentials_path.is_none() {
+            return Ok(Vec::new());
+        }
+        let rows = self.db().collab_remote_changes(thread_id).await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let payload: serde_json::Value = serde_json::from_str(&row.payload_json).ok()?;
+                Some(trama_protocol::RemoteChangesSnapshot {
+                    author: row.author,
+                    captured_at: payload
+                        .get("captured_at")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value(v).ok())
+                        .unwrap_or(row.captured_at),
+                    base: payload
+                        .get("base")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value(v).ok())
+                        .unwrap_or_default(),
+                    repos: payload
+                        .get("repos")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value(v).ok())
+                        .unwrap_or_default(),
+                })
+            })
+            .collect())
+    }
+
+    /// The service answered again: retry pending items now instead of
+    /// waiting out their backoff.
+    pub(crate) async fn reset_outbox_backoff(&self) {
+        if let Ok(rows) = self.db().collab_outbox_pending(1).await {
+            if let Some(head) = rows.first() {
+                if head.next_attempt_at > Utc::now() {
+                    let _ = self
+                        .db()
+                        .collab_outbox_retry_at(head.id, Utc::now(), "reconnected")
+                        .await;
+                }
+            }
+        }
+        self.kick_outbox();
     }
 
     pub fn set_draft(&self, thread_id: &ThreadId, text: String) -> Result<()> {
@@ -1075,6 +1193,8 @@ impl CollabService {
             )));
         }
         let text = sanitize_text(&text, MAX_TURN_TEXT_BYTES, "the message")?;
+        // The turn lands after the history it follows.
+        self.flush_thread(&link.thread_id).await;
         let command_id = connection.new_command_id();
         self.db()
             .insert_collab_turn(&CollabTurn {
@@ -1113,136 +1233,48 @@ impl CollabService {
         Ok(command_id)
     }
 
-    /// Publish a local comment of a linked thread (best effort, in the
-    /// background). Replies point at their root's `comment_created` event.
+    /// A local comment was created: the family rescan publishes it (after
+    /// the messages it may anchor to).
     pub fn publish_comment(&self, snapshot: CommentSnapshot) {
-        let service = self.clone();
-        tokio::spawn(async move {
-            if let Err(err) = service.try_publish_comment(snapshot).await {
-                crate::log::warn(format!("comment not published to the shared thread: {err}"));
-            }
-        });
+        self.signal(snapshot.thread_id);
     }
 
-    async fn try_publish_comment(&self, snapshot: CommentSnapshot) -> Result<()> {
-        let Some(link) = self.link(&snapshot.thread_id).await? else {
-            return Ok(());
-        };
-        let connection = self.require_connection()?;
-        if link.server_url != connection.endpoint.url() {
-            return Ok(());
+    pub fn publish_resolve(&self, comment: CommentSnapshot) {
+        if let trama_protocol::CommentState::Resolved { resolved_at, .. } = comment.state {
+            self.comment_changed(
+                comment.thread_id,
+                family::CommentChange::Resolved(comment.id, resolved_at),
+            );
         }
-        let parent_seq = match &snapshot.parent_comment_id {
-            Some(parent) => self
-                .db()
-                .collab_comment_seq(parent)
-                .await?
-                .filter(|(cid, _)| *cid == link.collab_thread_id)
-                .map(|(_, seq)| seq),
-            None => None,
-        };
-        let body = sanitize_text(
-            &truncate(&snapshot.body, MAX_COMMENT_BYTES - 8),
-            MAX_COMMENT_BYTES,
-            "the comment",
-        )?;
-        let excerpt = snapshot.excerpt.as_deref().map(|e| truncate(e, 1024));
-        let mut anchor = serde_json::json!({ "target": snapshot.target, "excerpt": excerpt });
-        if anchor.to_string().len() > MAX_ANCHOR_BYTES {
-            anchor = serde_json::json!({ "excerpt": excerpt });
+    }
+
+    pub fn publish_reopen(&self, comment: CommentSnapshot) {
+        self.comment_changed(
+            comment.thread_id,
+            family::CommentChange::Reopened(comment.id),
+        );
+    }
+
+    /// Deleted local comments: the root (replies go with it).
+    pub fn publish_delete(&self, thread_id: ThreadId, comment_ids: Vec<CommentId>) {
+        if let Some(root) = comment_ids.last().cloned() {
+            self.comment_changed(thread_id, family::CommentChange::Deleted(root));
         }
-        let receipt: CommandReceipt = connection
-            .endpoint
-            .call(
-                Method::POST,
-                &format!("/threads/{}/comments", link.collab_thread_id),
-                Some(connection.session()?),
-                Some(&CommentRequest {
-                    command_id: connection.new_command_id(),
-                    body,
-                    anchor: Some(anchor),
-                    parent_seq,
-                }),
-            )
-            .await
-            .map_err(|err| self.request_failed(&connection, err))?;
-        self.db()
-            .set_collab_comment_seq(&snapshot.id, &link.collab_thread_id, receipt.seq)
-            .await?;
-        Ok(())
     }
 
-    pub fn publish_resolve(&self, comment_id: CommentId) {
-        let service = self.clone();
-        tokio::spawn(async move {
-            let result: Result<()> = async {
-                let Some((cid, seq)) = service.db().collab_comment_seq(&comment_id).await? else {
-                    return Ok(());
-                };
-                let connection = service.require_connection()?;
-                connection
-                    .endpoint
-                    .call::<CommandReceipt>(
-                        Method::POST,
-                        &format!("/threads/{cid}/comments/{seq}/resolve"),
-                        Some(connection.session()?),
-                        Some(&ResolveRequest {
-                            command_id: connection.new_command_id(),
-                        }),
-                    )
-                    .await
-                    .map_err(|err| service.request_failed(&connection, err))?;
-                Ok(())
-            }
-            .await;
-            if let Err(err) = result {
-                crate::log::warn(format!(
-                    "resolution not published to the shared thread: {err}"
-                ));
-            }
-        });
+    /// A review subthread's verdict: published to the review thread by the
+    /// family rescan (its parent's row is published as history).
+    pub fn publish_verdict(&self, review_thread_id: ThreadId) {
+        self.signal(review_thread_id);
     }
 
-    /// A review subthread's verdict on a linked parent thread.
-    pub fn publish_verdict(&self, parent_thread_id: ThreadId, verdict: ReviewVerdict) {
+    pub(crate) fn signal(&self, thread_id: ThreadId) {
         let service = self.clone();
         tokio::spawn(async move {
-            let result: Result<()> = async {
-                let Some(link) = service.link(&parent_thread_id).await? else {
-                    return Ok(());
-                };
-                let connection = service.require_connection()?;
-                let (verdict, body) = match verdict {
-                    ReviewVerdict::Approve => (Verdict::Approved, None),
-                    ReviewVerdict::RequestChanges { summary } => (
-                        Verdict::ChangesRequested,
-                        sanitize_text(
-                            &truncate(&summary, MAX_COMMENT_BYTES - 8),
-                            MAX_COMMENT_BYTES,
-                            "the verdict",
-                        )
-                        .ok(),
-                    ),
-                };
-                connection
-                    .endpoint
-                    .call::<CommandReceipt>(
-                        Method::POST,
-                        &format!("/threads/{}/verdicts", link.collab_thread_id),
-                        Some(connection.session()?),
-                        Some(&VerdictRequest {
-                            command_id: connection.new_command_id(),
-                            verdict,
-                            body,
-                        }),
-                    )
-                    .await
-                    .map_err(|err| service.request_failed(&connection, err))?;
-                Ok(())
-            }
-            .await;
-            if let Err(err) = result {
-                crate::log::warn(format!("verdict not published to the shared thread: {err}"));
+            if let Some(root) = service.family_root(&thread_id).await {
+                if let Err(err) = service.sync_family(&root, &HashSet::new(), false).await {
+                    crate::log::warn(format!("shared thread not synced: {err}"));
+                }
             }
         });
     }

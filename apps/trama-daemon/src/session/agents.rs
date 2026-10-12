@@ -456,7 +456,7 @@ impl SessionManager {
 
     /// Create the child thread of `parent_id` for `profile`, post a link row
     /// in the parent, and queue its task.
-    pub(super) async fn spawn_subagent(
+    pub(crate) async fn spawn_subagent(
         &self,
         parent_id: &ThreadId,
         title: String,
@@ -596,6 +596,7 @@ impl SessionManager {
                     false,
                     PromptContext::default(),
                     Some(origin),
+                    None,
                 )
                 .await
             {
@@ -855,8 +856,16 @@ impl SessionManager {
         let Some(record) = self.db.get_subagent(thread_id).await? else {
             return Ok(None);
         };
+        // A subagent mirrored from another participant runs on their
+        // machine: its stored state is the one they published.
+        let remote = self
+            .db
+            .collab_family(thread_id)
+            .await?
+            .is_some_and(|row| row.origin == "remote");
         let (status, detail) = match self.task_status(thread_id) {
             Some(status) => (status, record.detail),
+            None if remote => (record.status, record.detail),
             None if record.status.is_active() => (
                 SubagentStatus::Failed,
                 Some("interrupted: the daemon stopped before the task finished".into()),
@@ -886,7 +895,7 @@ impl SessionManager {
     }
 
     /// Wait until `ids` are settled or `timeout` passes; true if settled.
-    pub(super) async fn wait_for(&self, ids: &[ThreadId], timeout: Duration) -> bool {
+    pub(crate) async fn wait_for(&self, ids: &[ThreadId], timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notified = self.agents.changed.notified();
@@ -1016,6 +1025,7 @@ impl SessionManager {
                 false,
                 PromptContext::default(),
                 Some(origin.clone()),
+                None,
             )
             .await
         {
@@ -1135,6 +1145,7 @@ impl SessionManager {
                 false,
                 PromptContext::default(),
                 Some(mail.origin.clone()),
+                None,
             )
             .await
         {

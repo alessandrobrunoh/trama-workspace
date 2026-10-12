@@ -20,22 +20,22 @@ use trama_protocol::{
     ClientMessage, DaemonMessage, PROTOCOL_VERSION, decode_json_line, encode_json_line,
 };
 
-const WAIT: Duration = Duration::from_secs(20);
-const AGENT_TEXT: &str = "Hello from the mock agent.";
+pub(super) const WAIT: Duration = Duration::from_secs(20);
+pub(super) const AGENT_TEXT: &str = "Hello from the mock agent.";
 
-struct Server {
-    url: String,
-    endpoint: Endpoint,
-    auth: AuthService,
-    _dir: TempDir,
+pub(super) struct Server {
+    pub(super) url: String,
+    pub(super) endpoint: Endpoint,
+    pub(super) auth: AuthService,
+    pub(super) _dir: TempDir,
 }
 
-fn password(user: &str) -> String {
+pub(super) fn password(user: &str) -> String {
     format!("{user}-secret-123")
 }
 
 impl Server {
-    async fn start() -> Self {
+    pub(super) async fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let auth =
             AuthService::open(dir.path().join("collab.sqlite"), AuthConfig::default()).unwrap();
@@ -62,7 +62,7 @@ impl Server {
         }
     }
 
-    async fn login(&self, user: &str) -> String {
+    pub(super) async fn login(&self, user: &str) -> String {
         #[derive(serde::Deserialize)]
         struct Login {
             token: String,
@@ -80,7 +80,7 @@ impl Server {
         login.token
     }
 
-    async fn commands(&self, session: &str, thread: &str) -> Vec<CommandInfo> {
+    pub(super) async fn commands(&self, session: &str, thread: &str) -> Vec<CommandInfo> {
         self.endpoint
             .call(
                 Method::GET,
@@ -92,7 +92,25 @@ impl Server {
             .unwrap()
     }
 
-    async fn last_seq(&self, session: &str, thread: &str) -> i64 {
+    pub(super) async fn events(
+        &self,
+        session: &str,
+        thread: &str,
+    ) -> Vec<trama_collab_protocol::EventEnvelope> {
+        let page: trama_collab_protocol::EventsPage = self
+            .endpoint
+            .call(
+                Method::GET,
+                &format!("/threads/{thread}/events?after=0&limit=500"),
+                Some(session),
+                None::<&()>,
+            )
+            .await
+            .unwrap();
+        page.events
+    }
+
+    pub(super) async fn last_seq(&self, session: &str, thread: &str) -> i64 {
         let detail: ThreadDetail = self
             .endpoint
             .call(
@@ -107,7 +125,7 @@ impl Server {
     }
 }
 
-fn git(cwd: &Path, args: &[&str]) {
+pub(super) fn git(cwd: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -123,16 +141,16 @@ fn git(cwd: &Path, args: &[&str]) {
 
 /// One daemon: its own data dir (database, credentials, checkouts), its own
 /// repository and a fake adapter recording every prompt it runs.
-struct Node {
-    dir: TempDir,
-    sessions: SessionManager,
-    collab: CollabService,
-    fake: FakeAdapter,
-    workspace_id: WorkspaceId,
+pub(super) struct Node {
+    pub(super) dir: TempDir,
+    pub(super) sessions: SessionManager,
+    pub(super) collab: CollabService,
+    pub(super) fake: FakeAdapter,
+    pub(super) workspace_id: WorkspaceId,
 }
 
 impl Node {
-    async fn start(fake: FakeAdapter) -> Self {
+    pub(super) async fn start(fake: FakeAdapter) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("repo");
         std::fs::create_dir_all(&source).unwrap();
@@ -166,19 +184,28 @@ impl Node {
         }
     }
 
-    fn app_dir(&self) -> PathBuf {
+    pub(super) fn app_dir(&self) -> PathBuf {
         self.dir.path().join("app")
     }
 
     /// Simulate a daemon restart: drop every connection, then start a new
     /// service from what is on disk.
-    async fn restart_collab(&mut self) {
+    pub(super) async fn restart_collab(&mut self) {
         self.collab.shutdown();
         self.collab = CollabService::new(self.sessions.clone(), &self.app_dir());
         self.collab.start().await.unwrap();
     }
 
-    fn prompts(&self) -> Vec<String> {
+    /// Prompts the fake adapter ran, without the shared-thread digest.
+    pub(super) fn prompts(&self) -> Vec<String> {
+        self.raw_prompts()
+            .iter()
+            .map(|p| bare(p).to_owned())
+            .collect()
+    }
+
+    /// Prompts exactly as the agent received them.
+    pub(super) fn raw_prompts(&self) -> Vec<String> {
         self.fake
             .prompts
             .lock()
@@ -186,7 +213,7 @@ impl Node {
             .clone()
     }
 
-    async fn ipc(&self) -> Ipc {
+    pub(super) async fn ipc(&self) -> Ipc {
         let (client, server) = tokio::io::duplex(1024 * 1024);
         let sessions = self.sessions.clone();
         let collab = self.collab.clone();
@@ -215,14 +242,14 @@ impl Node {
         ipc
     }
 
-    async fn wait_online(&self) {
+    pub(super) async fn wait_online(&self) {
         eventually("runner online", || async {
             self.collab.status().await.unwrap().runner == CollabRunnerState::Online
         })
         .await;
     }
 
-    async fn messages(&self, thread_id: &ThreadId) -> Vec<Message> {
+    pub(super) async fn messages(&self, thread_id: &ThreadId) -> Vec<Message> {
         self.sessions
             .db()
             .list_messages_by_thread(thread_id)
@@ -231,21 +258,21 @@ impl Node {
     }
 }
 
-struct Ipc {
+pub(super) struct Ipc {
     reader: BufReader<ReadHalf<DuplexStream>>,
     writer: WriteHalf<DuplexStream>,
-    backlog: Vec<DaemonMessage>,
+    pub(super) backlog: Vec<DaemonMessage>,
 }
 
 impl Ipc {
-    async fn send(&mut self, message: ClientMessage) {
+    pub(super) async fn send(&mut self, message: ClientMessage) {
         let bytes = encode_json_line(&message).unwrap();
         self.writer.write_all(&bytes).await.unwrap();
         self.writer.flush().await.unwrap();
     }
 
     /// First message (backlog included) for which `pick` returns `Some`.
-    async fn expect<T>(
+    pub(super) async fn expect<T>(
         &mut self,
         what: &str,
         mut pick: impl FnMut(&DaemonMessage) -> Option<T>,
@@ -270,7 +297,7 @@ impl Ipc {
         }
     }
 
-    async fn request<T>(
+    pub(super) async fn request<T>(
         &mut self,
         message: ClientMessage,
         what: &str,
@@ -280,7 +307,12 @@ impl Ipc {
         self.expect(what, pick).await
     }
 
-    async fn connect(&mut self, server: &Server, user: &str, runner_token: Option<String>) {
+    pub(super) async fn connect(
+        &mut self,
+        server: &Server,
+        user: &str,
+        runner_token: Option<String>,
+    ) {
         let status = self
             .request(
                 ClientMessage::ConnectCollab {
@@ -301,7 +333,11 @@ impl Ipc {
         assert_eq!(status.username.as_deref(), Some(user));
     }
 
-    async fn create_thread(&mut self, workspace_id: &WorkspaceId, title: &str) -> ThreadId {
+    pub(super) async fn create_thread(
+        &mut self,
+        workspace_id: &WorkspaceId,
+        title: &str,
+    ) -> ThreadId {
         self.request(
             ClientMessage::CreateThread {
                 workspace_id: workspace_id.clone(),
@@ -316,7 +352,11 @@ impl Ipc {
         .await
     }
 
-    async fn share(&mut self, thread_id: &ThreadId, invite: Vec<String>) -> SharedThreadSnapshot {
+    pub(super) async fn share(
+        &mut self,
+        thread_id: &ThreadId,
+        invite: Vec<String>,
+    ) -> SharedThreadSnapshot {
         self.request(
             ClientMessage::ShareThread {
                 thread_id: thread_id.clone(),
@@ -333,14 +373,14 @@ impl Ipc {
         .await
     }
 
-    async fn subscribe(&mut self, thread_id: &ThreadId) {
+    pub(super) async fn subscribe(&mut self, thread_id: &ThreadId) {
         self.send(ClientMessage::SubscribeThread {
             thread_id: thread_id.clone(),
         })
         .await;
     }
 
-    async fn queue_turn(&mut self, thread_id: &ThreadId, text: &str) {
+    pub(super) async fn queue_turn(&mut self, thread_id: &ThreadId, text: &str) {
         self.request(
             ClientMessage::SendPrompt {
                 thread_id: thread_id.clone(),
@@ -361,7 +401,7 @@ impl Ipc {
     }
 
     /// Send in a shared thread and wait until this daemon finished the turn.
-    async fn send_turn(&mut self, thread_id: &ThreadId, text: &str) {
+    pub(super) async fn send_turn(&mut self, thread_id: &ThreadId, text: &str) {
         self.queue_turn(thread_id, text).await;
         self.expect("local turn completed", |m| match m {
             DaemonMessage::AgentEventEnvelope {
@@ -374,7 +414,13 @@ impl Ipc {
     }
 
     /// A mirrored message from `user` with `role` and `text`.
-    async fn expect_remote(&mut self, thread_id: &ThreadId, user: &str, role: Role, text: &str) {
+    pub(super) async fn expect_remote(
+        &mut self,
+        thread_id: &ThreadId,
+        user: &str,
+        role: Role,
+        text: &str,
+    ) {
         let actor = Actor::Human {
             id: format!("collab:{user}"),
         };
@@ -395,7 +441,15 @@ impl Ipc {
     }
 }
 
-async fn eventually<F, Fut>(what: &str, mut check: F)
+/// A prompt without its leading shared-thread digest.
+pub(super) fn bare(prompt: &str) -> &str {
+    match prompt.split_once(&format!("{}\n\n", super::digest::CLOSE)) {
+        Some((_, rest)) if prompt.starts_with(super::digest::OPEN) => rest,
+        _ => prompt,
+    }
+}
+
+pub(super) async fn eventually<F, Fut>(what: &str, mut check: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
@@ -524,6 +578,14 @@ async fn each_turn_runs_only_on_its_senders_daemon_and_is_mirrored() {
         .await;
     assert_eq!(alice.prompts(), vec!["from alice".to_string()]);
     assert_eq!(bob.prompts(), vec!["from bob".to_string()]);
+    // Alice's agent was told what Bob did since its last turn.
+    let raw = alice.raw_prompts().remove(0);
+    assert!(raw.starts_with(super::digest::OPEN), "{raw}");
+    assert!(raw.contains("[bob] asked: from bob"), "{raw}");
+    assert!(
+        raw.contains(&format!("[bob's agent] answered: {AGENT_TEXT}")),
+        "{raw}"
+    );
 
     // Each transcript holds its own turn once (local actor) and the other
     // participant's turn once (remote actor).
@@ -623,14 +685,31 @@ async fn each_turn_runs_only_on_its_senders_daemon_and_is_mirrored() {
             parent_comment_id: None,
         })
         .await;
+    // Bob gets a real comment by Alice, anchored to his copy of the passage.
+    let bob_from_alice = bob
+        .messages(&bob_thread)
+        .await
+        .into_iter()
+        .find(|m| m.text() == "from alice")
+        .unwrap()
+        .id;
     bob_ipc
         .expect("alice's comment", |m| match m {
-            DaemonMessage::MessageAppended { message, .. }
-                if message
-                    .text()
-                    .starts_with("alice commented: please add tests") =>
+            DaemonMessage::CommentCreated(comment)
+                if comment.body == "please add tests"
+                    && comment.author
+                        == Actor::Human {
+                            id: "collab:alice".into(),
+                        } =>
             {
-                Some(())
+                Some(assert_eq!(
+                    comment.target,
+                    trama_domain::comment::CommentTarget::MessageRange {
+                        message_id: bob_from_alice.clone(),
+                        start_byte: 0,
+                        end_byte: 4,
+                    }
+                ))
             }
             _ => None,
         })
@@ -663,7 +742,7 @@ async fn each_turn_runs_only_on_its_senders_daemon_and_is_mirrored() {
 async fn restart_catches_up_from_the_stored_cursor_without_duplicates() {
     let Pair {
         server,
-        alice: _alice,
+        alice,
         mut bob,
         mut alice_ipc,
         bob_ipc,
@@ -684,7 +763,25 @@ async fn restart_catches_up_from_the_stored_cursor_without_duplicates() {
     let session = server.login("bob").await;
     // `TurnCompleted` precedes the stored answer (the turn checkpoint is
     // recorded first), so wait until the runner reported and finished both
-    // turns before taking the log head.
+    // turns, and Alice's outbox published the answers, before taking the
+    // log head.
+    eventually("alice published both answers", || async {
+        alice
+            .sessions
+            .db()
+            .collab_outbox_pending(1)
+            .await
+            .unwrap()
+            .is_empty()
+            && server
+                .events(&session, &collab_thread)
+                .await
+                .iter()
+                .filter(|e| e.kind == trama_collab_protocol::EventKind::HistoryMessage)
+                .count()
+                == 2
+    })
+    .await;
     eventually("alice's runner finished both turns", || async {
         let turns: Vec<_> = server
             .commands(&session, &collab_thread)

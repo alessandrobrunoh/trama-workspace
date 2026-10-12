@@ -920,6 +920,7 @@ mod tests {
                 },
             ],
             link_token: token.map(str::to_string),
+            pending_publish: 0,
         }
     }
 

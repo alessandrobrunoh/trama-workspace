@@ -34,6 +34,11 @@ pub(super) struct PendingDelivery {
     pub(super) block: String,
 }
 
+/// A comment mirrored from another participant (`collab:<username>`).
+pub(crate) fn is_remote_author(actor: &Actor) -> bool {
+    matches!(actor, Actor::Human { id } if id.starts_with("collab:"))
+}
+
 fn local_user() -> Actor {
     Actor::Human {
         id: LOCAL_USER.into(),
@@ -286,6 +291,38 @@ impl SessionManager {
         Ok((thread_id, ids))
     }
 
+    /// Tell subscribers about comments the collab mirror wrote: created
+    /// (`created`) or changed.
+    pub(crate) async fn notify_comments(
+        &self,
+        thread_id: &ThreadId,
+        ids: &[CommentId],
+        created: bool,
+    ) {
+        if !created {
+            self.broadcast_comment_updates(thread_id, ids).await;
+            return;
+        }
+        let records = match self.db.list_comments(thread_id).await {
+            Ok(records) => records
+                .into_iter()
+                .filter(|record| ids.contains(&record.comment.id))
+                .collect(),
+            Err(err) => {
+                crate::log::warn(format!("failed to load comments: {err}"));
+                return;
+            }
+        };
+        match self.comment_snapshots(thread_id, records).await {
+            Ok(snapshots) => {
+                for snapshot in snapshots {
+                    self.broadcast(thread_id, DaemonMessage::CommentCreated(snapshot));
+                }
+            }
+            Err(err) => crate::log::warn(format!("failed to snapshot comments: {err}")),
+        }
+    }
+
     /// Thread a comment belongs to (for routing replies).
     pub async fn comment_thread(&self, comment_id: &CommentId) -> Result<ThreadId> {
         self.db
@@ -309,9 +346,13 @@ impl SessionManager {
             })
             .map(|record| record.comment.id.clone())
             .collect();
+        // Comments mirrored from other participants of a shared thread went
+        // (or go) to their own agent; this one learns of them through the
+        // shared-thread digest instead.
         let pending: HashSet<CommentId> = records
             .iter()
             .filter(|record| record.delivery.is_none())
+            .filter(|record| !is_remote_author(&record.comment.author))
             .filter(|record| {
                 let root = record
                     .comment

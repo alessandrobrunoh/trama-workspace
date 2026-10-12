@@ -58,6 +58,10 @@ pub(super) enum ForkConversation {
     },
     /// A new conversation (subagents get only their task prompt).
     Fresh,
+    /// A child mirrored from a shared thread: no Claude session to fork
+    /// (the participant's own first turn starts one, with the shared-thread
+    /// digest), and the parent's transcript shown up to `last_message`.
+    Mirrored { last_message: Option<MessageId> },
 }
 
 pub(super) struct ForkRequest {
@@ -467,6 +471,7 @@ impl SessionManager {
                 (Some(path.clone()), Some(last_message.clone()))
             }
             ForkConversation::Fresh => (None, None),
+            ForkConversation::Mirrored { last_message } => (None, last_message.clone()),
         };
         let fork = SubthreadFork {
             thread_id: thread.id.clone(),
@@ -545,6 +550,56 @@ impl SessionManager {
                 .map(|(_, _, copy, _)| copy.path.clone())
                 .collect(),
         })
+    }
+
+    /// A child created because another participant of a shared thread
+    /// announced one (ADR 0013): its own copy of the parent's current files
+    /// (a scout shares the parent's checkouts), the parent's transcript up to
+    /// `fork_message`, and for a subagent a task record whose state the
+    /// mirror keeps up to date. No turn starts.
+    pub(crate) async fn create_mirrored_child(
+        &self,
+        parent_id: &ThreadId,
+        kind: ThreadKind,
+        title: String,
+        subagent: Option<trama_domain::subagent::SubagentProfile>,
+        fork_message: Option<MessageId>,
+    ) -> Result<ThreadSnapshot> {
+        let parent = self
+            .db
+            .get_thread(parent_id)
+            .await?
+            .ok_or_else(|| DaemonError::NotFound(format!("thread {parent_id}")))?;
+        let kind = if kind.is_subthread() {
+            kind
+        } else {
+            ThreadKind::Sub
+        };
+        let files = match subagent {
+            Some(trama_domain::subagent::SubagentProfile::Scout) => ForkFiles::Shared,
+            _ => ForkFiles::Current,
+        };
+        let child = self
+            .fork_child(
+                &parent,
+                ForkRequest {
+                    kind,
+                    title,
+                    files,
+                    conversation: ForkConversation::Mirrored {
+                        last_message: fork_message,
+                    },
+                    allow_parent_turn: true,
+                    spawned_by: subagent.map(|profile| trama_domain::subagent::SpawnedBy {
+                        parent_thread_id: parent.id.clone(),
+                        tool_use_id: None,
+                        profile,
+                    }),
+                    forked_at: None,
+                },
+            )
+            .await?;
+        Ok(child.snapshot)
     }
 
     pub async fn create_subthread(
