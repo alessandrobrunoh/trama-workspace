@@ -53,6 +53,16 @@ pub struct ProvisionedCheckout {
     pub base_revision: String,
 }
 
+/// A subthread's copy of a parent checkout. `base_revision` is the parent's
+/// `HEAD`; `fork_commit` snapshots the parent's full working state (tracked,
+/// staged, unstaged and untracked non-ignored files) inside the copy.
+#[derive(Clone, Debug)]
+pub struct ProvisionedCopy {
+    pub path: PathBuf,
+    pub base_revision: String,
+    pub fork_commit: String,
+}
+
 /// A local non-bare working tree whose `.git` is on the selected directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InspectedWorktree {
@@ -192,6 +202,143 @@ impl CheckoutManager {
         })
     }
 
+    /// Copy a parent thread's managed checkout for a subthread and publish it
+    /// atomically under `<source>/.trama/worktrees/<thread>/<checkout>`, like
+    /// any repo-local checkout. The copy is a `--no-hardlinks` clone of the
+    /// parent checkout at the parent's `HEAD` (so commits the parent made are
+    /// included), with the parent's working-tree delta replayed on top:
+    /// tracked changes (binary included) and untracked non-ignored files.
+    /// Ignored files are never copied. The parent checkout and the source
+    /// repository working tree are only read (the source need not be clean);
+    /// the copy's `local` remote points at `source`. An existing copy is
+    /// validated and returned, never replaced.
+    pub fn provision_copy(
+        &self,
+        parent_checkout: &Path,
+        source: &Path,
+        thread: &ThreadId,
+        repository: &RepositoryId,
+        checkout: &trama_domain::ids::CheckoutId,
+    ) -> Result<ProvisionedCopy, CheckoutError> {
+        let parent = fs::canonicalize(parent_checkout)
+            .map_err(|_| CheckoutError::Invalid(parent_checkout.to_path_buf()))?;
+        let canonical_source = fs::canonicalize(source).map_err(|_| CheckoutError::Missing {
+            path: source.to_path_buf(),
+        })?;
+        // The parent must be a managed checkout of this source, never the
+        // user's primary working tree.
+        let parent_local = git_text(&parent, ["remote", "get-url", "local"])
+            .map_err(|_| CheckoutError::Invalid(parent.clone()))?;
+        if parent == canonical_source
+            || fs::canonicalize(&parent_local).ok().as_ref() != Some(&canonical_source)
+        {
+            return Err(CheckoutError::Invalid(parent));
+        }
+        let (source, destination) =
+            self.prepare_repo_local(&canonical_source, thread, repository, checkout, false)?;
+        let destination_parent = destination
+            .parent()
+            .ok_or_else(|| CheckoutError::Containment(destination.clone()))?
+            .to_path_buf();
+        if fs::symlink_metadata(&destination).is_ok() {
+            let base_revision = fs::read_to_string(destination.join(".git/trama-base-commit"))
+                .map_err(|_| CheckoutError::Invalid(destination.clone()))?
+                .trim()
+                .to_owned();
+            self.validate_repo_local(&source, &destination, &base_revision)?;
+            let fork_commit = git_text(
+                &destination,
+                ["rev-parse", "--verify", crate::changes::FORK_POINT_REF],
+            )
+            .map_err(|_| CheckoutError::Invalid(destination.clone()))?;
+            return Ok(ProvisionedCopy {
+                path: destination,
+                base_revision,
+                fork_commit,
+            });
+        }
+
+        let base_revision = git_text(&parent, ["rev-parse", "HEAD"])?;
+        let parent_tree = crate::changes::snapshot_tree(&parent)?;
+        let patch = git(
+            &parent,
+            [
+                "diff",
+                "--binary",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-renames",
+                base_revision.as_str(),
+                parent_tree.as_str(),
+            ],
+        )?
+        .stdout;
+        let origin = git_text(&parent, ["remote", "get-url", "origin"]).ok();
+
+        let staging = destination_parent.join(format!(".staging-{}", ulid::Ulid::new()));
+        let result = (|| {
+            git(
+                &parent,
+                [
+                    OsStr::new("clone"),
+                    OsStr::new("--quiet"),
+                    OsStr::new("--no-hardlinks"),
+                    OsStr::new("--"),
+                    parent.as_os_str(),
+                    staging.as_os_str(),
+                ],
+            )?;
+            if git_text(&staging, ["rev-parse", "HEAD"])? != base_revision {
+                git(
+                    &staging,
+                    ["checkout", "--quiet", "--detach", base_revision.as_str()],
+                )?;
+            }
+            match &origin {
+                Some(url) => {
+                    git(&staging, ["remote", "set-url", "origin", url.as_str()])?;
+                }
+                None => {
+                    git(&staging, ["remote", "remove", "origin"])?;
+                }
+            }
+            git(
+                &staging,
+                [
+                    OsStr::new("remote"),
+                    OsStr::new("add"),
+                    OsStr::new("local"),
+                    source.as_os_str(),
+                ],
+            )?;
+            if !patch.is_empty() {
+                crate::changes::apply_patch(&staging, &patch)?;
+            }
+            fs::write(staging.join(".git/trama-base-commit"), &base_revision)?;
+            let fork_commit = crate::changes::record_snapshot(
+                &staging,
+                crate::changes::FORK_POINT_REF,
+                "trama: subthread fork point",
+            )?;
+            let fork_tree = git_text(&staging, ["rev-parse", &format!("{fork_commit}^{{tree}}")])?;
+            if fork_tree != parent_tree {
+                return Err(CheckoutError::Invalid(staging.clone()));
+            }
+            fs::rename(&staging, &destination)?;
+            Ok(fork_commit)
+        })();
+        if result.is_err() && staging.exists() {
+            // Only our unique unpublished staging directory is removed.
+            let _ = fs::remove_dir_all(&staging);
+        }
+        let fork_commit = result?;
+        Ok(ProvisionedCopy {
+            path: destination,
+            base_revision,
+            fork_commit,
+        })
+    }
+
     /// Validate identity and origin for an already-published checkout. Never
     /// replace or clean an existing directory, since it may contain user work.
     pub fn validate(
@@ -256,13 +403,17 @@ impl CheckoutManager {
             .join(&checkout.0))
     }
 
-    pub fn provision_repo_local(
+    /// Validate and prepare `<source>/.trama/worktrees/<thread>/` (owner
+    /// marker, local exclude) and return the canonical source plus the
+    /// checkout destination, which may already exist.
+    fn prepare_repo_local(
         &self,
         source: &Path,
         thread: &ThreadId,
         repository: &RepositoryId,
         checkout: &trama_domain::ids::CheckoutId,
-    ) -> Result<ProvisionedCheckout, CheckoutError> {
+        require_clean_source: bool,
+    ) -> Result<(PathBuf, PathBuf), CheckoutError> {
         if !safe_id(&repository.0) {
             return Err(CheckoutError::Containment(source.join(".trama")));
         }
@@ -300,8 +451,9 @@ impl CheckoutManager {
         {
             return Err(CheckoutError::Invalid(trama));
         }
-        Self::assert_clean(&source)?;
-        let base_revision = text(git(&source, ["rev-parse", "HEAD"])?);
+        if require_clean_source {
+            Self::assert_clean(&source)?;
+        }
         let marker = format!("trama-repo-local-v1\n{}\n", source.display());
         let marker_path = trama.join(".trama-workspace.json");
         if fs::symlink_metadata(&trama).is_ok() {
@@ -338,6 +490,19 @@ impl CheckoutManager {
         {
             return Err(CheckoutError::Containment(destination));
         }
+        Ok((source, destination))
+    }
+
+    pub fn provision_repo_local(
+        &self,
+        source: &Path,
+        thread: &ThreadId,
+        repository: &RepositoryId,
+        checkout: &trama_domain::ids::CheckoutId,
+    ) -> Result<ProvisionedCheckout, CheckoutError> {
+        let (source, destination) =
+            self.prepare_repo_local(source, thread, repository, checkout, true)?;
+        let base_revision = text(git(&source, ["rev-parse", "HEAD"])?);
         let parent = destination
             .parent()
             .ok_or_else(|| CheckoutError::Containment(destination.clone()))?;
@@ -596,7 +761,7 @@ fn canonicalize_deepest_existing(path: &Path) -> std::io::Result<PathBuf> {
     Ok(canonical)
 }
 
-fn git<I, S>(cwd: &Path, args: I) -> Result<Output, CheckoutError>
+pub(crate) fn git<I, S>(cwd: &Path, args: I) -> Result<Output, CheckoutError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -619,11 +784,11 @@ where
     Ok(output)
 }
 
-fn text(output: Output) -> String {
+pub(crate) fn text(output: Output) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
-fn git_text<I, S>(cwd: &Path, args: I) -> Result<String, CheckoutError>
+pub(crate) fn git_text<I, S>(cwd: &Path, args: I) -> Result<String, CheckoutError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
