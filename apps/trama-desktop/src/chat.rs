@@ -244,10 +244,6 @@ pub struct ChatPanel {
     prompt_times: HashMap<MessageId, chrono::DateTime<chrono::Utc>>,
     /// Threads the sidebar lists, for subagent links.
     known_threads: Vec<(ThreadId, String)>,
-    /// Tool calls and thinking of turns seen this session, by thread and
-    /// prompt. The daemon stores only prompts and final answers, so these
-    /// are put back when a thread replays.
-    turn_details: HashMap<ThreadId, TurnDetails>,
     /// Shared-thread state (drafts, presence, remote turns).
     collab: Option<Entity<crate::collab::CollabStore>>,
     /// Mirrored messages of other participants: author and role.
@@ -335,7 +331,6 @@ impl ChatPanel {
             bookmarks: Bookmarks::load(),
             prompt_times: HashMap::new(),
             known_threads: Vec::new(),
-            turn_details: HashMap::new(),
             collab: None,
             remote_authors: HashMap::new(),
             popup,
@@ -450,8 +445,8 @@ impl ChatPanel {
         let was_connected = self.connected;
         self.connected = connected;
         if connected && !was_connected && !self.is_running() {
-            // Re-subscribe replay will refill; drop anything streamed while offline.
-            self.stash_turn_details();
+            // Re-subscribe replay (stored tool activity included) will
+            // refill; drop anything streamed while offline.
             self.clear_transcript();
         }
         if !connected && was_connected {
@@ -477,7 +472,6 @@ impl ChatPanel {
         if self.selected_thread == thread {
             return;
         }
-        self.stash_turn_details();
         if let Some(current_thread) = &self.selected_thread {
             let mut draft = self.composer.value(cx);
             if let Some(prompt) = self.pending_prompt.take()
@@ -659,6 +653,17 @@ impl ChatPanel {
                 self.scroll.scroll_to_bottom();
                 cx.notify();
             }
+            DaemonMessage::TurnActivity {
+                thread_id,
+                message_id,
+                items,
+            } => {
+                if !self.thread_matches(&thread_id) {
+                    return;
+                }
+                self.apply_turn_activity(message_id, &items);
+                cx.notify();
+            }
             DaemonMessage::UsageSnapshot { thread_id, totals } => {
                 if !self.thread_matches(&thread_id) {
                     return;
@@ -781,7 +786,6 @@ impl ChatPanel {
         match message.role {
             Role::User => {
                 append_stored_user(&mut self.entries, &mut self.pending_prompt, &message);
-                self.restore_turn_details(&message.id);
             }
             Role::Assistant => {
                 append_stored_assistant(&mut self.entries, self.lifecycle, &message);
@@ -1098,50 +1102,6 @@ impl ChatPanel {
         }
     }
 
-    /// Remember the selected thread's tool calls and thinking per prompt.
-    fn stash_turn_details(&mut self) {
-        let Some(thread) = self.selected_thread.clone() else {
-            return;
-        };
-        let stash = self.turn_details.entry(thread).or_default();
-        for (prompt, entries) in turn_details(&self.entries) {
-            stash.entries.insert(prompt, entries);
-        }
-        stash.timings.extend(
-            self.tool_views
-                .timings
-                .iter()
-                .map(|(id, timing)| (id.clone(), *timing)),
-        );
-    }
-
-    /// Put a replayed prompt's stashed tool calls back under it.
-    fn restore_turn_details(&mut self, prompt: &MessageId) {
-        let Some(stash) = self
-            .selected_thread
-            .as_ref()
-            .and_then(|thread| self.turn_details.get(thread))
-        else {
-            return;
-        };
-        let Some(entries) = stash.entries.get(prompt) else {
-            return;
-        };
-        for entry in entries {
-            if let ChatEntry::ToolCall { tool_use_id, .. } = entry
-                && let Some(timing) = stash.timings.get(tool_use_id)
-            {
-                self.tool_views
-                    .timings
-                    .entry(tool_use_id.clone())
-                    .or_insert(*timing);
-            }
-            if let Some(entry) = detail_copy(entry) {
-                self.entries.push(entry);
-            }
-        }
-    }
-
     pub fn toggle_group(&mut self, start: usize, cx: &mut Context<Self>) {
         if !self.tool_views.open_groups.remove(&start) {
             self.tool_views.open_groups.insert(start);
@@ -1320,59 +1280,45 @@ impl ChatPanel {
         }
         cx.notify();
     }
-}
 
-/// One thread's stashed turn details.
-#[derive(Default)]
-struct TurnDetails {
-    entries: HashMap<MessageId, Vec<ChatEntry>>,
-    timings: HashMap<String, ToolTiming>,
-}
-
-/// A finished copy of a tool call or thought; other entries are not kept.
-fn detail_copy(entry: &ChatEntry) -> Option<ChatEntry> {
-    match entry {
-        ChatEntry::ToolCall {
-            tool_use_id,
-            name,
-            input_json,
-            finished,
-            is_error,
-            output,
-            ..
-        } => Some(ChatEntry::ToolCall {
-            tool_use_id: tool_use_id.clone(),
-            name: name.clone(),
-            input_json: input_json.clone(),
-            // A call cut off by the switch will not report back.
-            finished: true,
-            is_error: *is_error || (!*finished && output.is_none()),
-            expanded: false,
-            output: output.clone(),
-        }),
-        ChatEntry::Thinking { text } => Some(ChatEntry::Thinking { text: text.clone() }),
-        _ => None,
-    }
-}
-
-/// Tool calls and thinking after each stored prompt, by the prompt's id.
-fn turn_details(entries: &[ChatEntry]) -> Vec<(MessageId, Vec<ChatEntry>)> {
-    let mut out: Vec<(MessageId, Vec<ChatEntry>)> = Vec::new();
-    let mut prompt: Option<MessageId> = None;
-    for entry in entries {
-        if let ChatEntry::User { message_id, .. } = entry {
-            prompt = message_id.clone();
-            continue;
+    /// A stored turn's (or the running turn's) replayed tool calls and
+    /// thinking. They arrive right before the message that ends the turn;
+    /// the running turn's come after the history, and its later steps
+    /// stream as agent events.
+    fn apply_turn_activity(
+        &mut self,
+        message_id: Option<MessageId>,
+        items: &[trama_protocol::ActivityItem],
+    ) {
+        if message_id
+            .as_ref()
+            .is_some_and(|id| self.seen_message_ids.contains(id))
+        {
+            return;
         }
-        let (Some(id), Some(copy)) = (&prompt, detail_copy(entry)) else {
-            continue;
-        };
-        match out.last_mut() {
-            Some((last, list)) if last == id => list.push(copy),
-            _ => out.push((id.clone(), vec![copy])),
+        let in_flight = message_id.is_none();
+        // Already following this turn (a reconnect mid-turn): only add the
+        // tool calls it missed; its thinking is on screen already.
+        let following = in_flight && self.is_running();
+        if in_flight {
+            // Subscribed mid-turn: follow it like a turn started elsewhere.
+            self.adopt_remote_turn();
         }
+        let shown = crate::activity::shown_tool_ids(&self.entries);
+        let mut replayed = crate::activity::replay_entries(items, in_flight, &shown);
+        if following {
+            replayed
+                .entries
+                .retain(|entry| matches!(entry, ChatEntry::ToolCall { .. }));
+        }
+        for (id, timing) in replayed.timings {
+            self.tool_views.timings.entry(id).or_insert(timing);
+        }
+        if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
+            *streaming = false;
+        }
+        self.entries.extend(replayed.entries);
     }
-    out
 }
 
 /// Append streamed or stored thinking, merging with thinking right before.
@@ -4367,61 +4313,6 @@ mod tests {
         let only = user(block);
         append_stored_user(&mut entries, &mut pending, &only);
         assert_eq!(entries.len(), 2);
-    }
-
-    #[test]
-    fn turn_details_are_kept_per_stored_prompt() {
-        use super::turn_details;
-        let tool = |id: &str, finished: bool| ChatEntry::ToolCall {
-            tool_use_id: id.into(),
-            name: "Read".into(),
-            input_json: serde_json::json!({}),
-            finished,
-            is_error: false,
-            expanded: true,
-            output: None,
-        };
-        let entries = vec![
-            ChatEntry::User {
-                text: "first".into(),
-                message_id: Some(MessageId::from("m1")),
-            },
-            ChatEntry::Thinking { text: "hm".into() },
-            tool("t1", true),
-            ChatEntry::Assistant {
-                markdown: "done".into(),
-                streaming: false,
-                message_id: None,
-            },
-            ChatEntry::User {
-                text: "pending".into(),
-                message_id: None,
-            },
-            tool("t2", true),
-            ChatEntry::User {
-                text: "second".into(),
-                message_id: Some(MessageId::from("m2")),
-            },
-            tool("t3", false),
-        ];
-        let details = turn_details(&entries);
-        assert_eq!(details.len(), 2);
-        assert_eq!(details[0].0, MessageId::from("m1"));
-        assert_eq!(
-            details[0].1.len(),
-            2,
-            "thinking and the tool call, not the text"
-        );
-        assert_eq!(details[1].0, MessageId::from("m2"));
-        assert!(matches!(
-            details[1].1.as_slice(),
-            [ChatEntry::ToolCall {
-                finished: true,
-                is_error: true,
-                expanded: false,
-                ..
-            }]
-        ));
     }
 
     #[test]

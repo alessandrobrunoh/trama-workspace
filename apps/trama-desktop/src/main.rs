@@ -1,3 +1,4 @@
+mod activity;
 mod agent;
 mod changes;
 mod chat;
