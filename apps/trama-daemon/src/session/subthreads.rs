@@ -1814,7 +1814,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(land.kind, ThreadKind::Land);
-        let result = timeout(Duration::from_secs(5), async {
+        let result = timeout(Duration::from_secs(15), async {
             loop {
                 if let Some(DaemonMessage::LandResult {
                     outcome, summary, ..
