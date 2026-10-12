@@ -7,5 +7,6 @@
 pub mod changes;
 pub mod checkout;
 pub mod claude;
+pub mod setup;
 
 pub use claude::adapter::ClaudeAdapter;

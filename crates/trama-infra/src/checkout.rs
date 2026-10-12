@@ -443,9 +443,15 @@ impl CheckoutManager {
                 }
             }
         }
-        let tracked = git(&source, ["ls-files", "--", ".trama"])?;
+        // Only the committed setup overrides (`.trama/prepare`, `.trama/linked`)
+        // may be tracked; anything else under `.trama` belongs to someone else.
+        let tracked = git(&source, ["ls-files", "-z", "--", ".trama"])?;
         let trama = source.join(".trama");
-        if !tracked.stdout.is_empty()
+        if tracked
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .any(|entry| !TRACKED_TRAMA_CONFIG.contains(&entry))
             || fs::symlink_metadata(&trama)
                 .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
         {
@@ -456,7 +462,21 @@ impl CheckoutManager {
         }
         let marker = format!("trama-repo-local-v1\n{}\n", source.display());
         let marker_path = trama.join(".trama-workspace.json");
-        if fs::symlink_metadata(&trama).is_ok() {
+        // A `.trama` that holds only tracked setup overrides is adopted: the
+        // marker is created next to them below.
+        let config_only = fs::symlink_metadata(&marker_path).is_err()
+            && fs::read_dir(&trama).is_ok_and(|entries| {
+                let entries: Vec<_> = entries.collect();
+                !entries.is_empty()
+                    && entries.into_iter().all(|entry| {
+                        entry.is_ok_and(|entry| {
+                            let path = Path::new(".trama").join(entry.file_name());
+                            TRACKED_TRAMA_CONFIG.contains(&path.as_os_str().as_encoded_bytes())
+                                && entry.file_type().is_ok_and(|kind| kind.is_file())
+                        })
+                    })
+            });
+        if fs::symlink_metadata(&trama).is_ok() && !config_only {
             if fs::symlink_metadata(&marker_path)
                 .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
                 || fs::read_to_string(&marker_path)
@@ -470,6 +490,8 @@ impl CheckoutManager {
         ensure_local_exclude(&source)?;
         if !trama.exists() {
             fs::create_dir(&trama)?;
+        }
+        if fs::symlink_metadata(&marker_path).is_err() {
             fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -689,6 +711,9 @@ impl CheckoutManager {
         Ok(())
     }
 }
+
+/// Repository-tracked files allowed under `.trama` (see [`crate::setup`]).
+const TRACKED_TRAMA_CONFIG: [&[u8]; 2] = [b".trama/prepare", b".trama/linked"];
 
 fn safe_id(value: &str) -> bool {
     !value.is_empty()
@@ -995,6 +1020,62 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn tracked_trama_setup_overrides_are_adopted_but_nothing_else() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        repository(&source);
+        fs::create_dir_all(source.join(".trama")).unwrap();
+        fs::write(source.join(".trama/prepare"), "#!/bin/sh\n").unwrap();
+        fs::write(source.join(".trama/linked"), ".env\n").unwrap();
+        git(&source, &["add", ".trama"]);
+        git(&source, &["commit", "-m", "setup overrides"]);
+        let manager = CheckoutManager::new(temp.path().join("global"));
+        let checkout = manager
+            .provision_repo_local(
+                &source,
+                &ThreadId::from("t"),
+                &RepositoryId::from("r"),
+                &trama_domain::ids::CheckoutId::from("c"),
+            )
+            .unwrap();
+        assert!(checkout.path.join(".trama/prepare").exists());
+        assert!(source.join(".trama/.trama-workspace.json").exists());
+        assert!(
+            git_text(&source, ["status", "--porcelain", "--untracked-files=all"])
+                .unwrap()
+                .is_empty()
+        );
+        // A second thread reuses the adopted directory.
+        manager
+            .provision_repo_local(
+                &source,
+                &ThreadId::from("t2"),
+                &RepositoryId::from("r"),
+                &trama_domain::ids::CheckoutId::from("c"),
+            )
+            .unwrap();
+
+        let other = temp.path().join("other");
+        repository(&other);
+        fs::create_dir_all(other.join(".trama")).unwrap();
+        fs::write(other.join(".trama/prepare"), "#!/bin/sh\n").unwrap();
+        fs::write(other.join(".trama/notes"), "foreign\n").unwrap();
+        git(&other, &["add", ".trama"]);
+        git(&other, &["commit", "-m", "foreign trama"]);
+        assert!(
+            manager
+                .provision_repo_local(
+                    &other,
+                    &ThreadId::from("t"),
+                    &RepositoryId::from("r"),
+                    &trama_domain::ids::CheckoutId::from("c"),
+                )
+                .is_err()
+        );
+        assert!(!other.join(".trama/.trama-workspace.json").exists());
     }
 
     #[test]
