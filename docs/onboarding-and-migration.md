@@ -32,6 +32,13 @@ not rewrite stored ids or messages.
 `list_repositories` returns one snapshot per membership. Workspace `repo_count`
 is that membership count.
 
+### Project setup in new checkouts
+
+Ignored files (`node_modules`, `target/`, `.env`) are not cloned. Commit
+`.agents/linked` and an executable `.agents/prepare` to link or rebuild them in
+every new thread checkout and subthread copy; see
+[project setup](project-setup.md). Migrating a legacy thread does not run them.
+
 ### Which checkout is the cwd
 
 Attachments carry a stable order: repository id ascending — the same order
