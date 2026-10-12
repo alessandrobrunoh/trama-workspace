@@ -1,5 +1,7 @@
 //! Persistent session manager: TramaDB + injected `AgentAdapter`.
 
+mod subthreads;
+
 use crate::approval::{self, ApprovalHookSettings, HookDecision};
 use crate::config::permission_mode_from_settings;
 use crate::error::{DaemonError, Result};
@@ -40,6 +42,9 @@ enum Reservation {
     /// `migrate_legacy_thread` is cloning/persisting; `send_prompt` and other
     /// migrations are rejected for the whole window.
     Migration,
+    /// A subthread is copying this thread's checkouts, or changes are being
+    /// pulled into (or from) it.
+    Checkouts,
 }
 
 #[derive(Default)]
@@ -253,7 +258,7 @@ impl SessionManager {
             return Err(DaemonError::NotFound(format!("workspace {workspace_id}")));
         }
         let threads = self.db.list_threads(workspace_id).await?;
-        Ok(threads.iter().map(thread_snapshot).collect())
+        self.thread_snapshots(&threads).await
     }
 
     /// Return thread checkout readiness, exposing a path only after validation.
@@ -758,7 +763,8 @@ impl SessionManager {
         if self.db.get_thread(thread_id).await?.is_none() {
             return Err(DaemonError::NotFound(format!("thread {thread_id}")));
         }
-        let history = self.db.list_messages_by_thread(thread_id).await?;
+        let mut history = self.inherited_messages(thread_id).await?;
+        history.extend(self.db.list_messages_by_thread(thread_id).await?);
         let id = {
             let mut inner = self.lock();
             let id = SubscriptionId(inner.next_sub);
@@ -1367,6 +1373,12 @@ impl SessionManager {
         thread_id: ThreadId,
         text: String,
     ) -> std::result::Result<(), TurnFailure> {
+        // Best-effort "last turn" baseline. It runs beside session start and
+        // the model's first round trip instead of delaying the prompt; an
+        // edit landing within that window would count as pre-turn state.
+        let snapshot = self.clone();
+        let snapshot_thread = thread_id.clone();
+        tokio::spawn(async move { snapshot.snapshot_turn_start(&snapshot_thread).await });
         let session = match self.ensure_session(&thread_id).await {
             Ok(session) => session,
             Err(err) => {
@@ -1555,12 +1567,21 @@ impl SessionManager {
             None => (trama_domain::agent::PermissionMode::Default, None),
         };
 
-        let resume_external_session = self
+        let own_session = self
             .db
             .latest_agent_session_for_thread(thread_id)
             .await?
             .filter(|session| same_directory(&session.cwd, &cwd))
             .and_then(|session| session.external_session_id);
+        // A subthread's first session inherits its parent's conversation by
+        // forking the parent's session; afterwards it resumes its own.
+        let (resume_external_session, fork_session) = match own_session {
+            Some(id) => (Some(id), false),
+            None => match self.inherited_session(&thread).await? {
+                Some(parent) => (Some(parent), true),
+                None => (None, false),
+            },
+        };
 
         Ok(SessionConfig {
             cwd,
@@ -1576,7 +1597,7 @@ impl SessionManager {
             resume_external_session,
             billing: self.billing,
             approval_hook: None,
-            fork_session: false,
+            fork_session,
         })
     }
 
@@ -1730,6 +1751,7 @@ impl SessionManager {
             self.release_turn(thread_id);
             return;
         };
+        let land_result = subthreads::parse_land_result(&text);
 
         let assistant = Message::new_assistant(
             thread_id.clone(),
@@ -1800,6 +1822,9 @@ impl SessionManager {
             },
         );
         self.release_turn(thread_id);
+        if let Some((outcome, summary)) = land_result {
+            self.record_land_result(thread_id, outcome, summary).await;
+        }
     }
 
     /// The adapter event stream closed. If a turn was still in flight it never
@@ -2042,6 +2067,9 @@ fn thread_snapshot(thread: &Thread) -> ThreadSnapshot {
         id: thread.id.clone(),
         title: thread.title.clone().unwrap_or_default(),
         repo_count: thread.repo_attachments.len() as u32,
+        parent_thread_id: thread.parent_thread_id.clone(),
+        kind: thread.kind,
+        review_verdict: None,
     }
 }
 

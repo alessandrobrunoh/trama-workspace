@@ -22,10 +22,11 @@
 //! a new variant is a breaking handshake change: an older peer would accept `Hello`
 //! and then fail the command. [`PROTOCOL_VERSION`] **2** added workspace creation,
 //! repository membership, and legacy-thread migration. **3** added thread
-//! checkout discovery. **4** adds the approval channel
+//! checkout discovery. **4** added the approval channel
 //! ([`ClientMessage::ApprovalHook`], [`DaemonMessage::ApprovalHookDecision`])
-//! and the `session_info` / `approval_resolved` agent events. Each bump is
-//! transport-only. Persisted domain ids and SQLite rows are not rewritten.
+//! and the `session_info` / `approval_resolved` agent events. **5** adds
+//! subthreads, changes, pull changes, review verdicts and land results. Each
+//! bump is transport-only. Persisted domain ids and SQLite rows are not rewritten.
 //!
 //! A version mismatch fails the handshake (`Welcome.accepted = false`). Extra object
 //! fields inside a known payload are ignored (serde default). Bump [`PROTOCOL_VERSION`]
@@ -37,14 +38,20 @@ use std::path::PathBuf;
 pub use trama_domain::agent::{AgentEvent, ApprovalDecision, BillingSource, UsageReport};
 pub use trama_domain::ids::{RepositoryId, ThreadId, WorkspaceId};
 pub use trama_domain::message::Message;
+pub use trama_domain::subthread::{
+    FileChange, FileChangeStatus, LandOutcome, PullFileOutcome, PullFileResult, RepoPullResult,
+    ReviewVerdict,
+};
+pub use trama_domain::thread::ThreadKind;
 
 /// Wire protocol version carried in `Hello` / `Welcome`.
 ///
-/// Version 4 adds the Claude approval channel and the `session_info` /
-/// `approval_resolved` agent events (3 added thread checkout discovery). It
-/// does not migrate stored data; peers with a different version are rejected
-/// at handshake time.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// Version 5 adds subthreads (create/list, parent and kind in thread
+/// snapshots), changes, pull changes, review verdicts and land results.
+/// Version 4 added the Claude approval channel and 3 thread checkout
+/// discovery. It does not migrate stored data; peers with a different version
+/// are rejected at handshake time.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Encode `value` as one JSON line (compact JSON plus a trailing `\n`).
 pub fn encode_json_line<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
@@ -123,7 +130,90 @@ pub enum ClientMessage {
         tool_name: String,
         tool_input: serde_json::Value,
     },
+    /// Fork a subthread from a top-level thread: copies of the parent's
+    /// checkouts (uncommitted and untracked changes included) and, when the
+    /// parent has an agent session, its conversation. Review and land
+    /// subthreads start their first turn immediately; a plain subthread only
+    /// when `initial_prompt` is set. Answered with `SubthreadCreated`.
+    CreateSubthread {
+        parent_thread_id: ThreadId,
+        kind: SubthreadKind,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        initial_prompt: Option<String>,
+    },
+    /// Answered with `Subthreads`.
+    ListSubthreads {
+        parent_thread_id: ThreadId,
+    },
+    /// Unified diff per repository of the thread's current working state
+    /// (untracked non-ignored files included) against `base`. Answered with
+    /// `Changes`.
+    GetChanges {
+        thread_id: ThreadId,
+        #[serde(default)]
+        base: ChangeBase,
+    },
+    /// Apply what a subthread changed since its fork point to its parent's
+    /// checkouts. Never commits. Answered with `ChangesPulled`.
+    PullChanges {
+        subthread_id: ThreadId,
+    },
+    /// Record a review subthread's verdict and post it to the parent thread.
+    /// Answered with `ReviewVerdictPosted`.
+    SubmitReviewVerdict {
+        review_thread_id: ThreadId,
+        verdict: ReviewVerdict,
+    },
     Shutdown,
+}
+
+/// The kind of subthread to create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubthreadKind {
+    Plain,
+    Review,
+    Land,
+}
+
+impl SubthreadKind {
+    pub fn thread_kind(self) -> ThreadKind {
+        match self {
+            Self::Plain => ThreadKind::Sub,
+            Self::Review => ThreadKind::Review,
+            Self::Land => ThreadKind::Land,
+        }
+    }
+}
+
+/// What `GetChanges` diffs against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeBase {
+    /// Where the thread started: the base revision of a top-level thread's
+    /// checkout, or a subthread's fork point (the parent's full working state
+    /// when the subthread was created).
+    #[default]
+    ThreadBase,
+    /// The checkout's last commit (`HEAD`): uncommitted changes only.
+    Head,
+    /// The working state when the latest agent turn started.
+    LastTurn,
+}
+
+/// One repository's changes. `base_revision` is the resolved base commit.
+/// `diff` is `git diff --no-color -M` text (binary contents are not inlined)
+/// and is cut at 8 MiB when `truncated`; `files` is always complete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoChanges {
+    pub repository_id: RepositoryId,
+    pub title: String,
+    pub base_revision: String,
+    pub diff: String,
+    pub truncated: bool,
+    pub files: Vec<FileChange>,
 }
 
 /// Daemon → UI.
@@ -176,6 +266,40 @@ pub enum DaemonMessage {
         thread_id: ThreadId,
         checkouts: Vec<CheckoutSnapshot>,
     },
+    /// Reply to `CreateSubthread`; also broadcast to the parent's subscribers.
+    SubthreadCreated(ThreadSnapshot),
+    Subthreads {
+        parent_thread_id: ThreadId,
+        threads: Vec<ThreadSnapshot>,
+    },
+    Changes {
+        thread_id: ThreadId,
+        base: ChangeBase,
+        repos: Vec<RepoChanges>,
+    },
+    /// Per-file outcome of `PullChanges`; also broadcast to the parent's
+    /// subscribers. Conflicts are `PullFileOutcome::Conflict` entries.
+    ChangesPulled {
+        subthread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        repos: Vec<RepoPullResult>,
+    },
+    /// A review verdict was recorded. Sent to the requester and the
+    /// subscribers of both threads; the parent also gets a persisted system
+    /// message (replayed on subscribe).
+    ReviewVerdictPosted {
+        review_thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        verdict: ReviewVerdict,
+    },
+    /// A land subthread reported its result (broadcast to the subscribers of
+    /// both threads; the parent also gets a persisted system message).
+    LandResult {
+        land_thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        outcome: LandOutcome,
+        summary: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +335,18 @@ pub struct ThreadSnapshot {
     pub id: ThreadId,
     pub title: String,
     pub repo_count: u32,
+    /// Set for subthreads; the UI nests them under this thread.
+    #[serde(default)]
+    pub parent_thread_id: Option<ThreadId>,
+    #[serde(default = "top_kind")]
+    pub kind: ThreadKind,
+    /// Latest verdict of a review subthread.
+    #[serde(default)]
+    pub review_verdict: Option<ReviewVerdict>,
+}
+
+fn top_kind() -> ThreadKind {
+    ThreadKind::Top
 }
 
 /// One workspace membership. `title` is the membership alias when set.
@@ -282,6 +418,9 @@ mod tests {
             id: thread_id(),
             title: "Fix auth".into(),
             repo_count: 1,
+            parent_thread_id: None,
+            kind: ThreadKind::Top,
+            review_verdict: None,
         }
     }
 
@@ -523,7 +662,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&DaemonMessage::ThreadMigrated(snapshot_th())).unwrap(),
             format!(
-                r#"{{"type":"thread_migrated","payload":{{"id":"{thread}","title":"Fix auth","repo_count":1}}}}"#
+                r#"{{"type":"thread_migrated","payload":{{"id":"{thread}","title":"Fix auth","repo_count":1,"parent_thread_id":null,"kind":"top","review_verdict":null}}}}"#
             )
         );
         roundtrip_eq(&repo);
@@ -561,8 +700,136 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_four() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn protocol_version_is_five() {
+        assert_eq!(PROTOCOL_VERSION, 5);
+    }
+
+    #[test]
+    fn subthread_contract_shapes() {
+        let parent = thread_id();
+        let sub = ThreadId::from("01hsub000000000000000000001");
+        let client = [
+            ClientMessage::CreateSubthread {
+                parent_thread_id: parent.clone(),
+                kind: SubthreadKind::Review,
+                title: Some("Review".into()),
+                initial_prompt: None,
+            },
+            ClientMessage::ListSubthreads {
+                parent_thread_id: parent.clone(),
+            },
+            ClientMessage::GetChanges {
+                thread_id: sub.clone(),
+                base: ChangeBase::LastTurn,
+            },
+            ClientMessage::PullChanges {
+                subthread_id: sub.clone(),
+            },
+            ClientMessage::SubmitReviewVerdict {
+                review_thread_id: sub.clone(),
+                verdict: ReviewVerdict::RequestChanges {
+                    summary: "add tests".into(),
+                },
+            },
+        ];
+        for msg in &client {
+            roundtrip_eq(msg);
+            roundtrip_json(msg);
+        }
+        assert_eq!(
+            serde_json::to_value(&client[0]).unwrap(),
+            serde_json::json!({"type":"create_subthread","payload":{
+                "parent_thread_id": parent.to_string(), "kind":"review",
+                "title":"Review", "initial_prompt": null}})
+        );
+        // Optional fields and the default base may be omitted.
+        let minimal: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type":"get_changes","payload":{"thread_id": sub.to_string()}}))
+        .unwrap();
+        assert_eq!(
+            minimal,
+            ClientMessage::GetChanges {
+                thread_id: sub.clone(),
+                base: ChangeBase::ThreadBase
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&client[4]).unwrap()["payload"]["verdict"],
+            serde_json::json!({"verdict":"request_changes","summary":"add tests"})
+        );
+
+        let child = ThreadSnapshot {
+            id: sub.clone(),
+            title: "Review".into(),
+            repo_count: 1,
+            parent_thread_id: Some(parent.clone()),
+            kind: ThreadKind::Review,
+            review_verdict: Some(ReviewVerdict::Approve),
+        };
+        let daemon = [
+            DaemonMessage::SubthreadCreated(child.clone()),
+            DaemonMessage::Subthreads {
+                parent_thread_id: parent.clone(),
+                threads: vec![child.clone()],
+            },
+            DaemonMessage::Changes {
+                thread_id: sub.clone(),
+                base: ChangeBase::ThreadBase,
+                repos: vec![RepoChanges {
+                    repository_id: RepositoryId::from("repo"),
+                    title: "app".into(),
+                    base_revision: "abc".into(),
+                    diff: "diff --git a/x b/x\n".into(),
+                    truncated: false,
+                    files: vec![FileChange {
+                        path: "x".into(),
+                        old_path: None,
+                        status: FileChangeStatus::Modified,
+                        additions: Some(1),
+                        deletions: Some(0),
+                    }],
+                }],
+            },
+            DaemonMessage::ChangesPulled {
+                subthread_id: sub.clone(),
+                parent_thread_id: parent.clone(),
+                repos: vec![RepoPullResult {
+                    repository_id: RepositoryId::from("repo"),
+                    files: vec![PullFileResult {
+                        path: "x".into(),
+                        change: FileChangeStatus::Modified,
+                        outcome: PullFileOutcome::Conflict {
+                            markers_written: true,
+                            reason: "both".into(),
+                        },
+                    }],
+                }],
+            },
+            DaemonMessage::ReviewVerdictPosted {
+                review_thread_id: sub.clone(),
+                parent_thread_id: parent.clone(),
+                verdict: ReviewVerdict::Approve,
+            },
+            DaemonMessage::LandResult {
+                land_thread_id: sub,
+                parent_thread_id: parent,
+                outcome: LandOutcome::Landed,
+                summary: "merged".into(),
+            },
+        ];
+        for msg in &daemon {
+            roundtrip_json(msg);
+        }
+        let json = serde_json::to_value(&daemon[0]).unwrap();
+        assert_eq!(json["type"], "subthread_created");
+        assert_eq!(json["payload"]["kind"], "review");
+        assert_eq!(json["payload"]["review_verdict"]["verdict"], "approve");
+        // Snapshots from older peers without the new fields decode as top-level.
+        let legacy: ThreadSnapshot = serde_json::from_value(serde_json::json!({
+            "id": "t", "title": "old", "repo_count": 1}))
+        .unwrap();
+        assert_eq!(legacy.kind, ThreadKind::Top);
+        assert!(legacy.parent_thread_id.is_none());
     }
 
     #[test]

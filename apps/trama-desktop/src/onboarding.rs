@@ -806,6 +806,9 @@ mod tests {
             id: tid(id),
             title: title.to_string(),
             repo_count: 0,
+            parent_thread_id: None,
+            kind: trama_protocol::ThreadKind::Top,
+            review_verdict: None,
         }
     }
 

@@ -13,6 +13,8 @@ Each new thread gets a separate managed clone for every default-enabled reposito
 
 Thread creation requires each source repo to be clean. Uncommitted or non-ignored untracked files cause an actionable error; ignored files are not copied, while committed files and history are included. Existing copies are never replaced or cleaned automatically. Older threads can be explicitly prepared in place without losing the transcript; their next Claude session is fresh. The **Copie di lavoro** panel distinguishes original repositories from thread copies and offers **Apri in Zed**, **Mostra nel Finder** and **Copia percorso** for ready copies. These are working checkouts, not yet restorable checkpoints.
 
+Subthreads (plain, review, land) are children of a top-level thread and cannot nest. A subthread gets its own repo-local copy of each parent checkout at its current state (uncommitted and untracked non-ignored files included, ignored files never) and forks the parent's Claude session (`--resume <id> --fork-session`); it then diverges. **Changes** diffs a thread against its base, `HEAD`, or the last turn's starting state; **Pull Changes** merges a subthread's edits since its fork point into the parent's working tree file by file and reports conflicts, without committing. A review subthread starts with a change guide and its verdict (approve / request changes) is posted to the parent. A land subthread follows the repository's land skill (`SKILL.md` with `metadata: { trama-action: land }` under `.claude/skills` or `.agents/skills`) or proposes one; Trama itself still never pushes or merges.
+
 ## Crate map
 
 ```
@@ -48,11 +50,11 @@ cargo build --workspace --all-targets
 Starting the binaries directly does not acquire Cargo's build lock. Do not
 start parallel `cargo run`/check/test commands while building. The desktop also
 offers **Start daemon** when the sibling binary is installed and no daemon is
-listening. Stop old app/daemon processes before restarting with protocol v4.
+listening. Stop old app/daemon processes before restarting with protocol v5.
 Build profiles and editor-check settings are described in
 [build and disk usage](docs/build-and-space.md).
 
-The UI and daemon speak newline-delimited JSON (`crates/trama-protocol`). First message on a connection must be `Hello` with `protocol_version = 4`. A mismatch is rejected at the handshake; it does not rewrite stored threads or workspace ids. See [onboarding and legacy migration](docs/onboarding-and-migration.md).
+The UI and daemon speak newline-delimited JSON (`crates/trama-protocol`). First message on a connection must be `Hello` with `protocol_version = 5`. A mismatch is rejected at the handshake; it does not rewrite stored threads or workspace ids. See [onboarding and legacy migration](docs/onboarding-and-migration.md).
 
 ## Roadmap
 
