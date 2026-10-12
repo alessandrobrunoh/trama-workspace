@@ -1400,7 +1400,7 @@ impl ChangesPanel {
     }
 }
 
-fn render_line(line: &DiffLine, picked: bool, p: &Palette) -> Div {
+pub(crate) fn render_line(line: &DiffLine, picked: bool, p: &Palette) -> Div {
     let (bg, sign, text_color) = match line.kind {
         LineKind::Added => (Some(p.diff_add_bg), "+", p.text),
         LineKind::Removed => (Some(p.diff_del_bg), "-", p.text),

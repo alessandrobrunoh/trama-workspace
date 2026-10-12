@@ -19,7 +19,7 @@ use trama_domain::ids::{ThreadId, WorkspaceId};
 use trama_protocol::{ClientMessage, DaemonMessage, LandOutcome, SubthreadKind, ThreadKind};
 
 use crate::changes::{ChangesEvent, ChangesPanel, DrawerTab, render_drawer};
-use crate::chat::ChatPanel;
+use crate::chat::{ChatEvent, ChatPanel};
 use crate::comments::CommentStore;
 use crate::copies::CopyPanel;
 use crate::keymap::{self, CONTEXT, fuzzy_rank};
@@ -119,8 +119,26 @@ impl Workspace {
                         .update(cx, |chat, cx| chat.reveal_message(message_id, cx));
                 }
             }),
+            cx.subscribe(&chat, |this, _, event: &ChatEvent, cx| match event {
+                ChatEvent::OpenThread(thread) => {
+                    let thread = thread.clone();
+                    this.sidebar
+                        .update(cx, |sidebar, cx| sidebar.select_thread(thread, cx));
+                }
+            }),
             cx.observe(&subthread_bar, |_, _, cx| cx.notify()),
-            cx.observe(&sidebar, |_, _, cx| cx.notify()),
+            cx.observe(&sidebar, |this, sidebar, cx| {
+                let threads: Vec<_> = sidebar
+                    .read(cx)
+                    .onboarding
+                    .threads
+                    .iter()
+                    .map(|thread| (thread.id.clone(), thread.title.clone()))
+                    .collect();
+                this.chat
+                    .update(cx, |chat, cx| chat.set_known_threads(threads, cx));
+                cx.notify();
+            }),
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
                 this.on_sidebar_event(event, window, cx);
             }),

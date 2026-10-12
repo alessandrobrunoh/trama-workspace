@@ -28,6 +28,7 @@ use crate::composer::{BillingBadge, Composer, ComposerFooter};
 use crate::net::{DaemonClient, SendStatus};
 use crate::sidebar::ThreadStatus;
 use crate::theme::{self, Palette};
+use crate::tools::{self, Item, ToolKind, ToolTiming, ToolViewState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -108,6 +109,17 @@ pub enum ChatEntry {
         expanded: bool,
         output: Option<serde_json::Value>,
     },
+    /// Extended thinking, streamed or stored.
+    Thinking {
+        text: String,
+    },
+}
+
+/// Requests the chat panel makes of the workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatEvent {
+    /// Select this thread (a subagent link was clicked).
+    OpenThread(ThreadId),
 }
 
 /// One contiguous slice of a persisted message, rendered selectable. A
@@ -200,6 +212,13 @@ pub struct ChatPanel {
     pub completed_turns: u64,
     last_failed: bool,
     scroll: ScrollHandle,
+    tool_views: ToolViewState,
+    /// Threads the sidebar lists, for subagent links.
+    known_threads: Vec<(ThreadId, String)>,
+    /// Tool calls and thinking of turns seen this session, by thread and
+    /// prompt. The daemon stores only prompts and final answers, so these
+    /// are put back when a thread replays.
+    turn_details: HashMap<ThreadId, TurnDetails>,
     _enter: Subscription,
     _event_task: Option<Task<()>>,
 }
@@ -252,6 +271,9 @@ impl ChatPanel {
             completed_turns: 0,
             last_failed: false,
             scroll: ScrollHandle::new(),
+            tool_views: ToolViewState::default(),
+            known_threads: Vec::new(),
+            turn_details: HashMap::new(),
             _enter: enter,
             _event_task: None,
         }
@@ -351,6 +373,7 @@ impl ChatPanel {
         self.connected = connected;
         if connected && !was_connected && !self.is_running() {
             // Re-subscribe replay will refill; drop anything streamed while offline.
+            self.stash_turn_details();
             self.clear_transcript();
         }
         if !connected && was_connected {
@@ -367,6 +390,7 @@ impl ChatPanel {
         if self.selected_thread == thread {
             return;
         }
+        self.stash_turn_details();
         if let Some(current_thread) = &self.selected_thread {
             let mut draft = self.composer.value(cx);
             if let Some(prompt) = self.pending_prompt.take()
@@ -412,6 +436,7 @@ impl ChatPanel {
         self.session_info = None;
         self.last_failed = false;
         self._event_task = None;
+        self.tool_views.clear();
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -592,9 +617,30 @@ impl ChatPanel {
     }
 
     fn append_stored_message(&mut self, message: Message) {
+        let at = message.created_at.timestamp_millis();
+        for block in &message.content {
+            match block {
+                ContentBlock::ToolUse { id, .. } => {
+                    self.tool_views
+                        .timings
+                        .entry(id.clone())
+                        .or_insert(ToolTiming {
+                            started_ms: at,
+                            finished_ms: None,
+                        });
+                }
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    if let Some(timing) = self.tool_views.timings.get_mut(tool_use_id) {
+                        timing.finished_ms.get_or_insert(at);
+                    }
+                }
+                _ => {}
+            }
+        }
         match message.role {
             Role::User => {
                 append_stored_user(&mut self.entries, &mut self.pending_prompt, &message);
+                self.restore_turn_details(&message.id);
             }
             Role::Assistant => {
                 append_stored_assistant(&mut self.entries, self.lifecycle, &message);
@@ -662,7 +708,7 @@ impl ChatPanel {
                 } => {
                     self.finish_tool(tool_use_id, *is_error, Some(content.clone()));
                 }
-                ContentBlock::Thinking { .. } => {}
+                ContentBlock::Thinking { text } => push_thinking(&mut self.entries, text),
             }
         }
     }
@@ -768,6 +814,13 @@ impl ChatPanel {
                 if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
                     *streaming = false;
                 }
+                self.tool_views.timings.insert(
+                    tool_use_id.clone(),
+                    ToolTiming {
+                        started_ms: tools::now_ms(),
+                        finished_ms: None,
+                    },
+                );
                 self.entries.push(ChatEntry::ToolCall {
                     tool_use_id,
                     name,
@@ -783,8 +836,12 @@ impl ChatPanel {
                 output_json,
                 is_error,
             } => {
+                if let Some(timing) = self.tool_views.timings.get_mut(&tool_use_id) {
+                    timing.finished_ms.get_or_insert(tools::now_ms());
+                }
                 self.finish_tool(&tool_use_id, is_error, Some(output_json));
             }
+            AgentEvent::ReasoningDelta { text } => push_thinking(&mut self.entries, &text),
             AgentEvent::UsageReported { report } => {
                 self.model = Some(report.model.clone());
                 self.usage = Some(report);
@@ -810,8 +867,7 @@ impl ChatPanel {
                 self.last_failed = true;
                 self.finish_turn();
             }
-            AgentEvent::ReasoningDelta { .. }
-            | AgentEvent::ApprovalRequested { .. }
+            AgentEvent::ApprovalRequested { .. }
             | AgentEvent::SessionInfo { .. }
             | AgentEvent::ApprovalResolved { .. }
             | AgentEvent::SubagentStarted { .. }
@@ -861,6 +917,155 @@ impl ChatPanel {
         if let Some(ChatEntry::ToolCall { expanded, .. }) = self.entries.get_mut(index) {
             *expanded = !*expanded;
             cx.notify();
+        }
+    }
+
+    /// Remember the selected thread's tool calls and thinking per prompt.
+    fn stash_turn_details(&mut self) {
+        let Some(thread) = self.selected_thread.clone() else {
+            return;
+        };
+        let stash = self.turn_details.entry(thread).or_default();
+        for (prompt, entries) in turn_details(&self.entries) {
+            stash.entries.insert(prompt, entries);
+        }
+        stash.timings.extend(
+            self.tool_views
+                .timings
+                .iter()
+                .map(|(id, timing)| (id.clone(), *timing)),
+        );
+    }
+
+    /// Put a replayed prompt's stashed tool calls back under it.
+    fn restore_turn_details(&mut self, prompt: &MessageId) {
+        let Some(stash) = self
+            .selected_thread
+            .as_ref()
+            .and_then(|thread| self.turn_details.get(thread))
+        else {
+            return;
+        };
+        let Some(entries) = stash.entries.get(prompt) else {
+            return;
+        };
+        for entry in entries {
+            if let ChatEntry::ToolCall { tool_use_id, .. } = entry
+                && let Some(timing) = stash.timings.get(tool_use_id)
+            {
+                self.tool_views
+                    .timings
+                    .entry(tool_use_id.clone())
+                    .or_insert(*timing);
+            }
+            if let Some(entry) = detail_copy(entry) {
+                self.entries.push(entry);
+            }
+        }
+    }
+
+    pub fn toggle_group(&mut self, start: usize, cx: &mut Context<Self>) {
+        if !self.tool_views.open_groups.remove(&start) {
+            self.tool_views.open_groups.insert(start);
+        }
+        cx.notify();
+    }
+
+    /// Flip an edit row; `open` is what it showed (possibly by default).
+    pub fn toggle_edit(&mut self, tool_use_id: &str, open: bool, cx: &mut Context<Self>) {
+        self.tool_views
+            .edit_open
+            .insert(tool_use_id.to_string(), !open);
+        cx.notify();
+    }
+
+    pub fn toggle_output(&mut self, tool_use_id: &str, cx: &mut Context<Self>) {
+        if !self.tool_views.full_output.remove(tool_use_id) {
+            self.tool_views.full_output.insert(tool_use_id.to_string());
+        }
+        cx.notify();
+    }
+
+    pub fn open_thread(&mut self, thread: ThreadId, cx: &mut Context<Self>) {
+        cx.emit(ChatEvent::OpenThread(thread));
+    }
+
+    /// Threads the sidebar lists (id, title), for subagent links.
+    pub fn set_known_threads(&mut self, threads: Vec<(ThreadId, String)>, cx: &mut Context<Self>) {
+        if self.known_threads != threads {
+            self.known_threads = threads;
+            cx.notify();
+        }
+    }
+}
+
+/// One thread's stashed turn details.
+#[derive(Default)]
+struct TurnDetails {
+    entries: HashMap<MessageId, Vec<ChatEntry>>,
+    timings: HashMap<String, ToolTiming>,
+}
+
+/// A finished copy of a tool call or thought; other entries are not kept.
+fn detail_copy(entry: &ChatEntry) -> Option<ChatEntry> {
+    match entry {
+        ChatEntry::ToolCall {
+            tool_use_id,
+            name,
+            input_json,
+            finished,
+            is_error,
+            output,
+            ..
+        } => Some(ChatEntry::ToolCall {
+            tool_use_id: tool_use_id.clone(),
+            name: name.clone(),
+            input_json: input_json.clone(),
+            // A call cut off by the switch will not report back.
+            finished: true,
+            is_error: *is_error || (!*finished && output.is_none()),
+            expanded: false,
+            output: output.clone(),
+        }),
+        ChatEntry::Thinking { text } => Some(ChatEntry::Thinking { text: text.clone() }),
+        _ => None,
+    }
+}
+
+/// Tool calls and thinking after each stored prompt, by the prompt's id.
+fn turn_details(entries: &[ChatEntry]) -> Vec<(MessageId, Vec<ChatEntry>)> {
+    let mut out: Vec<(MessageId, Vec<ChatEntry>)> = Vec::new();
+    let mut prompt: Option<MessageId> = None;
+    for entry in entries {
+        if let ChatEntry::User { message_id, .. } = entry {
+            prompt = message_id.clone();
+            continue;
+        }
+        let (Some(id), Some(copy)) = (&prompt, detail_copy(entry)) else {
+            continue;
+        };
+        match out.last_mut() {
+            Some((last, list)) if last == id => list.push(copy),
+            _ => out.push((id.clone(), vec![copy])),
+        }
+    }
+    out
+}
+
+/// Append streamed or stored thinking, merging with thinking right before.
+fn push_thinking(entries: &mut Vec<ChatEntry>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    match entries.last_mut() {
+        Some(ChatEntry::Thinking { text: existing }) => existing.push_str(text),
+        last => {
+            if let Some(ChatEntry::Assistant { streaming, .. }) = last {
+                *streaming = false;
+            }
+            entries.push(ChatEntry::Thinking {
+                text: text.to_string(),
+            });
         }
     }
 }
@@ -1777,8 +1982,27 @@ impl Render for ChatPanel {
             }));
         }
 
+        let items = tools::layout_items(&entries);
         let mut previous_was_agent = false;
-        for (ix, entry) in entries.iter().enumerate() {
+        for item in &items {
+            let ix = match item {
+                Item::Single(ix) => *ix,
+                Item::Group(range) => {
+                    let open = self.tool_views.open_groups.contains(&range.start);
+                    let content = tools::render_group(range.clone(), &entries, open, &p, cx);
+                    rows.push(row(agent_block(&p, !previous_was_agent, content)));
+                    previous_was_agent = true;
+                    continue;
+                }
+                Item::Edits(range) => {
+                    let content =
+                        tools::render_edits(range.clone(), &entries, &self.tool_views, &p, cx);
+                    rows.push(row(agent_block(&p, !previous_was_agent, content)));
+                    previous_was_agent = true;
+                    continue;
+                }
+            };
+            let entry = &entries[ix];
             match entry {
                 ChatEntry::User { text, message_id } => {
                     let mut block = v_flex().w_full().gap(theme::sp(1.5));
@@ -1825,12 +2049,8 @@ impl Render for ChatPanel {
                     previous_was_agent = false;
                 }
                 ChatEntry::Approval(card) => {
-                    let mut block = v_flex().w_full().gap(theme::sp(3.));
-                    if !previous_was_agent {
-                        block = block.child(author_row(&p, Author::Agent));
-                    }
-                    block = block.child(render_approval(card, &p, cx).into_any_element());
-                    rows.push(row(block.into_any_element()));
+                    let content = render_approval(card, &p, cx);
+                    rows.push(row(agent_block(&p, !previous_was_agent, content)));
                     previous_was_agent = true;
                 }
                 ChatEntry::Assistant {
@@ -1838,24 +2058,42 @@ impl Render for ChatPanel {
                     streaming: false,
                     message_id: Some(id),
                 } if uses_daemon && self.stored_len.get(id) == Some(&markdown.len()) => {
-                    let mut block = v_flex().w_full().gap(theme::sp(3.));
-                    if !previous_was_agent {
-                        block = block.child(author_row(&p, Author::Agent));
-                    }
                     let (content, threads) = self
                         .message_body(id, markdown, 0, &groups, &mut hits, &handlers, now, &p, cx);
-                    block = block.child(self.message_row(id, content, &threads, &groups, &p, cx));
+                    let content = self.message_row(id, content, &threads, &groups, &p, cx);
                     row_of.insert(id.clone(), rows.len());
-                    rows.push(row(block.into_any_element()));
+                    rows.push(row(agent_block(&p, !previous_was_agent, content)));
                     previous_was_agent = true;
                 }
-                ChatEntry::Assistant { .. } | ChatEntry::ToolCall { .. } => {
-                    let mut block = v_flex().w_full().gap(theme::sp(3.));
-                    if !previous_was_agent {
-                        block = block.child(author_row(&p, Author::Agent));
-                    }
-                    block = block.child(render_entry(ix, entry, &p, cx).into_any_element());
-                    rows.push(row(block.into_any_element()));
+                ChatEntry::ToolCall {
+                    name,
+                    input_json,
+                    output,
+                    ..
+                } => {
+                    let content = match tools::tool_kind(name) {
+                        ToolKind::Command => {
+                            tools::render_command(ix, entry, &self.tool_views, &p, cx)
+                        }
+                        ToolKind::Subthread => {
+                            let link = tools::subthread_link(
+                                name,
+                                input_json,
+                                output.as_ref(),
+                                &self.known_threads,
+                            );
+                            tools::render_subthread(ix, entry, link, &p, cx)
+                        }
+                        ToolKind::Edit | ToolKind::Minor(_) => {
+                            render_entry(ix, entry, &p, cx).into_any_element()
+                        }
+                    };
+                    rows.push(row(agent_block(&p, !previous_was_agent, content)));
+                    previous_was_agent = true;
+                }
+                ChatEntry::Assistant { .. } | ChatEntry::Thinking { .. } => {
+                    let content = render_entry(ix, entry, &p, cx).into_any_element();
+                    rows.push(row(agent_block(&p, !previous_was_agent, content)));
                     previous_was_agent = true;
                 }
             }
@@ -2104,6 +2342,16 @@ fn author_row(p: &Palette, author: Author) -> impl IntoElement {
         )
 }
 
+/// An agent row: the author line unless the previous row was the agent's.
+fn agent_block(p: &Palette, show_author: bool, content: AnyElement) -> AnyElement {
+    v_flex()
+        .w_full()
+        .gap(theme::sp(3.))
+        .when(show_author, |this| this.child(author_row(p, Author::Agent)))
+        .child(content)
+        .into_any_element()
+}
+
 fn notice(p: &Palette, icon: IconName, color: Hsla, text: String) -> impl IntoElement {
     h_flex()
         .w_full()
@@ -2286,141 +2534,160 @@ fn render_entry(
                 TextView::markdown(("assistant-md", ix), markdown.clone()).stream_fade(*streaming),
             )
             .into_any_element(),
-        ChatEntry::ToolCall {
-            name,
-            input_json,
-            finished,
-            is_error,
-            expanded,
-            output,
-            ..
-        } => {
-            let summary = tool_summary(name, input_json);
-            let status: AnyElement = if *is_error {
-                Icon::new(IconName::CircleX)
-                    .with_size(px(13.))
-                    .text_color(p.danger)
-                    .into_any_element()
-            } else if *finished {
-                Icon::new(IconName::Check)
-                    .with_size(px(13.))
-                    .text_color(p.success)
-                    .into_any_element()
-            } else {
-                Spinner::new().xsmall().color(p.accent).into_any_element()
-            };
-
-            let body = expanded.then(|| {
-                let block = |label: &'static str, text: String| {
-                    v_flex()
-                        .gap(theme::sp(1.))
-                        .child(
-                            div()
-                                .text_size(theme::text_xs())
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(p.text_faint)
-                                .child(label),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .px(theme::sp(2.5))
-                                .py(theme::sp(2.))
-                                .rounded(theme::radius())
-                                .bg(p.bg)
-                                .border_1()
-                                .border_color(p.border)
-                                .font_family(theme::MONO_FONT)
-                                .text_size(theme::text_xs())
-                                .line_height(relative(1.5))
-                                .text_color(p.text_muted)
-                                .child(text),
-                        )
-                };
-                v_flex()
-                    .w_full()
-                    .px(theme::sp(2.))
-                    .pb(theme::sp(2.))
-                    .gap(theme::sp(2.))
-                    .child(block("Input", pretty_json(input_json)))
-                    .children(output.as_ref().map(|output| {
-                        block(
-                            if *is_error { "Error" } else { "Output" },
-                            pretty_json(output),
-                        )
-                    }))
-            });
-
-            div()
-                .w_full()
-                .pl(theme::sp(7.))
-                .child(
-                    v_flex()
-                        .w_full()
-                        .rounded(theme::radius())
-                        .border_1()
-                        .border_color(if *expanded {
-                            p.border
-                        } else {
-                            p.bg.opacity(0.)
-                        })
-                        .when(*expanded, |this| this.bg(p.elevated))
-                        .child(
-                            h_flex()
-                                .id(("tool-row", ix))
-                                .w_full()
-                                .h(px(26.))
-                                .px(theme::sp(2.))
-                                .gap(theme::sp(2.))
-                                .items_center()
-                                .rounded(theme::radius())
-                                .cursor_pointer()
-                                .text_size(theme::text_sm())
-                                .hover(|style| style.bg(p.hover))
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.toggle_tool(ix, cx)),
-                                )
-                                .child(
-                                    Icon::new(tool_icon(name))
-                                        .with_size(px(13.))
-                                        .text_color(p.text_muted),
-                                )
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(p.text)
-                                        .child(name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .font_family(theme::MONO_FONT)
-                                        .text_size(theme::text_xs())
-                                        .text_color(p.text_faint)
-                                        .child(summary),
-                                )
-                                .child(status)
-                                .child(
-                                    Icon::new(if *expanded {
-                                        IconName::ChevronDown
-                                    } else {
-                                        IconName::ChevronRight
-                                    })
-                                    .with_size(px(12.))
-                                    .text_color(p.text_faint),
-                                ),
-                        )
-                        .children(body),
-                )
-                .into_any_element()
-        }
+        ChatEntry::ToolCall { .. } => div()
+            .w_full()
+            .pl(theme::sp(7.))
+            .child(tool_row(ix, entry, p, cx))
+            .into_any_element(),
+        ChatEntry::Thinking { text } => div()
+            .w_full()
+            .pl(theme::sp(7.))
+            .text_size(theme::text_sm())
+            .line_height(relative(1.5))
+            .italic()
+            .text_color(p.text_faint)
+            .child(text.trim().to_string())
+            .into_any_element(),
     }
 }
 
+/// A compact, expandable row for one tool call (input and output JSON).
+pub fn tool_row(
+    ix: usize,
+    entry: &ChatEntry,
+    p: &Palette,
+    cx: &mut Context<ChatPanel>,
+) -> AnyElement {
+    let ChatEntry::ToolCall {
+        name,
+        input_json,
+        finished,
+        is_error,
+        expanded,
+        output,
+        ..
+    } = entry
+    else {
+        return div().into_any_element();
+    };
+    let summary = tool_summary(name, input_json);
+    let status: AnyElement = if *is_error {
+        Icon::new(IconName::CircleX)
+            .with_size(px(13.))
+            .text_color(p.danger)
+            .into_any_element()
+    } else if *finished {
+        Icon::new(IconName::Check)
+            .with_size(px(13.))
+            .text_color(p.success)
+            .into_any_element()
+    } else {
+        Spinner::new().xsmall().color(p.accent).into_any_element()
+    };
+
+    let body = expanded.then(|| {
+        let block = |label: &'static str, text: String| {
+            v_flex()
+                .gap(theme::sp(1.))
+                .child(
+                    div()
+                        .text_size(theme::text_xs())
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.text_faint)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .px(theme::sp(2.5))
+                        .py(theme::sp(2.))
+                        .rounded(theme::radius())
+                        .bg(p.bg)
+                        .border_1()
+                        .border_color(p.border)
+                        .font_family(theme::MONO_FONT)
+                        .text_size(theme::text_xs())
+                        .line_height(relative(1.5))
+                        .text_color(p.text_muted)
+                        .child(text),
+                )
+        };
+        v_flex()
+            .w_full()
+            .px(theme::sp(2.))
+            .pb(theme::sp(2.))
+            .gap(theme::sp(2.))
+            .child(block("Input", pretty_json(input_json)))
+            .children(output.as_ref().map(|output| {
+                block(
+                    if *is_error { "Error" } else { "Output" },
+                    pretty_json(output),
+                )
+            }))
+    });
+
+    v_flex()
+        .w_full()
+        .rounded(theme::radius())
+        .border_1()
+        .border_color(if *expanded {
+            p.border
+        } else {
+            p.bg.opacity(0.)
+        })
+        .when(*expanded, |this| this.bg(p.elevated))
+        .child(
+            h_flex()
+                .id(("tool-row", ix))
+                .w_full()
+                .h(px(26.))
+                .px(theme::sp(2.))
+                .gap(theme::sp(2.))
+                .items_center()
+                .rounded(theme::radius())
+                .cursor_pointer()
+                .text_size(theme::text_sm())
+                .hover(|style| style.bg(p.hover))
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_tool(ix, cx)))
+                .child(
+                    Icon::new(tool_icon(name))
+                        .with_size(px(13.))
+                        .text_color(p.text_muted),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.text)
+                        .child(name.clone()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(theme::MONO_FONT)
+                        .text_size(theme::text_xs())
+                        .text_color(p.text_faint)
+                        .child(summary),
+                )
+                .child(status)
+                .child(
+                    Icon::new(if *expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .with_size(px(12.))
+                    .text_color(p.text_faint),
+                ),
+        )
+        .children(body)
+        .into_any_element()
+}
+
 impl EventEmitter<PanelEvent> for ChatPanel {}
+impl EventEmitter<ChatEvent> for ChatPanel {}
 
 impl Focusable for ChatPanel {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -3249,6 +3516,61 @@ mod tests {
         let only = user(block);
         append_stored_user(&mut entries, &mut pending, &only);
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn turn_details_are_kept_per_stored_prompt() {
+        use super::turn_details;
+        let tool = |id: &str, finished: bool| ChatEntry::ToolCall {
+            tool_use_id: id.into(),
+            name: "Read".into(),
+            input_json: serde_json::json!({}),
+            finished,
+            is_error: false,
+            expanded: true,
+            output: None,
+        };
+        let entries = vec![
+            ChatEntry::User {
+                text: "first".into(),
+                message_id: Some(MessageId::from("m1")),
+            },
+            ChatEntry::Thinking { text: "hm".into() },
+            tool("t1", true),
+            ChatEntry::Assistant {
+                markdown: "done".into(),
+                streaming: false,
+                message_id: None,
+            },
+            ChatEntry::User {
+                text: "pending".into(),
+                message_id: None,
+            },
+            tool("t2", true),
+            ChatEntry::User {
+                text: "second".into(),
+                message_id: Some(MessageId::from("m2")),
+            },
+            tool("t3", false),
+        ];
+        let details = turn_details(&entries);
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0].0, MessageId::from("m1"));
+        assert_eq!(
+            details[0].1.len(),
+            2,
+            "thinking and the tool call, not the text"
+        );
+        assert_eq!(details[1].0, MessageId::from("m2"));
+        assert!(matches!(
+            details[1].1.as_slice(),
+            [ChatEntry::ToolCall {
+                finished: true,
+                is_error: true,
+                expanded: false,
+                ..
+            }]
+        ));
     }
 
     #[test]

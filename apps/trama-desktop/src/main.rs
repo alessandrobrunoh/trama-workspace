@@ -16,6 +16,7 @@ mod sidebar;
 mod startup;
 mod subthreads;
 mod theme;
+mod tools;
 mod workspace;
 
 use std::borrow::Cow;
@@ -29,9 +30,12 @@ use workspace::Workspace;
 gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
+        ArrowUpRight,
+        Brain,
         CircleCheckBig,
         Command,
         FileDiff,
+        FilePen,
         FolderGit2,
         GitBranch,
         GitMerge,
@@ -46,6 +50,7 @@ gpui_kit::assets::icon_assets!(
         PlaneLanding,
         ShieldAlert,
         ShieldCheck,
+        Sparkles,
         Split,
         SquarePen,
         UserCheck,

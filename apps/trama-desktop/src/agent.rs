@@ -17,7 +17,8 @@ pub trait ChatAgent {
 }
 
 /// Scripted agent that emits a realistic turn so the UI can exercise streaming
-/// markdown, tool-call chips, usage, and completion.
+/// markdown, thinking, folded tool calls, an edit diff, a command block,
+/// usage, and completion.
 pub struct FakeAgent;
 
 impl ChatAgent for FakeAgent {
@@ -30,7 +31,7 @@ impl ChatAgent for FakeAgent {
 
             emit(AgentEvent::SessionStarted {
                 external_session_id: Some("fake-session".into()),
-                model: Some("claude-sonnet-4-6".into()),
+                model: Some("claude-sonnet-5-5".into()),
             });
             thread::sleep(Duration::from_millis(80));
 
@@ -40,27 +41,75 @@ impl ChatAgent for FakeAgent {
                 thread::sleep(Duration::from_millis(28));
             }
 
-            emit(AgentEvent::ToolCallStarted {
-                tool_use_id: "toolu_edit_1".into(),
-                name: "Edit".into(),
-                input_json: serde_json::json!({
-                    "path": "backend/src/auth.rs",
-                    "old_string": "todo!",
-                    "new_string": "issue_token(user.id)"
-                }),
+            emit(AgentEvent::ReasoningDelta {
+                text: "The session path lives in auth.rs; check how tokens are issued first."
+                    .into(),
             });
-            thread::sleep(Duration::from_millis(220));
-
-            emit(AgentEvent::ToolCallFinished {
-                tool_use_id: "toolu_edit_1".into(),
-                output_json: serde_json::json!({
-                    "ok": true,
-                    "diff": "updated issue_token"
+            let tool = |id: &str,
+                        name: &str,
+                        input: serde_json::Value,
+                        output: serde_json::Value,
+                        is_error: bool,
+                        ms: u64| {
+                emit(AgentEvent::ToolCallStarted {
+                    tool_use_id: id.into(),
+                    name: name.into(),
+                    input_json: input,
+                });
+                thread::sleep(Duration::from_millis(ms));
+                emit(AgentEvent::ToolCallFinished {
+                    tool_use_id: id.into(),
+                    output_json: output,
+                    is_error,
+                });
+                thread::sleep(Duration::from_millis(40));
+            };
+            tool(
+                "toolu_grep_1",
+                "Grep",
+                serde_json::json!({"pattern": "fn login", "path": "backend/src"}),
+                serde_json::json!("backend/src/auth.rs:42:fn login(user: &User) -> Session {"),
+                false,
+                120,
+            );
+            tool(
+                "toolu_read_1",
+                "Read",
+                serde_json::json!({"file_path": "backend/src/auth.rs"}),
+                serde_json::json!(
+                    "    42→fn login(user: &User) -> Session {\n    43→    todo!()\n    44→}"
+                ),
+                false,
+                90,
+            );
+            tool(
+                "toolu_edit_1",
+                "Edit",
+                serde_json::json!({
+                    "file_path": "backend/src/auth.rs",
+                    "old_string": "fn login(user: &User) -> Session {\n    todo!()\n}",
+                    "new_string": "fn login(user: &User) -> Session {\n    let token = issue_token(user.id);\n    Session::new(token)\n}"
                 }),
-                is_error: false,
-            });
-            thread::sleep(Duration::from_millis(80));
-
+                serde_json::json!(
+                    "The file backend/src/auth.rs has been updated. Here's the result of running `cat -n` on a snippet of the edited file:\n    42→fn login(user: &User) -> Session {\n    43→    let token = issue_token(user.id);"
+                ),
+                false,
+                220,
+            );
+            tool(
+                "toolu_bash_1",
+                "Bash",
+                serde_json::json!({"command": "cargo test -p backend auth", "description": "Run the auth tests"}),
+                serde_json::json!(format!(
+                    "{}\n\u{1b}[32mtest result: ok.\u{1b}[0m 14 passed; 0 failed",
+                    (1..=14)
+                        .map(|n| format!("test auth::tests::case_{n} ... \u{1b}[32mok\u{1b}[0m"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )),
+                false,
+                640,
+            );
             for chunk in chunk_text(
                 "\n\nThe `Edit` landed. Next we can wire the frontend login form to this endpoint.\n",
                 32,
@@ -71,7 +120,7 @@ impl ChatAgent for FakeAgent {
 
             emit(AgentEvent::UsageReported {
                 report: UsageReport {
-                    model: "claude-sonnet-4-6".into(),
+                    model: "claude-sonnet-5-5".into(),
                     input_tokens: 1_240,
                     output_tokens: 386,
                     cache_read_tokens: 8_192,
