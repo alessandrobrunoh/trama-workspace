@@ -13,6 +13,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use trama_domain::agent::ApprovalDecision;
 use trama_domain::ids::{ThreadId, WorkspaceId};
 use trama_protocol::{ClientMessage, DaemonMessage};
 
@@ -178,6 +179,11 @@ impl Workspace {
             self.changes
                 .update(cx, |changes, cx| changes.begin_loading(thread_id, cx));
         }
+    }
+
+    fn answer_approval(&mut self, decision: ApprovalDecision, cx: &mut Context<Self>) {
+        self.chat
+            .update(cx, |chat, cx| chat.answer_oldest_approval(decision, cx));
     }
 
     fn on_sidebar_event(
@@ -1090,6 +1096,15 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &keymap::CloseOverlay, window, cx| {
                 this.close_overlay(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::AllowOnce, _, cx| {
+                this.answer_approval(ApprovalDecision::AllowOnce, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::AllowSession, _, cx| {
+                this.answer_approval(ApprovalDecision::AllowSession, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::DenyApproval, _, cx| {
+                this.answer_approval(ApprovalDecision::Deny, cx);
             }))
             // Text inputs (the composer) handle Escape first; close the
             // drawer on the way down so Esc works with the composer focused.

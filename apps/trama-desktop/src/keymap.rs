@@ -16,6 +16,9 @@ gpui_kit::actions!(
         ManageProjects,
         CloseOverlay,
         ToggleAppearance,
+        AllowOnce,
+        AllowSession,
+        DenyApproval,
     ]
 );
 
@@ -27,6 +30,9 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("cmd-/", ShowShortcuts, Some(CONTEXT)),
         KeyBinding::new("cmd-,", ManageProjects, Some(CONTEXT)),
         KeyBinding::new("escape", CloseOverlay, Some(CONTEXT)),
+        KeyBinding::new("cmd-y", AllowOnce, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-y", AllowSession, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-n", DenyApproval, Some(CONTEXT)),
     ]);
 }
 
@@ -52,6 +58,18 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut {
         keys: &["shift-enter"],
         label: "New line in the composer",
+    },
+    Shortcut {
+        keys: &["cmd-y"],
+        label: "Allow the pending tool request once",
+    },
+    Shortcut {
+        keys: &["cmd-shift-y"],
+        label: "Allow the tool for this session",
+    },
+    Shortcut {
+        keys: &["cmd-shift-n"],
+        label: "Deny the pending tool request",
     },
     Shortcut {
         keys: &["cmd-k"],

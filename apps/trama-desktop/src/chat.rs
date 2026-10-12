@@ -11,13 +11,13 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
-use trama_domain::agent::{AgentEvent, UsageReport};
+use trama_domain::agent::{AgentEvent, ApprovalDecision, BillingSource, UsageReport};
 use trama_domain::ids::{MessageId, ThreadId};
 use trama_domain::message::{ContentBlock, Message, Role};
 use trama_protocol::{ClientMessage, DaemonMessage};
 
 use crate::agent::{ChatAgent, FakeAgent};
-use crate::composer::{Composer, ComposerFooter};
+use crate::composer::{BillingBadge, Composer, ComposerFooter};
 use crate::net::{DaemonClient, SendStatus};
 use crate::sidebar::ThreadStatus;
 use crate::theme::{self, Palette};
@@ -36,8 +36,51 @@ enum TurnLifecycle {
     AwaitingAssistant,
 }
 
+/// Where an inline approval card stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalState {
+    /// Waiting for the user.
+    Pending,
+    /// Answer sent; waiting for the daemon's `ApprovalResolved`.
+    Sending(ApprovalDecision),
+    /// The daemon resolved it, by this answer or automatically (`reason`).
+    Resolved {
+        decision: ApprovalDecision,
+        reason: Option<String>,
+    },
+    /// The turn ended before a resolution arrived.
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalCard {
+    pub request_id: String,
+    pub tool_name: String,
+    pub input_json: serde_json::Value,
+    pub state: ApprovalState,
+}
+
+impl ApprovalCard {
+    pub fn is_open(&self) -> bool {
+        matches!(
+            self.state,
+            ApprovalState::Pending | ApprovalState::Sending(_)
+        )
+    }
+}
+
+/// What the agent reported about its session (`AgentEvent::SessionInfo`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub billing: BillingSource,
+    pub api_key_source: Option<String>,
+    pub agent_version: Option<String>,
+    pub permission_mode: Option<String>,
+}
+
 pub enum ChatEntry {
     User(String),
+    Approval(ApprovalCard),
     Assistant {
         markdown: String,
         streaming: bool,
@@ -73,9 +116,7 @@ pub struct ChatPanel {
     pub cost_usd_micros: Option<u64>,
     pub turns: Option<u32>,
     pub model: Option<String>,
-    /// Tool name of an approval the agent is waiting on. Approvals cannot be
-    /// answered from this build yet; the thread is flagged instead.
-    pending_approval: Option<String>,
+    pub session_info: Option<SessionInfo>,
     /// Bumped whenever a turn reaches a terminal event; observers use it to
     /// refresh views that depend on the checkout (the Changes drawer).
     pub completed_turns: u64,
@@ -111,7 +152,7 @@ impl ChatPanel {
             cost_usd_micros: None,
             turns: None,
             model: None,
-            pending_approval: None,
+            session_info: None,
             completed_turns: 0,
             last_failed: false,
             scroll: ScrollHandle::new(),
@@ -128,9 +169,55 @@ impl ChatPanel {
         self.composer.input.focus_handle(cx).focus(window, cx);
     }
 
+    /// Approvals still waiting for the user, oldest first.
+    pub fn open_approvals(&self) -> impl Iterator<Item = &ApprovalCard> {
+        self.entries.iter().filter_map(|entry| match entry {
+            ChatEntry::Approval(card) if card.state == ApprovalState::Pending => Some(card),
+            _ => None,
+        })
+    }
+
+    fn has_open_approval(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(entry, ChatEntry::Approval(card) if card.is_open()))
+    }
+
+    /// Answer the oldest pending approval (keyboard shortcuts).
+    pub fn answer_oldest_approval(&mut self, decision: ApprovalDecision, cx: &mut Context<Self>) {
+        let request_id = self
+            .open_approvals()
+            .next()
+            .map(|card| card.request_id.clone());
+        if let Some(request_id) = request_id {
+            self.answer_approval(&request_id, decision, cx);
+        }
+    }
+
+    pub fn answer_approval(
+        &mut self,
+        request_id: &str,
+        decision: ApprovalDecision,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread_id) = self.selected_thread.clone() else {
+            return;
+        };
+        let Some(message) = answer_approval(&mut self.entries, &thread_id, request_id, decision)
+        else {
+            return;
+        };
+        if self.client.send(message) == SendStatus::Rejected {
+            set_approval_state(&mut self.entries, request_id, ApprovalState::Pending);
+            self.connection_error =
+                Some("The daemon is not connected; the approval was not sent.".into());
+        }
+        cx.notify();
+    }
+
     /// Dot shown next to the selected thread in the sidebar.
     pub fn thread_status(&self) -> ThreadStatus {
-        if self.pending_approval.is_some() {
+        if self.has_open_approval() {
             ThreadStatus::NeedsAttention
         } else if self.is_running() {
             ThreadStatus::Running
@@ -143,7 +230,7 @@ impl ChatPanel {
 
     /// Short label and color for the composer status pill.
     fn status_pill(&self, p: &Palette) -> (&'static str, Hsla) {
-        if self.pending_approval.is_some() {
+        if self.has_open_approval() {
             return ("Waiting for approval", p.warning);
         }
         match self.lifecycle {
@@ -210,7 +297,7 @@ impl ChatPanel {
         self.cost_usd_micros = None;
         self.turns = None;
         self.model = None;
-        self.pending_approval = None;
+        self.session_info = None;
         self.last_failed = false;
         self._event_task = None;
     }
@@ -373,7 +460,6 @@ impl ChatPanel {
         }
         self.entries.push(ChatEntry::User(prompt));
         self.last_failed = false;
-        self.pending_approval = None;
         self.scroll.scroll_to_bottom();
         self.connection_error = None;
         self.lifecycle = TurnLifecycle::Running;
@@ -486,6 +572,49 @@ impl ChatPanel {
     }
 
     fn apply_event(&mut self, event: AgentEvent) {
+        // Session metadata and approvals are keyed, not turn-ordered: the
+        // daemon replays them on subscribe while this view is idle.
+        match event {
+            AgentEvent::SessionInfo {
+                billing,
+                api_key_source,
+                agent_version,
+                permission_mode,
+            } => {
+                self.session_info = Some(SessionInfo {
+                    billing,
+                    api_key_source,
+                    agent_version,
+                    permission_mode,
+                });
+                return;
+            }
+            AgentEvent::ApprovalRequested {
+                request_id,
+                tool_name,
+                input_json,
+            } => {
+                self.adopt_remote_turn();
+                push_approval(&mut self.entries, request_id, tool_name, input_json);
+                return;
+            }
+            AgentEvent::ApprovalResolved {
+                request_id,
+                decision,
+                reason,
+            } => {
+                set_approval_state(
+                    &mut self.entries,
+                    &request_id,
+                    ApprovalState::Resolved { decision, reason },
+                );
+                return;
+            }
+            _ => {}
+        }
+        if starts_remote_turn(self.lifecycle, &event) {
+            self.adopt_remote_turn();
+        }
         if !accepts_agent_events(self.lifecycle) {
             return;
         }
@@ -530,7 +659,6 @@ impl ChatPanel {
                 output_json,
                 is_error,
             } => {
-                self.pending_approval = None;
                 self.finish_tool(&tool_use_id, is_error, Some(output_json));
             }
             AgentEvent::UsageReported { report } => {
@@ -546,7 +674,6 @@ impl ChatPanel {
                 }
                 self.turns = Some(num_turns);
                 self.cost_usd_micros = cost_usd_micros;
-                self.pending_approval = None;
                 self.finish_turn();
             }
             AgentEvent::Failed { message } => {
@@ -557,15 +684,10 @@ impl ChatPanel {
                 });
                 self.final_assistant_persisted = true;
                 self.last_failed = true;
-                self.pending_approval = None;
                 self.finish_turn();
             }
-            // Integration hook: render an approval prompt here once the
-            // composer can answer with `ClientMessage::RespondApproval`.
-            AgentEvent::ApprovalRequested { tool_name, .. } => {
-                self.pending_approval = Some(tool_name);
-            }
             AgentEvent::ReasoningDelta { .. }
+            | AgentEvent::ApprovalRequested { .. }
             | AgentEvent::SessionInfo { .. }
             | AgentEvent::ApprovalResolved { .. }
             | AgentEvent::SubagentStarted { .. }
@@ -573,7 +695,19 @@ impl ChatPanel {
         }
     }
 
+    /// A turn this view did not start (a subthread's initial prompt, a
+    /// review or land run, another client) is streaming: follow it.
+    fn adopt_remote_turn(&mut self) {
+        if self.lifecycle == TurnLifecycle::Idle && self.uses_daemon() {
+            self.lifecycle = TurnLifecycle::Running;
+            self.final_assistant_persisted = false;
+            self.status = AgentStatus::Running;
+            self.last_failed = false;
+        }
+    }
+
     fn finish_turn(&mut self) {
+        expire_open_approvals(&mut self.entries);
         self.completed_turns += 1;
         self.lifecycle = terminal_transition(self.uses_daemon(), self.final_assistant_persisted);
         let waiting_for_assistant = self.lifecycle == TurnLifecycle::AwaitingAssistant;
@@ -644,16 +778,6 @@ impl Render for ChatPanel {
                 "Offline demo: replies are scripted and nothing is sent to an agent.".into(),
             ));
         }
-        if let Some(tool) = self.pending_approval.clone() {
-            column = column.child(notice(
-                &p,
-                IconName::CircleAlert,
-                p.warning,
-                format!(
-                    "The agent is waiting for approval to use {tool}. Answering approvals from the app is not available yet."
-                ),
-            ));
-        }
 
         if self.entries.is_empty() {
             column = column.child(if uses_daemon || !self.connected {
@@ -704,6 +828,13 @@ impl Render for ChatPanel {
                     );
                     previous_was_agent = false;
                 }
+                ChatEntry::Approval(card) => {
+                    if !previous_was_agent {
+                        column = column.child(author_row(&p, Author::Agent));
+                    }
+                    column = column.child(render_approval(card, &p, cx).into_any_element());
+                    previous_was_agent = true;
+                }
                 ChatEntry::Assistant { .. } | ChatEntry::ToolCall { .. } => {
                     if !previous_was_agent {
                         column = column.child(author_row(&p, Author::Agent));
@@ -718,7 +849,7 @@ impl Render for ChatPanel {
             let label = match self.lifecycle {
                 TurnLifecycle::Stopping => "Stopping…",
                 TurnLifecycle::AwaitingAssistant => "Finishing…",
-                _ if self.pending_approval.is_some() => "Waiting for approval…",
+                _ if self.has_open_approval() => "Waiting for approval…",
                 _ => "Working…",
             };
             if !previous_was_agent {
@@ -751,6 +882,7 @@ impl Render for ChatPanel {
             usage: self.usage.clone(),
             cost_usd_micros: self.cost_usd_micros,
             turns: self.turns,
+            billing: self.session_info.as_ref().map(billing_badge),
         };
 
         v_flex()
@@ -999,6 +1131,7 @@ fn render_entry(
 ) -> impl IntoElement {
     match entry {
         ChatEntry::User(text) => div().child(text.clone()).into_any_element(),
+        ChatEntry::Approval(card) => render_approval(card, p, cx).into_any_element(),
         ChatEntry::Assistant {
             markdown,
             streaming,
@@ -1309,6 +1442,296 @@ fn append_stored_assistant(
     }
 }
 
+/// Add an approval card unless the daemon is replaying one already shown.
+fn push_approval(
+    entries: &mut Vec<ChatEntry>,
+    request_id: String,
+    tool_name: String,
+    input_json: serde_json::Value,
+) {
+    let known = entries
+        .iter()
+        .any(|entry| matches!(entry, ChatEntry::Approval(card) if card.request_id == request_id));
+    if !known {
+        if let Some(ChatEntry::Assistant { streaming, .. }) = entries.last_mut() {
+            *streaming = false;
+        }
+        entries.push(ChatEntry::Approval(ApprovalCard {
+            request_id,
+            tool_name,
+            input_json,
+            state: ApprovalState::Pending,
+        }));
+    }
+}
+
+fn set_approval_state(entries: &mut [ChatEntry], request_id: &str, state: ApprovalState) -> bool {
+    for entry in entries.iter_mut().rev() {
+        if let ChatEntry::Approval(card) = entry
+            && card.request_id == request_id
+        {
+            card.state = state;
+            return true;
+        }
+    }
+    false
+}
+
+/// Move a pending card to `Sending` and build the reply. `None` when the
+/// card is unknown or already answered (double clicks, stale shortcuts).
+fn answer_approval(
+    entries: &mut [ChatEntry],
+    thread_id: &ThreadId,
+    request_id: &str,
+    decision: ApprovalDecision,
+) -> Option<ClientMessage> {
+    let card = entries.iter_mut().find_map(|entry| match entry {
+        ChatEntry::Approval(card) if card.request_id == request_id => Some(card),
+        _ => None,
+    })?;
+    if card.state != ApprovalState::Pending {
+        return None;
+    }
+    card.state = ApprovalState::Sending(decision);
+    Some(ClientMessage::RespondApproval {
+        thread_id: thread_id.clone(),
+        request_id: request_id.to_string(),
+        decision,
+    })
+}
+
+/// A finished turn cannot still be waiting for an approval.
+fn expire_open_approvals(entries: &mut [ChatEntry]) {
+    for entry in entries.iter_mut() {
+        if let ChatEntry::Approval(card) = entry
+            && card.is_open()
+        {
+            card.state = ApprovalState::Expired;
+        }
+    }
+}
+
+/// Events that only appear inside a running turn. Seen while idle, they mean
+/// a turn was started elsewhere (daemon-run subthread prompt, review, land).
+fn starts_remote_turn(lifecycle: TurnLifecycle, event: &AgentEvent) -> bool {
+    lifecycle == TurnLifecycle::Idle
+        && matches!(
+            event,
+            AgentEvent::SessionStarted { .. }
+                | AgentEvent::TextDelta { .. }
+                | AgentEvent::ToolCallStarted { .. }
+        )
+}
+
+fn billing_badge(info: &SessionInfo) -> BillingBadge {
+    BillingBadge {
+        billing: info.billing,
+        api_key_source: info.api_key_source.clone(),
+        agent_version: info.agent_version.clone(),
+        permission_mode: info.permission_mode.clone(),
+    }
+}
+
+fn decision_label(decision: ApprovalDecision) -> &'static str {
+    match decision {
+        ApprovalDecision::AllowOnce => "Allowed once",
+        ApprovalDecision::AllowSession => "Allowed for this session",
+        ApprovalDecision::Deny => "Denied",
+    }
+}
+
+/// Compact one-line JSON of a tool input, capped for the approval card.
+pub fn approval_preview(input: &serde_json::Value) -> String {
+    let text = match input {
+        serde_json::Value::Object(map) if map.is_empty() => String::new(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    const LIMIT: usize = 280;
+    if text.chars().count() > LIMIT {
+        let mut out: String = text.chars().take(LIMIT).collect();
+        out.push('…');
+        out
+    } else {
+        text
+    }
+}
+
+fn render_approval(card: &ApprovalCard, p: &Palette, cx: &mut Context<ChatPanel>) -> AnyElement {
+    use gpui_kit::component::Disableable as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+
+    let summary = tool_summary(&card.tool_name, &card.input_json);
+    let preview = approval_preview(&card.input_json);
+    let open = card.state == ApprovalState::Pending;
+    let header = h_flex()
+        .w_full()
+        .gap(theme::sp(2.))
+        .items_center()
+        .text_size(theme::text_sm())
+        .child(
+            Icon::new(if card.is_open() {
+                IconName::ShieldAlert
+            } else {
+                IconName::ShieldCheck
+            })
+            .with_size(px(14.))
+            .text_color(if card.is_open() {
+                p.warning
+            } else {
+                p.text_faint
+            }),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.text)
+                .child(if card.is_open() {
+                    format!("Allow {}?", card.tool_name)
+                } else {
+                    card.tool_name.clone()
+                }),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_family(theme::MONO_FONT)
+                .text_size(theme::text_xs())
+                .text_color(p.text_faint)
+                .child(summary),
+        );
+
+    let footer: AnyElement = match &card.state {
+        ApprovalState::Pending | ApprovalState::Sending(_) => {
+            let sending = match card.state {
+                ApprovalState::Sending(decision) => Some(decision),
+                _ => None,
+            };
+            let button = |id: &'static str, label: &'static str, keys: &'static str, decision| {
+                let request_id = card.request_id.clone();
+                let mut button =
+                    Button::new(SharedString::from(format!("{id}-{}", card.request_id)))
+                        .small()
+                        .label(label)
+                        .tooltip(keys)
+                        .loading(sending == Some(decision))
+                        .disabled(!open)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.answer_approval(&request_id, decision, cx);
+                        }));
+                button = match decision {
+                    ApprovalDecision::AllowOnce => button.primary(),
+                    ApprovalDecision::AllowSession => button.ghost(),
+                    ApprovalDecision::Deny => button.ghost(),
+                };
+                button
+            };
+            h_flex()
+                .gap(theme::sp(1.5))
+                .items_center()
+                .child(button(
+                    "approve-once",
+                    "Allow once",
+                    "\u{2318}Y",
+                    ApprovalDecision::AllowOnce,
+                ))
+                .child(button(
+                    "approve-session",
+                    "Allow for session",
+                    "\u{2318}\u{21e7}Y",
+                    ApprovalDecision::AllowSession,
+                ))
+                .child(button(
+                    "approve-deny",
+                    "Deny",
+                    "\u{2318}\u{21e7}N",
+                    ApprovalDecision::Deny,
+                ))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_size(theme::text_xs())
+                        .text_color(p.text_faint)
+                        .child(
+                            "\u{2318}Y allow · \u{2318}\u{21e7}Y session · \u{2318}\u{21e7}N deny",
+                        ),
+                )
+                .into_any_element()
+        }
+        ApprovalState::Resolved { decision, reason } => {
+            let color = match decision {
+                ApprovalDecision::Deny => p.danger,
+                _ => p.success,
+            };
+            h_flex()
+                .gap(theme::sp(1.5))
+                .items_center()
+                .text_size(theme::text_xs())
+                .child(div().size(px(6.)).rounded_full().bg(color))
+                .child(
+                    div()
+                        .text_color(p.text_muted)
+                        .child(decision_label(*decision)),
+                )
+                .when_some(reason.clone(), |this, reason| {
+                    this.child(div().text_color(p.text_faint).child(format!("· {reason}")))
+                })
+                .into_any_element()
+        }
+        ApprovalState::Expired => div()
+            .text_size(theme::text_xs())
+            .text_color(p.text_faint)
+            .child("No longer pending: the turn ended.")
+            .into_any_element(),
+    };
+
+    div()
+        .w_full()
+        .pl(theme::sp(7.))
+        .child(
+            v_flex()
+                .w_full()
+                .px(theme::sp(3.))
+                .py(theme::sp(2.5))
+                .gap(theme::sp(2.))
+                .rounded(theme::radius())
+                .border_1()
+                .border_color(if card.is_open() {
+                    p.warning.opacity(0.5)
+                } else {
+                    p.border
+                })
+                .bg(if card.is_open() {
+                    p.warning.opacity(0.06)
+                } else {
+                    p.elevated
+                })
+                .child(header)
+                .when(card.is_open() && !preview.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .w_full()
+                            .px(theme::sp(2.5))
+                            .py(theme::sp(1.5))
+                            .rounded(theme::radius_sm())
+                            .bg(p.bg)
+                            .border_1()
+                            .border_color(p.border)
+                            .font_family(theme::MONO_FONT)
+                            .text_size(theme::text_xs())
+                            .line_height(relative(1.5))
+                            .text_color(p.text_muted)
+                            .child(preview),
+                    )
+                })
+                .child(footer),
+        )
+        .into_any_element()
+}
+
 fn take_rejected_prompt(event: &AgentEvent, pending: &mut Option<String>) -> Option<String> {
     if matches!(event, AgentEvent::Failed { .. }) {
         pending.take()
@@ -1479,6 +1902,103 @@ mod tests {
             record_message_id(&mut HashSet::new(), MessageId::from("same-id")),
             true,
         );
+    }
+
+    #[test]
+    fn approval_cards_move_from_pending_to_sending_to_resolved() {
+        use super::{
+            ApprovalState, answer_approval, expire_open_approvals, push_approval,
+            set_approval_state,
+        };
+        use trama_domain::agent::ApprovalDecision;
+
+        let mut entries = vec![ChatEntry::User("go".into())];
+        let input = serde_json::json!({"command": "rm -rf target"});
+        push_approval(&mut entries, "req-1".into(), "Bash".into(), input.clone());
+        push_approval(&mut entries, "req-1".into(), "Bash".into(), input);
+        assert_eq!(entries.len(), 2, "replayed requests are not duplicated");
+
+        let thread_id = thread("t");
+        let reply = answer_approval(
+            &mut entries,
+            &thread_id,
+            "req-1",
+            ApprovalDecision::AllowOnce,
+        );
+        assert_eq!(
+            reply,
+            Some(ClientMessage::RespondApproval {
+                thread_id: thread_id.clone(),
+                request_id: "req-1".into(),
+                decision: ApprovalDecision::AllowOnce,
+            })
+        );
+        assert_eq!(
+            answer_approval(&mut entries, &thread_id, "req-1", ApprovalDecision::Deny),
+            None,
+            "a card in flight cannot be answered twice"
+        );
+        assert_eq!(
+            answer_approval(&mut entries, &thread_id, "unknown", ApprovalDecision::Deny),
+            None
+        );
+
+        assert!(set_approval_state(
+            &mut entries,
+            "req-1",
+            ApprovalState::Resolved {
+                decision: ApprovalDecision::AllowOnce,
+                reason: None,
+            },
+        ));
+        let ChatEntry::Approval(card) = &entries[1] else {
+            panic!("approval card expected");
+        };
+        assert!(!card.is_open());
+
+        push_approval(
+            &mut entries,
+            "req-2".into(),
+            "Edit".into(),
+            serde_json::json!({}),
+        );
+        expire_open_approvals(&mut entries);
+        let ChatEntry::Approval(card) = &entries[2] else {
+            panic!("approval card expected");
+        };
+        assert_eq!(card.state, ApprovalState::Expired);
+    }
+
+    #[test]
+    fn idle_view_follows_turns_started_elsewhere() {
+        use super::starts_remote_turn;
+        use trama_domain::agent::AgentEvent;
+
+        let text = AgentEvent::TextDelta { text: "hi".into() };
+        let done = AgentEvent::TurnCompleted {
+            num_turns: 1,
+            cost_usd_micros: None,
+        };
+        assert!(starts_remote_turn(TurnLifecycle::Idle, &text));
+        assert!(!starts_remote_turn(TurnLifecycle::Idle, &done));
+        assert!(!starts_remote_turn(TurnLifecycle::Running, &text));
+        assert!(
+            !starts_remote_turn(TurnLifecycle::AwaitingAssistant, &text),
+            "late events of a finished turn stay fenced"
+        );
+    }
+
+    #[test]
+    fn approval_preview_is_compact_and_capped() {
+        use super::approval_preview;
+        assert_eq!(approval_preview(&serde_json::json!({})), "");
+        assert_eq!(
+            approval_preview(&serde_json::json!({"command": "ls"})),
+            r#"{"command":"ls"}"#
+        );
+        let long = approval_preview(&serde_json::json!({"content": "x".repeat(1000)}));
+        assert_eq!(long.chars().count(), 281);
+        assert!(long.ends_with('…'));
     }
 
     #[test]

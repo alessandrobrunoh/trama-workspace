@@ -9,7 +9,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use trama_domain::agent::UsageReport;
+use trama_domain::agent::{BillingSource, UsageReport};
 
 use crate::theme;
 
@@ -32,6 +32,53 @@ pub struct ComposerFooter {
     pub usage: Option<UsageReport>,
     pub cost_usd_micros: Option<u64>,
     pub turns: Option<u32>,
+    /// From the agent's `SessionInfo`; `None` until a session reports it.
+    pub billing: Option<BillingBadge>,
+}
+
+/// Who pays for the session, plus runtime details for the tooltip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BillingBadge {
+    pub billing: BillingSource,
+    pub api_key_source: Option<String>,
+    pub agent_version: Option<String>,
+    pub permission_mode: Option<String>,
+}
+
+impl BillingBadge {
+    pub fn label(&self) -> &'static str {
+        match self.billing {
+            BillingSource::Subscription => "Claude subscription",
+            BillingSource::ApiKey => "API key",
+            BillingSource::Unknown => "Billing unknown",
+        }
+    }
+
+    /// API-key billing is opt-in and charges the Anthropic API account.
+    pub fn warns(&self) -> bool {
+        self.billing != BillingSource::Subscription
+    }
+
+    pub fn tooltip(&self) -> String {
+        let mut lines = vec![match self.billing {
+            BillingSource::Subscription => "Turns use your Claude subscription login.".to_string(),
+            BillingSource::ApiKey => format!(
+                "Turns are billed to the Anthropic API ({}), not your Claude subscription.",
+                self.api_key_source.as_deref().unwrap_or("API key")
+            ),
+            BillingSource::Unknown => format!(
+                "Claude reported an unrecognized credential source ({}). It may bill the API.",
+                self.api_key_source.as_deref().unwrap_or("unknown")
+            ),
+        }];
+        if let Some(version) = &self.agent_version {
+            lines.push(format!("Claude Code {version}"));
+        }
+        if let Some(mode) = &self.permission_mode {
+            lines.push(format!("Permission mode: {mode}"));
+        }
+        lines.join("\n")
+    }
 }
 
 impl Composer {
@@ -177,6 +224,42 @@ impl Composer {
                     })
                     .into_any_element(),
             ))
+            .when_some(footer.billing.clone(), |this, badge| {
+                let color = if badge.warns() {
+                    p.warning
+                } else {
+                    p.text_muted
+                };
+                let tooltip: SharedString = badge.tooltip().into();
+                this.child(
+                    h_flex()
+                        .id("composer-billing")
+                        .h(px(22.))
+                        .px(theme::sp(2.))
+                        .gap(theme::sp(1.5))
+                        .items_center()
+                        .rounded(theme::radius())
+                        .text_size(theme::text_xs())
+                        .text_color(color)
+                        .when(badge.warns(), |this| this.bg(p.warning.opacity(0.12)))
+                        .hover(|style| style.bg(p.hover))
+                        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                        .child(
+                            Icon::new(if badge.warns() {
+                                IconName::KeyRound
+                            } else {
+                                IconName::UserCheck
+                            })
+                            .with_size(px(12.)),
+                        )
+                        .child(badge.label())
+                        .when_some(badge.permission_mode.clone(), |this, mode| {
+                            this.when(mode != "default", |this| {
+                                this.child(div().text_color(p.text_faint).child(mode))
+                            })
+                        }),
+                )
+            })
             .child(div().flex_1())
             .child(
                 h_flex()
@@ -281,7 +364,31 @@ pub fn format_cost(micros: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_cost, format_tokens};
+    use super::{BillingBadge, BillingSource, format_cost, format_tokens};
+
+    #[test]
+    fn api_key_billing_warns_and_explains_itself() {
+        let mut badge = BillingBadge {
+            billing: BillingSource::Subscription,
+            api_key_source: Some("none".into()),
+            agent_version: Some("2.1.0".into()),
+            permission_mode: Some("default".into()),
+        };
+        assert!(!badge.warns());
+        assert_eq!(badge.label(), "Claude subscription");
+        assert!(badge.tooltip().contains("Claude Code 2.1.0"));
+        badge.billing = BillingSource::ApiKey;
+        badge.api_key_source = Some("ANTHROPIC_API_KEY".into());
+        assert!(badge.warns());
+        assert_eq!(badge.label(), "API key");
+        assert!(
+            badge
+                .tooltip()
+                .contains("billed to the Anthropic API (ANTHROPIC_API_KEY)")
+        );
+        badge.billing = BillingSource::Unknown;
+        assert!(badge.warns());
+    }
 
     #[test]
     fn formats_tokens_and_cost_compactly() {

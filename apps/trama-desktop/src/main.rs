@@ -31,11 +31,15 @@ gpui_kit::assets::icon_assets!(
         FileDiff,
         FolderGit2,
         GitBranch,
+        KeyRound,
         Keyboard,
         ListChecks,
         MessageSquare,
         Pencil,
+        ShieldAlert,
+        ShieldCheck,
         SquarePen,
+        UserCheck,
         Wrench,
     ]
 );
