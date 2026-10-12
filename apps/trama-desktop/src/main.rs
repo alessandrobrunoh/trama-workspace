@@ -8,6 +8,7 @@ mod comments;
 mod composer;
 mod composer_popup;
 mod copies;
+mod demo;
 mod devhooks;
 mod dialog;
 mod diff;
@@ -135,7 +136,9 @@ fn main() {
         };
 
         if let Err(err) = gpui_kit::open_window(options, cx, |window, cx| {
-            window.activate_window();
+            if !devhooks::no_activate() {
+                window.activate_window();
+            }
             cx.new(|cx| Workspace::new(window, cx))
         }) {
             eprintln!("failed to open TramaWorkspace window: {err}");

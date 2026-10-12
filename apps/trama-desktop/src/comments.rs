@@ -76,6 +76,12 @@ impl CommentStore {
         handled
     }
 
+    /// Show these comments for `thread` without a daemon (the demo).
+    pub fn load_demo(&mut self, thread: ThreadId, comments: Vec<CommentSnapshot>) {
+        self.thread = Some(thread);
+        self.comments = comments;
+    }
+
     pub fn groups(&self) -> Vec<CommentGroup> {
         group_comments(&self.comments)
     }

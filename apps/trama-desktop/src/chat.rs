@@ -331,6 +331,8 @@ pub struct ChatPanel {
     checkouts: Vec<(String, std::path::PathBuf)>,
     /// Drawn in the side pane: no terminals, a subagent's transcript.
     pane_mode: bool,
+    /// A scripted transcript (`TRAMA_DEV_DEMO`): comments show offline.
+    demo: bool,
     _composer_extras: Vec<Subscription>,
     _enter: Subscription,
     _event_task: Option<Task<()>>,
@@ -424,6 +426,7 @@ impl ChatPanel {
             turn_comments_open: HashMap::new(),
             checkouts: Vec::new(),
             pane_mode: false,
+            demo: false,
             _composer_extras: composer_extras,
             _enter: enter,
             _event_task: None,
@@ -2529,7 +2532,7 @@ impl Render for ChatPanel {
         if shared.revoked {
             rows.push(row(crate::presence::revoked_banner(&p)));
         }
-        if !self.connected && !self.pane_mode {
+        if !self.connected && !self.pane_mode && !self.demo {
             rows.push(row(notice(
                 &p,
                 IconName::Info,
@@ -2932,7 +2935,35 @@ fn glyph_avatar(icon: IconName, bg: Hsla, fg: Hsla) -> Div {
 impl ChatPanel {
     /// Comments can be read and written here.
     fn comments_enabled(&self) -> bool {
-        self.uses_daemon()
+        self.uses_daemon() || self.demo
+    }
+
+    /// Show a scripted transcript (`TRAMA_DEV_DEMO`, debug builds).
+    pub fn load_demo(
+        &mut self,
+        thread: ThreadId,
+        entries: Vec<ChatEntry>,
+        received: Vec<(MessageId, crate::subagents::AnnotationRow)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.demo = true;
+        self.selected_thread = Some(thread);
+        for entry in &entries {
+            if let ChatEntry::Assistant {
+                markdown,
+                message_id: Some(id),
+                ..
+            } = entry
+            {
+                self.stored_len.insert(id.clone(), markdown.len());
+            }
+        }
+        self.entries = entries;
+        self.received = received.into_iter().collect();
+        if crate::devhooks::from_env().is_some_and(|dev| dev.bottom) {
+            self.scroll.scroll_to_bottom();
+        }
+        cx.notify();
     }
 
     /// Show a subagent's transcript in the side pane (rather than as the

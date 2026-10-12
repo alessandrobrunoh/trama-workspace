@@ -93,6 +93,8 @@ pub struct Workspace {
     _net_events: Task<()>,
     _daemon_start: Option<Task<()>>,
     dev: Option<crate::devhooks::DevScript>,
+    /// Showing the scripted demo transcript (debug builds).
+    dev_demo: bool,
 }
 
 impl Workspace {
@@ -296,9 +298,37 @@ impl Workspace {
             }
         });
 
+        let mut demo_pane = crate::side_pane::SidePane::default();
         if let Some(dev) = crate::devhooks::from_env() {
             if let Some((label, diff)) = &dev.diff {
                 changes.update(cx, |changes, cx| changes.set_diff(label.clone(), diff, cx));
+            }
+            if dev.demo {
+                let parent = ThreadId::from(crate::demo::PARENT);
+                let index = crate::subagents::ThreadIndex::from_threads(&crate::demo::threads());
+                sidebar.update(cx, |sidebar, _| {
+                    sidebar.onboarding.apply_threads(crate::demo::threads());
+                });
+                comments.update(cx, |comments, _| {
+                    comments.load_demo(parent.clone(), crate::demo::parent_comments());
+                });
+                chat.update(cx, |chat, cx| {
+                    chat.set_thread_index(index.clone(), cx);
+                    chat.load_demo(parent, crate::demo::parent_entries(), Vec::new(), cx);
+                });
+                if dev.pane {
+                    let child = ThreadId::from(crate::demo::CHILD);
+                    demo_pane.open(child.clone(), None);
+                    pane_chat.update(cx, |chat, cx| {
+                        chat.set_thread_index(index, cx);
+                        chat.load_demo(
+                            child,
+                            crate::demo::child_entries(),
+                            crate::demo::child_received(),
+                            cx,
+                        );
+                    });
+                }
             }
         }
 
@@ -308,7 +338,7 @@ impl Workspace {
         Self {
             focus_handle,
             chat,
-            pane: Default::default(),
+            pane: demo_pane,
             pane_chat,
             pane_comments,
             copies,
@@ -336,6 +366,7 @@ impl Workspace {
             _net_events: net_events,
             _daemon_start: None,
             dev: crate::devhooks::from_env(),
+            dev_demo: crate::devhooks::from_env().is_some_and(|dev| dev.demo),
         }
     }
 
@@ -1951,7 +1982,7 @@ impl Render for Workspace {
         let can_start = self.sidebar.read(cx).onboarding.can_start_daemon();
         let daemon_feedback = self.sidebar.read(cx).onboarding.daemon_feedback.clone();
 
-        let online = matches!(link, Link::Online);
+        let online = matches!(link, Link::Online) || self.dev_demo;
         // The room the transcript and the side pane share.
         let viewport = f32::from(window.viewport_size().width);
         let drawer = if self.drawer_open {
