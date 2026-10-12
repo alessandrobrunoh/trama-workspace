@@ -75,6 +75,8 @@ pub struct SidebarPanel {
     pub clear_thread_title: bool,
     /// Shared-thread badges and the "Shared with me" list.
     pub collab: crate::collab::SidebarCollab,
+    /// Collapsed threads and fully shown child lists.
+    pub tree: crate::thread_tree::TreeState,
 }
 
 impl SidebarPanel {
@@ -87,6 +89,7 @@ impl SidebarPanel {
             clear_repo_fields: false,
             clear_thread_title: false,
             collab: Default::default(),
+            tree: Default::default(),
         }
     }
 
@@ -132,6 +135,7 @@ impl SidebarPanel {
     }
 
     pub fn select_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        self.tree.reveal(&self.onboarding.threads, &id);
         let requests = self.onboarding.select_thread(id);
         self.emit_requests(requests, cx);
         cx.notify();
@@ -158,54 +162,6 @@ impl Default for SidebarPanel {
 }
 
 impl EventEmitter<SidebarEvent> for SidebarPanel {}
-
-/// Order threads so children follow their parent, with a nesting depth.
-///
-/// `items` is `(id, parent)` in display order. A parent that is missing from
-/// the list (or a cycle) leaves the child at the top level. Callers pass
-/// `ThreadSnapshot::parent_thread_id` (see [`crate::subthreads::thread_rows`]).
-pub fn nest_threads<T: PartialEq + Clone>(items: &[(T, Option<T>)]) -> Vec<(usize, usize)> {
-    let known = |id: &T| items.iter().any(|(candidate, _)| candidate == id);
-    let mut out = Vec::with_capacity(items.len());
-    let mut placed = vec![false; items.len()];
-
-    fn visit<T: PartialEq + Clone>(
-        index: usize,
-        depth: usize,
-        items: &[(T, Option<T>)],
-        placed: &mut [bool],
-        out: &mut Vec<(usize, usize)>,
-    ) {
-        if placed[index] {
-            return;
-        }
-        placed[index] = true;
-        out.push((index, depth));
-        let id = &items[index].0;
-        for (child, (_, parent)) in items.iter().enumerate() {
-            if parent.as_ref() == Some(id) {
-                visit(child, depth + 1, items, placed, out);
-            }
-        }
-    }
-
-    for (index, (_, parent)) in items.iter().enumerate() {
-        let is_root = match parent {
-            None => true,
-            Some(parent) => !known(parent),
-        };
-        if is_root {
-            visit(index, 0, items, &mut placed, &mut out);
-        }
-    }
-    // Anything left is part of a cycle: show it flat rather than hide it.
-    for index in 0..items.len() {
-        if !placed[index] {
-            visit(index, 0, items, &mut placed, &mut out);
-        }
-    }
-    out
-}
 
 pub fn status_dot(status: ThreadStatus, p: &Palette) -> impl IntoElement {
     let color = status.color(p);
@@ -395,7 +351,22 @@ impl Render for SidebarPanel {
                 );
                 continue;
             }
-            for row in crate::subthreads::thread_rows(&threads) {
+            for tree_row in crate::thread_tree::tree_rows(&threads, &self.tree) {
+                let (row, children, collapsed) = match tree_row {
+                    crate::thread_tree::TreeRow::Thread {
+                        row,
+                        children,
+                        collapsed,
+                    } => (row, children, collapsed),
+                    crate::thread_tree::TreeRow::ShowMore {
+                        parent,
+                        depth,
+                        hidden,
+                    } => {
+                        list = list.child(self.show_more_row(parent, depth, hidden, &p, cx));
+                        continue;
+                    }
+                };
                 let thread = &threads[row.index];
                 let is_selected = selected_thread.as_ref() == Some(&thread.id);
                 let status = if is_selected {
@@ -404,9 +375,9 @@ impl Render for SidebarPanel {
                     ThreadStatus::Idle
                 };
                 list = list.child(self.thread_row(
-                    thread.id.clone(),
-                    thread.title.clone(),
+                    thread,
                     &row,
+                    (children, collapsed),
                     is_selected,
                     status,
                     &p,
@@ -469,28 +440,95 @@ impl Render for SidebarPanel {
 }
 
 impl SidebarPanel {
+    /// Children not shown yet: "Show N more", like Delta.
+    fn show_more_row(
+        &self,
+        parent: ThreadId,
+        depth: usize,
+        hidden: usize,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let indent = crate::thread_tree::indent_level(depth);
+        h_flex()
+            .id(SharedString::from(format!("th-more-{parent}")))
+            .h(px(24.))
+            .pl(theme::sp(0.5) + px(14.) + theme::sp(2.) + theme::sp(3.) * indent as f32)
+            .pr(theme::sp(1.))
+            .gap(theme::sp(1.5))
+            .items_center()
+            .rounded(theme::radius())
+            .cursor_pointer()
+            .text_size(theme::text_sm())
+            .text_color(p.text_faint)
+            .hover(|style| style.bg(p.hover).text_color(p.text_muted))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.tree.show_all(&parent);
+                cx.notify();
+            }))
+            .child(Icon::new(IconName::Ellipsis).with_size(px(12.)))
+            .child(format!("Show {hidden} more"))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn thread_row(
         &self,
-        id: ThreadId,
-        title: String,
+        thread: &trama_protocol::ThreadSnapshot,
         row: &crate::subthreads::ThreadRow,
+        (children, collapsed): (usize, bool),
         selected: bool,
         status: ThreadStatus,
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let id = thread.id.clone();
+        let title = thread.title.clone();
         let depth = row.depth;
+        let indent = crate::thread_tree::indent_level(depth);
+        let marker = crate::thread_tree::depth_marker(depth);
         let kind = row.kind;
         let verdict = row.verdict;
         let group = SharedString::from(format!("thread-row-{id}"));
         let click_id = id.clone();
+        let toggle_id = id.clone();
         let copy_id = id.to_string();
+        let subagent = thread
+            .subagent
+            .as_ref()
+            .map(|snapshot| crate::subagents::sidebar_badge(&id, snapshot, p));
+        // Fixed-width slot so rows line up whether or not they have children.
+        let chevron = div()
+            .id(SharedString::from(format!("th-toggle-{id}")))
+            .w(px(14.))
+            .h(px(14.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(theme::radius_sm())
+            .when(children > 0, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(p.hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.tree.toggle_collapsed(&toggle_id);
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(if collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .with_size(px(11.))
+                        .text_color(p.text_faint),
+                    )
+            });
         h_flex()
             .id(SharedString::from(format!("th-{id}")))
             .group(group.clone())
             .h(px(28.))
-            .pl(theme::sp(6.) + theme::sp(4.) * depth as f32)
+            .pl(theme::sp(0.5) + theme::sp(3.) * indent as f32)
             .pr(theme::sp(1.))
             .gap(theme::sp(2.))
             .items_center()
@@ -505,6 +543,7 @@ impl SidebarPanel {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.select_thread(click_id.clone(), cx);
             }))
+            .child(chevron)
             .child(
                 div()
                     .id(SharedString::from(format!("th-status-{id}")))
@@ -520,7 +559,23 @@ impl SidebarPanel {
                         Tooltip::new(crate::subthreads::kind_label(kind)).build(window, cx)
                     })
             }))
+            .children(subagent)
             .child(div().flex_1().min_w_0().truncate().child(title))
+            .when_some(marker, |this, marker| {
+                let tooltip: SharedString = format!("Nested {marker} levels deep").into();
+                this.child(
+                    div()
+                        .id(SharedString::from(format!("th-depth-{id}")))
+                        .flex_shrink_0()
+                        .px(theme::sp(1.))
+                        .rounded(theme::radius_sm())
+                        .bg(p.hover)
+                        .text_size(theme::text_xs())
+                        .text_color(p.text_faint)
+                        .child(format!("\u{21b3}{marker}"))
+                        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)),
+                )
+            })
             .when(self.collab.shared.contains(&id), |this| {
                 this.child(
                     div()
@@ -683,38 +738,4 @@ fn hint(p: &Palette, text: &'static str) -> impl IntoElement {
         .text_size(theme::text_sm())
         .text_color(p.text_faint)
         .child(text)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::nest_threads;
-
-    #[test]
-    fn flat_threads_stay_in_order_at_depth_zero() {
-        let items = [("a", None), ("b", None), ("c", None)];
-        assert_eq!(nest_threads(&items), vec![(0, 0), (1, 0), (2, 0)]);
-    }
-
-    #[test]
-    fn children_follow_their_parent_indented() {
-        let items = [
-            ("child", Some("root")),
-            ("root", None),
-            ("other", None),
-            ("grandchild", Some("child")),
-            ("orphan", Some("missing")),
-        ];
-        assert_eq!(
-            nest_threads(&items),
-            vec![(1, 0), (0, 1), (3, 2), (2, 0), (4, 0)]
-        );
-    }
-
-    #[test]
-    fn cycles_are_shown_flat_instead_of_hidden() {
-        let items = [("a", Some("b")), ("b", Some("a"))];
-        let nested = nest_threads(&items);
-        assert_eq!(nested.len(), 2);
-        assert_eq!(nested[0], (0, 0));
-    }
 }

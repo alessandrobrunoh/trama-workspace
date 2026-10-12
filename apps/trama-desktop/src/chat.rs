@@ -119,6 +119,9 @@ pub enum ChatEntry {
     Thinking {
         text: String,
     },
+    /// A stored message that links another thread (subagent started or
+    /// finished, agent message sent).
+    Annotation(crate::subagents::AnnotationRow),
 }
 
 /// Requests the chat panel makes of the workspace.
@@ -126,6 +129,8 @@ pub enum ChatEntry {
 pub enum ChatEvent {
     /// Select this thread (a subagent link was clicked).
     OpenThread(ThreadId),
+    /// Fork the selected thread at a message (hover action, ⌘K).
+    Fork(crate::forks::ForkTarget),
 }
 
 /// The turn rail's interaction state.
@@ -244,6 +249,12 @@ pub struct ChatPanel {
     prompt_times: HashMap<MessageId, chrono::DateTime<chrono::Utc>>,
     /// Threads the sidebar lists, for subagent links.
     known_threads: Vec<(ThreadId, String)>,
+    /// Titles, subagent profiles and spawning tool calls of known threads.
+    thread_index: crate::subagents::ThreadIndex,
+    /// Where the stored messages can be forked at.
+    fork_index: crate::forks::ForkIndex,
+    /// Prompts another thread's agent sent, by message.
+    received: HashMap<MessageId, crate::subagents::AnnotationRow>,
     /// Shared-thread state (drafts, presence, remote turns).
     collab: Option<Entity<crate::collab::CollabStore>>,
     /// Mirrored messages of other participants: author and role.
@@ -331,6 +342,9 @@ impl ChatPanel {
             bookmarks: Bookmarks::load(),
             prompt_times: HashMap::new(),
             known_threads: Vec::new(),
+            thread_index: Default::default(),
+            fork_index: Default::default(),
+            received: HashMap::new(),
             collab: None,
             remote_authors: HashMap::new(),
             popup,
@@ -530,6 +544,8 @@ impl ChatPanel {
         self.rail = RailState::default();
         self.prompt_times.clear();
         self.remote_authors.clear();
+        self.fork_index.clear();
+        self.received.clear();
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -615,6 +631,18 @@ impl ChatPanel {
                 }
                 if !self.seen_message_ids.insert(message.id.clone()) {
                     return;
+                }
+                self.fork_index.note(&message, &thread_id);
+                if let Some(row) = crate::subagents::annotation_row(&message) {
+                    if crate::subagents::is_standalone(&message) {
+                        // Shown even mid-turn: a subagent starts while its
+                        // parent's turn is still running.
+                        self.entries.push(ChatEntry::Annotation(row));
+                        self.scroll.scroll_to_bottom();
+                        cx.notify();
+                        return;
+                    }
+                    self.received.insert(message.id.clone(), row);
                 }
                 if let crate::collab::Speaker::Remote(author) =
                     crate::collab::Speaker::of(&message.actor)
@@ -1281,6 +1309,19 @@ impl ChatPanel {
         cx.notify();
     }
 
+    /// Titles and subagent records of the listed threads, for annotation
+    /// rows and links from `spawn_subagent` calls to their child.
+    pub fn set_thread_index(
+        &mut self,
+        index: crate::subagents::ThreadIndex,
+        cx: &mut Context<Self>,
+    ) {
+        if self.thread_index != index {
+            self.thread_index = index;
+            cx.notify();
+        }
+    }
+
     /// A stored turn's (or the running turn's) replayed tool calls and
     /// thinking. They arrive right before the message that ends the turn;
     /// the running turn's come after the history, and its later steps
@@ -1318,6 +1359,58 @@ impl ChatPanel {
             *streaming = false;
         }
         self.entries.extend(replayed.entries);
+    }
+
+    /// Ask the workspace to fork at `message_id` (the hover action).
+    pub fn request_fork(&mut self, message_id: MessageId, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.selected_thread.clone() else {
+            return;
+        };
+        if self.fork_index.state(&message_id) != crate::forks::ForkState::Ready {
+            return;
+        }
+        let label = self
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ChatEntry::User {
+                    text,
+                    message_id: Some(id),
+                } if id == &message_id => Some(comments::prompt_body(text).to_string()),
+                ChatEntry::Assistant {
+                    markdown,
+                    message_id: Some(id),
+                    ..
+                } if id == &message_id => Some(markdown.clone()),
+                _ => None,
+            })
+            .map(|text| crate::forks::preview(&text))
+            .unwrap_or_default();
+        cx.emit(ChatEvent::Fork(crate::forks::ForkTarget {
+            thread_id,
+            message_id,
+            label,
+        }));
+    }
+
+    /// "Fork from here" (⌘K): the turn under the rail's pointer, else the
+    /// turn at the top of the view, when it can be forked.
+    pub fn fork_here_target(&self) -> Option<MessageId> {
+        if !self.uses_daemon() {
+            return None;
+        }
+        let turn_list = turns::segment_turns(&self.entries);
+        let turn = self.rail.hovered.or_else(|| {
+            let geometry = self.rail_geometry()?;
+            geometry
+                .spans
+                .iter()
+                .rposition(|span| span.top <= geometry.view.top + 1.)
+                .or(Some(0))
+        })?;
+        let range = turn_list.get(turn)?.entries.clone();
+        let message = crate::forks::turn_fork_message(&self.entries[range])?;
+        (self.fork_index.state(&message) == crate::forks::ForkState::Ready).then_some(message)
     }
 }
 
@@ -1899,7 +1992,11 @@ impl ChatPanel {
             .gap(theme::sp(1.))
             .items_start()
             .children(marker)
-            .when(self.uses_daemon(), |this| this.child(add))
+            .when(self.uses_daemon(), |this| {
+                let fork =
+                    crate::forks::fork_button(message_id, self.fork_index.state(message_id), p, cx);
+                this.child(add).child(fork)
+            })
             .into_any_element()
     }
 
@@ -2293,9 +2390,23 @@ impl Render for ChatPanel {
                         block =
                             block.child(div().w_full().h(px(1.)).my(theme::sp(2.)).bg(p.border));
                     }
-                    block = match message_id.as_ref().and_then(|id| self.remote_author(id)) {
-                        Some(name) => block.child(crate::presence::person_row(&p, name)),
-                        None => block.child(author_row(&p, Author::User)),
+                    let received = message_id
+                        .as_ref()
+                        .and_then(|id| self.received.get(id))
+                        .cloned();
+                    block = match (
+                        received,
+                        message_id.as_ref().and_then(|id| self.remote_author(id)),
+                    ) {
+                        (Some(row), _) => block.child(crate::subagents::received_author_row(
+                            ix,
+                            &row,
+                            &self.thread_index,
+                            &p,
+                            cx,
+                        )),
+                        (None, Some(name)) => block.child(crate::presence::person_row(&p, name)),
+                        (None, None) => block.child(author_row(&p, Author::User)),
                     };
                     match message_id {
                         Some(id) if uses_daemon => {
@@ -2388,6 +2499,7 @@ impl Render for ChatPanel {
                     previous_was_agent = true;
                 }
                 ChatEntry::ToolCall {
+                    tool_use_id,
                     name,
                     input_json,
                     output,
@@ -2398,11 +2510,16 @@ impl Render for ChatPanel {
                             tools::render_command(ix, entry, &self.tool_views, &p, cx)
                         }
                         ToolKind::Subthread => {
-                            let link = tools::subthread_link(
+                            let mut link = tools::subthread_link(
                                 name,
                                 input_json,
                                 output.as_ref(),
                                 &self.known_threads,
+                            );
+                            crate::subagents::link_spawned_child(
+                                &mut link,
+                                tool_use_id,
+                                &self.thread_index,
                             );
                             tools::render_subthread(ix, entry, link, &p, cx)
                         }
@@ -2410,6 +2527,17 @@ impl Render for ChatPanel {
                             render_entry(ix, entry, &p, cx).into_any_element()
                         }
                     };
+                    rows.push(row(agent_block(&p, !previous_was_agent, content)));
+                    previous_was_agent = true;
+                }
+                ChatEntry::Annotation(annotation) => {
+                    let content = crate::subagents::render_annotation(
+                        ix,
+                        annotation,
+                        &self.thread_index,
+                        &p,
+                        cx,
+                    );
                     rows.push(row(agent_block(&p, !previous_was_agent, content)));
                     previous_was_agent = true;
                 }
@@ -3345,6 +3473,8 @@ fn render_entry(
             .text_color(p.text_faint)
             .child(text.trim().to_string())
             .into_any_element(),
+        // Rendered with the thread index by the transcript itself.
+        ChatEntry::Annotation(_) => div().into_any_element(),
     }
 }
 

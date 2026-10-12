@@ -12,6 +12,7 @@ mod devhooks;
 mod dialog;
 mod diff;
 mod editor;
+mod forks;
 mod keymap;
 mod mentions;
 mod model_picker;
@@ -24,9 +25,11 @@ mod sidebar;
 mod slash;
 mod snapshot;
 mod startup;
+mod subagents;
 mod subthreads;
 mod terminal_view;
 mod theme;
+mod thread_tree;
 mod tools;
 mod trigger;
 mod turns;
@@ -73,6 +76,12 @@ gpui_kit::assets::icon_assets!(
         SquarePen,
         UserCheck,
         Wrench,
+        // Subagents and forks.
+        Clock,
+        GitFork,
+        Hammer,
+        Send,
+        Telescope,
         // Shared threads.
         Crown,
         Link,

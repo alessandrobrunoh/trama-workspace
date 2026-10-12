@@ -53,6 +53,8 @@ enum PaletteTarget {
     Share,
     JoinShared,
     CollabAccount,
+    /// Fork the selected thread at this message ("Fork from here").
+    ForkHere(trama_domain::ids::MessageId),
 }
 
 pub struct Workspace {
@@ -77,6 +79,10 @@ pub struct Workspace {
     seen_completed_turns: u64,
     /// Subthread this window asked for, to follow it once created.
     pending_subthread: Option<(ThreadId, SubthreadKind)>,
+    /// The fork-at-a-message dialog.
+    fork_view: Entity<crate::forks::ForkView>,
+    /// Parent of a fork this window asked for; the fork opens when created.
+    pending_fork: Option<ThreadId>,
     client: DaemonClient,
     connected: bool,
     _subscriptions: Vec<Subscription>,
@@ -114,6 +120,7 @@ impl Workspace {
         let join_store = collab.clone();
         let join = cx.new(|cx| JoinView::new(join_store, window, cx));
         let composer_input = chat.read(cx).composer_input();
+        let fork_view = cx.new(|cx| crate::forks::ForkView::new(window, cx));
 
         let subscriptions = vec![
             cx.observe(&collab, |this, collab, cx| {
@@ -172,13 +179,28 @@ impl Workspace {
                         .update(cx, |chat, cx| chat.reveal_message(message_id, cx));
                 }
             }),
-            cx.subscribe(&chat, |this, _, event: &ChatEvent, cx| match event {
-                ChatEvent::OpenThread(thread) => {
-                    let thread = thread.clone();
-                    this.sidebar
-                        .update(cx, |sidebar, cx| sidebar.select_thread(thread, cx));
-                }
-            }),
+            cx.subscribe_in(
+                &chat,
+                window,
+                |this, _, event: &ChatEvent, window, cx| match event {
+                    ChatEvent::OpenThread(thread) => {
+                        let thread = thread.clone();
+                        this.sidebar
+                            .update(cx, |sidebar, cx| sidebar.select_thread(thread, cx));
+                    }
+                    ChatEvent::Fork(target) => this.open_fork(target.clone(), window, cx),
+                },
+            ),
+            cx.subscribe_in(
+                &fork_view,
+                window,
+                |this, _, event: &crate::forks::ForkEvent, window, cx| {
+                    window.close_dialog(cx);
+                    if let crate::forks::ForkEvent::Submit(message) = event {
+                        this.send_fork(message.clone(), window, cx);
+                    }
+                },
+            ),
             cx.observe(&subthread_bar, |_, _, cx| cx.notify()),
             cx.observe(&sidebar, |this, sidebar, cx| {
                 let threads: Vec<_> = sidebar
@@ -195,9 +217,13 @@ impl Workspace {
                     .iter()
                     .map(|thread| (thread.id.clone(), thread.model.clone()))
                     .collect();
+                let index = crate::subagents::ThreadIndex::from_threads(
+                    &sidebar.read(cx).onboarding.threads,
+                );
                 this.chat.update(cx, |chat, cx| {
                     chat.set_known_threads(threads, cx);
                     chat.set_thread_models(models, cx);
+                    chat.set_thread_index(index, cx);
                 });
                 cx.notify();
             }),
@@ -266,6 +292,8 @@ impl Workspace {
             drawer_tab: DrawerTab::default(),
             seen_completed_turns: 0,
             pending_subthread: None,
+            fork_view,
+            pending_fork: None,
             client,
             connected: false,
             _subscriptions: subscriptions,
@@ -393,6 +421,49 @@ impl Workspace {
                     true
                 })
         });
+    }
+
+    /// Ask for a title, a first prompt and a kind, then fork at the message.
+    fn open_fork(
+        &mut self,
+        target: crate::forks::ForkTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.connected {
+            return;
+        }
+        window.close_all_dialogs(cx);
+        self.fork_view
+            .update(cx, |view, cx| view.reset(target, window, cx));
+        let view = self.fork_view.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Fork from here")
+                .w(px(480.))
+                .child(view.clone())
+        });
+    }
+
+    fn send_fork(&mut self, message: ClientMessage, window: &mut Window, cx: &mut Context<Self>) {
+        let ClientMessage::ForkThread { thread_id, .. } = &message else {
+            return;
+        };
+        let parent = thread_id.clone();
+        if self.client.send(message) == crate::net::SendStatus::Rejected {
+            window.push_notification(
+                Notification::error("The daemon is not connected; nothing was forked."),
+                cx,
+            );
+            return;
+        }
+        self.pending_fork = Some(parent);
+    }
+
+    /// ⌘K "Fork from here": the turn under the rail cursor.
+    fn fork_here(&mut self, message_id: trama_domain::ids::MessageId, cx: &mut Context<Self>) {
+        self.chat
+            .update(cx, |chat, cx| chat.request_fork(message_id, cx));
     }
 
     fn pull_selected(&mut self, cx: &mut Context<Self>) {
@@ -898,6 +969,18 @@ impl Workspace {
                 true,
             ),
         ];
+        let mut commands = commands;
+        if let Some(message) = self.chat.read(cx).fork_here_target() {
+            commands.insert(
+                1,
+                (
+                    "Fork from here",
+                    IconName::GitFork,
+                    PaletteTarget::ForkHere(message),
+                    connected,
+                ),
+            );
+        }
         let available: Vec<_> = commands.into_iter().filter(|c| c.3).collect();
         let ranked = fuzzy_rank(&query, available.iter().map(|c| c.0));
         if !ranked.is_empty() {
@@ -949,6 +1032,7 @@ impl Workspace {
             PaletteTarget::Share => self.open_share(window, cx),
             PaletteTarget::JoinShared => self.open_join(window, cx),
             PaletteTarget::CollabAccount => self.open_account(None, window, cx),
+            PaletteTarget::ForkHere(message) => self.fork_here(message, cx),
         }
         cx.notify();
     }
@@ -1235,6 +1319,35 @@ impl Workspace {
                     self.dispatch_request(request, cx);
                 }
             }
+            DaemonMessage::SubthreadCreated(snapshot)
+                if self.pending_fork.is_some()
+                    && snapshot.parent_thread_id == self.pending_fork =>
+            {
+                self.pending_fork = None;
+                let id = snapshot.id.clone();
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.onboarding.apply_subthread(snapshot);
+                    sidebar.select_thread(id, cx);
+                    cx.notify();
+                });
+            }
+            DaemonMessage::SubagentStatusChanged {
+                thread_id,
+                status,
+                detail,
+                ..
+            } => {
+                self.sidebar.update(cx, |sidebar, cx| {
+                    if crate::subagents::apply_status(
+                        &mut sidebar.onboarding.threads,
+                        &thread_id,
+                        status,
+                        detail,
+                    ) {
+                        cx.notify();
+                    }
+                });
+            }
             DaemonMessage::SubthreadCreated(snapshot) => {
                 let ours = self
                     .pending_subthread
@@ -1368,6 +1481,7 @@ impl Workspace {
             }
             DaemonMessage::Error { code, message } => {
                 self.pending_subthread = None;
+                self.pending_fork = None;
                 self.subthread_bar.update(cx, |bar, cx| bar.note_error(cx));
                 self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.onboarding.note_error(&code, &message);

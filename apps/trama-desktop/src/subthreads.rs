@@ -22,7 +22,7 @@ use trama_protocol::{
 };
 
 use crate::net::{DaemonClient, SendStatus};
-use crate::sidebar::{SidebarPanel, nest_threads};
+use crate::sidebar::SidebarPanel;
 use crate::theme::{self, Palette};
 
 pub fn kind_icon(kind: ThreadKind) -> Option<IconName> {
@@ -83,34 +83,13 @@ pub struct ThreadRow {
     pub verdict: Option<VerdictBadge>,
 }
 
-/// Threads in display order with subthreads under their parent.
-pub fn thread_rows(threads: &[ThreadSnapshot]) -> Vec<ThreadRow> {
-    let pairs: Vec<(ThreadId, Option<ThreadId>)> = threads
-        .iter()
-        .map(|thread| (thread.id.clone(), thread.parent_thread_id.clone()))
-        .collect();
-    nest_threads(&pairs)
-        .into_iter()
-        .map(|(index, depth)| {
-            let thread = &threads[index];
-            ThreadRow {
-                index,
-                depth,
-                kind: thread.kind,
-                verdict: VerdictBadge::from_verdict(thread.review_verdict.as_ref()),
-            }
-        })
-        .collect()
-}
-
-/// The top-level thread new subthreads hang from: the selection itself, or
-/// its parent when a subthread is selected (subthreads do not nest).
+/// The thread new subthreads hang from: the selection itself. Subthreads
+/// nest at any depth (protocol 9).
 pub fn subthread_parent(threads: &[ThreadSnapshot], selected: &ThreadId) -> Option<ThreadId> {
-    let thread = threads.iter().find(|thread| &thread.id == selected)?;
-    match &thread.parent_thread_id {
-        Some(parent) => Some(parent.clone()),
-        None => Some(thread.id.clone()),
-    }
+    threads
+        .iter()
+        .find(|thread| &thread.id == selected)
+        .map(|thread| thread.id.clone())
 }
 
 /// Short title for a subthread started from a draft.
@@ -203,6 +182,8 @@ pub struct BarModel {
     pub parent_id: ThreadId,
     pub parent_title: String,
     pub verdict: Option<ReviewVerdict>,
+    /// Set when the thread is a subagent of its parent.
+    pub subagent: Option<trama_protocol::SubagentSnapshot>,
 }
 
 /// `None` for top-level threads: the bar only exists inside subthreads.
@@ -220,6 +201,7 @@ pub fn bar_model(threads: &[ThreadSnapshot], selected: Option<&ThreadId>) -> Opt
         parent_id,
         parent_title,
         verdict: thread.review_verdict.clone(),
+        subagent: thread.subagent.clone(),
     })
 }
 
@@ -412,7 +394,11 @@ impl Render for SubthreadBar {
                 sidebar.update(cx, |sidebar, cx| sidebar.select_thread(parent, cx));
             })
             .children(
-                kind_icon(model.kind)
+                model
+                    .subagent
+                    .as_ref()
+                    .map(|subagent| crate::subagents::profile_icon(subagent.spawned_by.profile))
+                    .or_else(|| kind_icon(model.kind))
                     .map(|icon| Icon::new(icon).with_size(px(13.)).text_color(p.accent_text)),
             )
             .child(
@@ -420,7 +406,13 @@ impl Render for SubthreadBar {
                     .flex_shrink_0()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(p.text)
-                    .child(kind_label(model.kind)),
+                    .child(match &model.subagent {
+                        Some(subagent) => format!(
+                            "{} subagent",
+                            crate::subagents::profile_title(subagent.spawned_by.profile)
+                        ),
+                        None => kind_label(model.kind).to_string(),
+                    }),
             )
             .child("of")
             .child(div().min_w_0().truncate().child(model.parent_title.clone()));
@@ -430,6 +422,9 @@ impl Render for SubthreadBar {
             .flex_shrink_0()
             .gap(theme::sp(1.))
             .items_center()
+            .when_some(model.subagent.as_ref(), |this, subagent| {
+                this.child(crate::subagents::header_badge(subagent, &p))
+            })
             .when_some(badge, |this, badge| {
                 this.child(
                     div()
@@ -667,8 +662,9 @@ impl Render for SubthreadBar {
 mod tests {
     use super::{
         IconName, PullSummary, ThreadId, VerdictBadge, bar_model, kind_icon, outcome_label,
-        subthread_parent, thread_rows, title_from_prompt,
+        subthread_parent, title_from_prompt,
     };
+    use crate::thread_tree::{TreeRow, TreeState, tree_rows};
     use trama_protocol::{
         FileChangeStatus, PullFileOutcome, PullFileResult, RepoPullResult, RepositoryId,
         ReviewVerdict, ThreadKind, ThreadSnapshot,
@@ -701,7 +697,13 @@ mod tests {
             review,
             snapshot("l", Some("a"), ThreadKind::Land),
         ];
-        let rows = thread_rows(&threads);
+        let rows: Vec<_> = tree_rows(&threads, &TreeState::default())
+            .into_iter()
+            .filter_map(|row| match row {
+                TreeRow::Thread { row, .. } => Some(row),
+                TreeRow::ShowMore { .. } => None,
+            })
+            .collect();
         let order: Vec<(String, usize)> = rows
             .iter()
             .map(|row| (threads[row.index].id.to_string(), row.depth))
@@ -719,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn new_subthreads_hang_from_the_top_level_thread() {
+    fn new_subthreads_hang_from_the_selection_at_any_depth() {
         let threads = vec![
             snapshot("a", None, ThreadKind::Top),
             snapshot("s", Some("a"), ThreadKind::Sub),
@@ -730,7 +732,7 @@ mod tests {
         );
         assert_eq!(
             subthread_parent(&threads, &ThreadId::from("s")),
-            Some(ThreadId::from("a"))
+            Some(ThreadId::from("s"))
         );
         assert_eq!(subthread_parent(&threads, &ThreadId::from("zz")), None);
     }
