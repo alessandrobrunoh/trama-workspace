@@ -101,10 +101,9 @@ impl DaemonClient {
     }
 }
 
-/// `$HOME/Library/Application Support/TramaWorkspace/daemon.sock`
+/// `<app dir>/daemon.sock`; see [`trama_protocol::default_app_dir`].
 pub fn default_socket_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/TramaWorkspace/daemon.sock"))
+    Some(trama_protocol::default_app_dir()?.join("daemon.sock"))
 }
 
 fn runtime() -> Option<&'static tokio::runtime::Runtime> {
@@ -471,7 +470,8 @@ mod tests {
     #[test]
     fn socket_path_uses_application_support() {
         let path = default_socket_path().expect("HOME");
-        assert!(path.ends_with("Library/Application Support/TramaWorkspace/daemon.sock"));
+        let app_dir = trama_protocol::default_app_dir().expect("HOME");
+        assert_eq!(path, app_dir.join("daemon.sock"));
     }
 
     #[test]

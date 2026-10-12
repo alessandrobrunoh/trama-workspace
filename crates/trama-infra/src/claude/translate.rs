@@ -221,6 +221,20 @@ fn translate_stream(
     }
 }
 
+const NOT_LOGGED_IN_HINT: &str = "Claude Code is not logged in for the user running the \
+     Trama daemon. Run `claude` in a terminal and use /login (or `claude auth login`), then \
+     retry. If the daemon was started with a different HOME, start it with your real HOME and \
+     use TRAMA_DATA_DIR to isolate Trama's data instead.";
+
+/// Replace the CLI's terse login error with an actionable one; keep others as-is.
+fn explain_failure(message: String) -> String {
+    if message.contains("Not logged in") {
+        format!("{NOT_LOGGED_IN_HINT}\n\nClaude Code said: {message}")
+    } else {
+        message
+    }
+}
+
 fn translate_result(result: &ResultLine, state: &mut TranslateState, events: &mut Vec<AgentEvent>) {
     if let Some(usage) = result.usage.as_ref() {
         events.push(usage_event(usage, state));
@@ -233,7 +247,9 @@ fn translate_result(result: &ResultLine, state: &mut TranslateState, events: &mu
             .clone()
             .or_else(|| result.result.clone())
             .unwrap_or_else(|| "claude result error".to_string());
-        events.push(AgentEvent::Failed { message });
+        events.push(AgentEvent::Failed {
+            message: explain_failure(message),
+        });
     }
 
     events.push(AgentEvent::TurnCompleted {
@@ -276,6 +292,19 @@ mod tests {
         );
         assert_eq!(billing_source(Some("future")), BillingSource::Unknown);
         assert_eq!(billing_source(None), BillingSource::Unknown);
+    }
+
+    #[test]
+    fn not_logged_in_result_explains_how_to_log_in() {
+        let ndjson = r#"{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login","num_turns":1}"#;
+        let lines = parse_ndjson(ndjson).unwrap();
+        let events = translate_lines(&lines);
+        let Some(AgentEvent::Failed { message }) = events.first() else {
+            panic!("expected Failed, got {events:?}");
+        };
+        assert!(message.starts_with("Claude Code is not logged in"));
+        assert!(message.contains("TRAMA_DATA_DIR"));
+        assert!(message.ends_with("Claude Code said: Not logged in · Please run /login"));
     }
 
     #[test]

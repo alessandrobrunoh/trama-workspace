@@ -47,6 +47,11 @@ cargo build --workspace --all-targets
 ./target/debug/TramaWorkspace
 ```
 
+To run an isolated instance (separate socket, database and config) without
+touching your real data, set `TRAMA_DATA_DIR=/some/dir` for both processes.
+Do not override `HOME` for that: the `claude` child process needs your real
+`HOME` to find your Claude Code login.
+
 Starting the binaries directly does not acquire Cargo's build lock. Do not
 start parallel `cargo run`/check/test commands while building. The desktop also
 offers **Start daemon** when the sibling binary is installed and no daemon is

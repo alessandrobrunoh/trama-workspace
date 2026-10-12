@@ -25,15 +25,16 @@ use tokio::net::UnixListener;
 use tokio::sync::watch;
 use trama_db::TramaDb;
 
-/// `$HOME/Library/Application Support/TramaWorkspace`
+/// `$TRAMA_DATA_DIR`, else `$HOME/Library/Application Support/TramaWorkspace`
 pub fn default_app_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        DaemonError::Invalid("HOME is not set; cannot locate Application Support".into())
-    })?;
-    Ok(PathBuf::from(home).join("Library/Application Support/TramaWorkspace"))
+    trama_protocol::default_app_dir().ok_or_else(|| {
+        DaemonError::Invalid(
+            "Neither TRAMA_DATA_DIR nor HOME is set; cannot locate Application Support".into(),
+        )
+    })
 }
 
-/// `$HOME/Library/Application Support/TramaWorkspace/daemon.sock`
+/// `<app dir>/daemon.sock`
 pub fn default_socket_path() -> Result<PathBuf> {
     Ok(default_app_dir()?.join("daemon.sock"))
 }

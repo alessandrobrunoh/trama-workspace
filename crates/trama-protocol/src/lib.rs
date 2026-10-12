@@ -53,6 +53,21 @@ pub use trama_domain::thread::ThreadKind;
 /// are rejected at handshake time.
 pub const PROTOCOL_VERSION: u32 = 5;
 
+/// Environment variable that relocates the whole app-data directory (socket,
+/// database, config, legacy checkouts). Use it for isolated test instances
+/// instead of overriding `HOME`: the `claude` child still needs the real
+/// `HOME` to find the user's Claude Code login.
+pub const DATA_DIR_ENV: &str = "TRAMA_DATA_DIR";
+
+/// `$TRAMA_DATA_DIR`, else `$HOME/Library/Application Support/TramaWorkspace`.
+pub fn default_app_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(DATA_DIR_ENV).filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join("Library/Application Support/TramaWorkspace"))
+}
+
 /// Encode `value` as one JSON line (compact JSON plus a trailing `\n`).
 pub fn encode_json_line<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
     let mut buf = serde_json::to_vec(value)?;
@@ -697,6 +712,34 @@ mod tests {
             },
         };
         roundtrip_json(&envelope);
+    }
+
+    #[test]
+    fn app_dir_prefers_trama_data_dir_over_home() {
+        // Single test touching these variables, so no cross-test races.
+        let saved = (std::env::var_os(DATA_DIR_ENV), std::env::var_os("HOME"));
+        unsafe {
+            std::env::set_var("HOME", "/Users/someone");
+            std::env::remove_var(DATA_DIR_ENV);
+        }
+        assert_eq!(
+            default_app_dir(),
+            Some(PathBuf::from(
+                "/Users/someone/Library/Application Support/TramaWorkspace"
+            ))
+        );
+        unsafe { std::env::set_var(DATA_DIR_ENV, "/tmp/trama-test") };
+        assert_eq!(default_app_dir(), Some(PathBuf::from("/tmp/trama-test")));
+        unsafe {
+            match saved.0 {
+                Some(value) => std::env::set_var(DATA_DIR_ENV, value),
+                None => std::env::remove_var(DATA_DIR_ENV),
+            }
+            match saved.1 {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     #[test]

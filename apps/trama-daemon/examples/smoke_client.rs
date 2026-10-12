@@ -22,10 +22,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prompt = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "Reply with exactly: TRAMA-E2E-OK".into());
-    let socket = format!(
-        "{}/Library/Application Support/TramaWorkspace/daemon.sock",
-        std::env::var("HOME").expect("HOME")
-    );
+    let socket = trama_protocol::default_app_dir()
+        .expect("TRAMA_DATA_DIR or HOME")
+        .join("daemon.sock");
 
     let stream =
         tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(&socket)).await??;

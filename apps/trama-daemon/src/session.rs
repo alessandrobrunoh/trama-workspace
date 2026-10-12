@@ -145,10 +145,8 @@ pub struct SessionManager {
 
 impl SessionManager {
     pub fn new(db: TramaDb, adapter: Arc<dyn AgentAdapter>) -> Self {
-        let root = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("Library/Application Support/TramaWorkspace");
+        let root = trama_protocol::default_app_dir()
+            .unwrap_or_else(|| std::env::temp_dir().join("TramaWorkspace"));
         Self::with_checkout_root(db, adapter, root)
     }
 
