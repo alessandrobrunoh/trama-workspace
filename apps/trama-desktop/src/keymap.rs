@@ -22,6 +22,7 @@ gpui_kit::actions!(
         DenyApproval,
         CommentOnSelection,
         ShareThread,
+        ArchiveThread,
     ]
 );
 
@@ -40,6 +41,9 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("cmd-shift-n", DenyApproval, Some(CONTEXT)),
         KeyBinding::new("cmd-alt-m", CommentOnSelection, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-s", ShareThread, Some(CONTEXT)),
+        // Delta's shortcut. Nothing else binds ⌘W (there are no tabs and the
+        // window is closed with the traffic light or ⌘Q).
+        KeyBinding::new("cmd-w", ArchiveThread, Some(CONTEXT)),
     ]);
 }
 
@@ -89,6 +93,10 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut {
         keys: &["cmd-shift-s"],
         label: "Share this thread",
+    },
+    Shortcut {
+        keys: &["cmd-w"],
+        label: "Archive this thread (removes its checkouts)",
     },
     Shortcut {
         keys: &["ctrl-`"],

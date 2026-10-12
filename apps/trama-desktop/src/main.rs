@@ -12,6 +12,7 @@ mod demo;
 mod devhooks;
 mod dialog;
 mod diff;
+mod disk_usage;
 mod doc_text;
 mod document;
 mod editor;
@@ -95,6 +96,10 @@ gpui_kit::assets::icon_assets!(
         Unplug,
         UserPlus,
         Users,
+        // Archive and disk usage.
+        Archive,
+        ArchiveRestore,
+        Trash,
     ]
 );
 

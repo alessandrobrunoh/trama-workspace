@@ -187,6 +187,47 @@ fn mark_subtree(threads: &[ThreadSnapshot], index: usize, placed: &mut [bool]) {
     }
 }
 
+/// Split the sidebar's threads into the active tree and the "Archived"
+/// section. Archived threads and every descendant of one leave the active
+/// tree (their history stays reachable through ⌘K); the section lists the
+/// archived threads themselves, in their original order.
+pub fn split_archived(threads: &[ThreadSnapshot]) -> (Vec<ThreadSnapshot>, Vec<ThreadSnapshot>) {
+    let parents: std::collections::HashMap<&ThreadId, Option<&ThreadId>> = threads
+        .iter()
+        .map(|thread| (&thread.id, thread.parent_thread_id.as_ref()))
+        .collect();
+    let archived: HashSet<&ThreadId> = threads
+        .iter()
+        .filter(|thread| thread.archived)
+        .map(|thread| &thread.id)
+        .collect();
+    let hidden = |thread: &ThreadSnapshot| {
+        let mut seen = HashSet::new();
+        let mut current = Some(&thread.id);
+        while let Some(id) = current {
+            if archived.contains(id) {
+                return true;
+            }
+            if !seen.insert(id) {
+                break;
+            }
+            current = parents.get(id).copied().flatten();
+        }
+        false
+    };
+    let active = threads
+        .iter()
+        .filter(|thread| !hidden(thread))
+        .cloned()
+        .collect();
+    let archived_rows = threads
+        .iter()
+        .filter(|thread| thread.archived)
+        .cloned()
+        .collect();
+    (active, archived_rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +375,27 @@ mod tests {
         ];
         let rows = tree_rows(&threads, &TreeState::default());
         assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn archived_threads_and_their_descendants_leave_the_active_tree() {
+        let mut threads = vec![
+            snapshot("a", None),
+            snapshot("a1", Some("a")),
+            snapshot("a11", Some("a1")),
+            snapshot("b", None),
+            snapshot("b1", Some("b")),
+        ];
+        threads[0].archived = true;
+        threads[4].archived = true;
+        let (active, archived) = split_archived(&threads);
+        let ids = |list: &[ThreadSnapshot]| -> Vec<String> {
+            list.iter().map(|thread| thread.id.to_string()).collect()
+        };
+        assert_eq!(ids(&active), ["b"]);
+        assert_eq!(ids(&archived), ["a", "b1"]);
+        let (active, archived) = split_archived(&threads[3..4]);
+        assert_eq!(ids(&active), ["b"]);
+        assert!(archived.is_empty());
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gpui_kit::assets::IconName;
@@ -24,6 +25,7 @@ use crate::collab::CollabStore;
 use crate::collab_account::{AccountView, JoinEvent, JoinView};
 use crate::comments::CommentStore;
 use crate::copies::CopyPanel;
+use crate::disk_usage::{DiskUsageEvent, DiskUsageView, RemovalKind};
 use crate::keymap::{self, CONTEXT, fuzzy_rank};
 use crate::net::{DaemonClient, NetEvent};
 use crate::onboarding::{Link, OnboardingRequest};
@@ -55,6 +57,9 @@ enum PaletteTarget {
     CollabAccount,
     /// Fork the selected thread at this message ("Fork from here").
     ForkHere(trama_domain::ids::MessageId),
+    DiskUsage,
+    ArchiveSelected,
+    UnarchiveSelected,
 }
 
 pub struct Workspace {
@@ -87,6 +92,11 @@ pub struct Workspace {
     fork_view: Entity<crate::forks::ForkView>,
     /// Parent of a fork this window asked for; the fork opens when created.
     pending_fork: Option<ThreadId>,
+    /// "Disk usage" dialog body.
+    disk_usage: Entity<DiskUsageView>,
+    /// Archive / delete-copy requests in flight, to resend with `force`
+    /// after the daemon refuses and the user confirms.
+    pending_removals: HashMap<ThreadId, RemovalKind>,
     client: DaemonClient,
     connected: bool,
     _subscriptions: Vec<Subscription>,
@@ -135,6 +145,7 @@ impl Workspace {
         let join = cx.new(|cx| JoinView::new(join_store, window, cx));
         let composer_input = chat.read(cx).composer_input();
         let fork_view = cx.new(|cx| crate::forks::ForkView::new(window, cx));
+        let disk_usage = cx.new(|_| DiskUsageView::new());
 
         let subscriptions = vec![
             cx.observe(&collab, |this, collab, cx| {
@@ -231,6 +242,16 @@ impl Workspace {
                     }
                 },
             ),
+            cx.subscribe_in(
+                &disk_usage,
+                window,
+                |this, _, event: &DiskUsageEvent, window, cx| match event {
+                    DiskUsageEvent::Refresh => this.refresh_disk_usage(cx),
+                    DiskUsageEvent::Remove(thread_id, kind) => {
+                        this.request_removal(thread_id.clone(), *kind, false, window, cx);
+                    }
+                },
+            ),
             cx.observe(&subthread_bar, |_, _, cx| cx.notify()),
             cx.observe(&sidebar, |this, sidebar, cx| {
                 let threads: Vec<_> = sidebar
@@ -271,6 +292,7 @@ impl Workspace {
                 |this, _, event, window, cx| match event {
                     ProjectsEvent::StartDaemon => this.start_daemon(cx),
                     ProjectsEvent::OpenCollaboration => this.open_account(None, window, cx),
+                    ProjectsEvent::OpenDiskUsage => this.open_disk_usage(window, cx),
                 },
             ),
             cx.subscribe_in(&new_thread, window, |this, _, event, window, cx| {
@@ -360,6 +382,8 @@ impl Workspace {
             pending_subthread: None,
             fork_view,
             pending_fork: None,
+            disk_usage,
+            pending_removals: HashMap::new(),
             client,
             connected: false,
             _subscriptions: subscriptions,
@@ -588,6 +612,12 @@ impl Workspace {
             }
             SidebarEvent::JoinShared => self.open_join(window, cx),
             SidebarEvent::OpenInPane(thread) => self.open_pane(thread.clone(), false, cx),
+            SidebarEvent::ArchiveThread(thread_id) => {
+                self.request_removal(thread_id.clone(), RemovalKind::Archive, false, window, cx);
+            }
+            SidebarEvent::UnarchiveThread(thread_id) => {
+                self.unarchive(thread_id.clone(), window, cx);
+            }
         }
         cx.notify();
     }
@@ -737,6 +767,175 @@ impl Workspace {
         });
         self.projects
             .update(cx, |projects, cx| projects.focus_first(window, cx));
+    }
+
+    // -- disk usage and archiving -----------------------------------------
+
+    fn open_disk_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.connected {
+            return;
+        }
+        window.close_all_dialogs(cx);
+        self.disk_usage.update(cx, |view, _| view.visible = true);
+        self.refresh_disk_usage(cx);
+        let view = self.disk_usage.clone();
+        let closing = self.disk_usage.downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let closing = closing.clone();
+            dialog
+                .title("Disk usage")
+                .w(px(640.))
+                .on_close(move |_, _, cx| {
+                    let _ = closing.update(cx, |view, _| view.visible = false);
+                })
+                .child(view.clone())
+        });
+    }
+
+    /// Measure all workspaces' checkouts again (disk is shared by all).
+    fn refresh_disk_usage(&mut self, cx: &mut Context<Self>) {
+        if !self.disk_usage.read(cx).visible {
+            return;
+        }
+        if self
+            .client
+            .send(ClientMessage::GetDiskUsage { workspace_id: None })
+            == crate::net::SendStatus::Enqueued
+        {
+            self.disk_usage.update(cx, |view, cx| view.reset(cx));
+        }
+    }
+
+    /// Archive (removing checkouts) or delete a thread's copies. Without
+    /// `force` the daemon refuses when a copy holds unsaved work, and
+    /// [`Self::confirm_forced_removal`] asks before resending.
+    fn request_removal(
+        &mut self,
+        thread_id: ThreadId,
+        kind: RemovalKind,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.client.send(kind.message(thread_id.clone(), force))
+            == crate::net::SendStatus::Rejected
+        {
+            window.push_notification(
+                Notification::error("The daemon is not connected; nothing was removed."),
+                cx,
+            );
+            return;
+        }
+        self.disk_usage
+            .update(cx, |view, cx| view.set_pending(&thread_id, true, cx));
+        self.pending_removals.insert(thread_id, kind);
+    }
+
+    /// ⌘W: archive the selected thread and remove its checkouts.
+    fn archive_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.connected {
+            return;
+        }
+        let target = {
+            let onboarding = &self.sidebar.read(cx).onboarding;
+            onboarding
+                .selected_thread
+                .as_ref()
+                .and_then(|id| onboarding.thread(id))
+                .map(|thread| (thread.id.clone(), thread.archived))
+        };
+        match target {
+            Some((id, false)) => self.request_removal(id, RemovalKind::Archive, false, window, cx),
+            Some((_, true)) => {
+                window.push_notification(Notification::info("This thread is already archived."), cx)
+            }
+            None => window.push_notification(Notification::info("Select a thread to archive."), cx),
+        }
+    }
+
+    fn unarchive(&mut self, thread_id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .client
+            .send(ClientMessage::UnarchiveThread { thread_id })
+            == crate::net::SendStatus::Rejected
+        {
+            window.push_notification(
+                Notification::error("The daemon is not connected; the thread stays archived."),
+                cx,
+            );
+        }
+    }
+
+    fn selected_archived(&self, cx: &App) -> Option<bool> {
+        let onboarding = &self.sidebar.read(cx).onboarding;
+        onboarding
+            .selected_thread
+            .as_ref()
+            .and_then(|id| onboarding.thread(id))
+            .map(|thread| thread.archived)
+    }
+
+    /// The daemon refused to remove copies with unsaved work: show it and
+    /// resend with `force` on confirmation.
+    fn confirm_forced_removal(
+        &mut self,
+        thread_id: ThreadId,
+        checkouts: Vec<trama_protocol::CheckoutRemoval>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let kind = self
+            .pending_removals
+            .remove(&thread_id)
+            .unwrap_or(RemovalKind::Archive);
+        self.disk_usage
+            .update(cx, |view, cx| view.set_pending(&thread_id, false, cx));
+        let details = crate::disk_usage::refusal_details(&checkouts);
+        let description = format!(
+            "These copies hold work that is not in the source repository. Trama keeps a snapshot and restores it when the copy is recreated, but ignored files (build output, local config) are deleted.\n\n{details}"
+        );
+        let workspace = cx.weak_entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let workspace = workspace.clone();
+            let thread_id = thread_id.clone();
+            alert
+                .confirm()
+                .title(kind.confirm_title())
+                .description(description.clone())
+                .ok_text(kind.confirm_label())
+                .cancel_text("Keep")
+                .on_ok(move |_, window, cx| {
+                    let thread_id = thread_id.clone();
+                    let _ = workspace.update(cx, |this, cx| {
+                        this.request_removal(thread_id, kind, true, window, cx);
+                    });
+                    true
+                })
+        });
+    }
+
+    /// Replace the thread's snapshot in the sidebar (archive state changed).
+    fn upsert_thread_snapshot(
+        &mut self,
+        snapshot: trama_protocol::ThreadSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.onboarding.apply_subthread(snapshot);
+            cx.notify();
+        });
+    }
+
+    fn after_removal(&mut self, thread_id: &ThreadId, cx: &mut Context<Self>) {
+        self.pending_removals.remove(thread_id);
+        self.disk_usage
+            .update(cx, |view, cx| view.set_pending(thread_id, false, cx));
+        self.refresh_disk_usage(cx);
+        if self.sidebar.read(cx).onboarding.selected_thread.as_ref() == Some(thread_id) {
+            let _ = self.client.send(ClientMessage::GetThreadCheckouts {
+                thread_id: thread_id.clone(),
+            });
+        }
     }
 
     // -- shared threads -----------------------------------------------------
@@ -1082,6 +1281,24 @@ impl Workspace {
                 connected,
             ),
             (
+                "Disk usage",
+                IconName::HardDrive,
+                PaletteTarget::DiskUsage,
+                connected,
+            ),
+            (
+                "Archive this thread",
+                IconName::Archive,
+                PaletteTarget::ArchiveSelected,
+                connected && self.selected_archived(cx) == Some(false),
+            ),
+            (
+                "Unarchive this thread",
+                IconName::ArchiveRestore,
+                PaletteTarget::UnarchiveSelected,
+                connected && self.selected_archived(cx) == Some(true),
+            ),
+            (
                 "Prepare isolated checkout for this thread",
                 IconName::GitBranch,
                 PaletteTarget::PrepareCheckout,
@@ -1172,6 +1389,13 @@ impl Workspace {
             PaletteTarget::JoinShared => self.open_join(window, cx),
             PaletteTarget::CollabAccount => self.open_account(None, window, cx),
             PaletteTarget::ForkHere(message) => self.fork_here(message, cx),
+            PaletteTarget::DiskUsage => self.open_disk_usage(window, cx),
+            PaletteTarget::ArchiveSelected => self.archive_selected(window, cx),
+            PaletteTarget::UnarchiveSelected => {
+                if let Some(id) = self.sidebar.read(cx).onboarding.selected_thread.clone() {
+                    self.unarchive(id, window, cx);
+                }
+            }
         }
         cx.notify();
     }
@@ -1408,6 +1632,56 @@ impl Workspace {
                 self.copies
                     .update(cx, |copies, cx| copies.apply(&thread_id, checkouts, cx));
             }
+            DaemonMessage::DiskUsage { items, .. } => {
+                self.disk_usage.update(cx, |view, cx| view.apply(items, cx));
+            }
+            DaemonMessage::ThreadArchived { thread, removed } => {
+                let id = thread.id.clone();
+                let title = thread.title.clone();
+                self.upsert_thread_snapshot(thread, cx);
+                self.after_removal(&id, cx);
+                let freed = crate::disk_usage::freed_total(&removed)
+                    .map(|bytes| format!(" Freed {}.", crate::disk_usage::format_bytes(bytes)))
+                    .unwrap_or_default();
+                window.push_notification(
+                    Notification::success(format!(
+                        "Archived \u{201c}{title}\u{201d}.{freed} Unarchive it from the sidebar to recreate its checkouts."
+                    ))
+                    .title("Thread archived"),
+                    cx,
+                );
+            }
+            DaemonMessage::ThreadUnarchived(thread) => {
+                let title = thread.title.clone();
+                self.upsert_thread_snapshot(thread, cx);
+                self.refresh_disk_usage(cx);
+                window.push_notification(
+                    Notification::success(format!("Unarchived \u{201c}{title}\u{201d}."))
+                        .title("Thread restored"),
+                    cx,
+                );
+            }
+            DaemonMessage::ThreadCheckoutsDeleted { thread_id, removed } => {
+                self.after_removal(&thread_id, cx);
+                let freed = crate::disk_usage::freed_total(&removed)
+                    .map(|bytes| format!(" Freed {}.", crate::disk_usage::format_bytes(bytes)))
+                    .unwrap_or_default();
+                window.push_notification(
+                    Notification::success(format!(
+                        "Deleted {} cop{}.{freed} They are recreated when the thread needs them.",
+                        removed.len(),
+                        if removed.len() == 1 { "y" } else { "ies" }
+                    ))
+                    .title("Checkouts removed"),
+                    cx,
+                );
+            }
+            DaemonMessage::CheckoutRemovalRefused {
+                thread_id,
+                checkouts,
+            } => {
+                self.confirm_forced_removal(thread_id, checkouts, window, cx);
+            }
             DaemonMessage::Workspaces(list) => {
                 self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.onboarding.apply_workspaces(list);
@@ -1639,9 +1913,21 @@ impl Workspace {
             {
                 // The pending GetChanges failed (e.g. no last turn yet).
             }
+            DaemonMessage::Error { message, .. }
+                if self
+                    .disk_usage
+                    .update(cx, |view, cx| view.fail_loading(&message, cx)) =>
+            {
+                // The pending GetDiskUsage failed.
+            }
             DaemonMessage::Error { code, message } => {
                 self.pending_subthread = None;
                 self.pending_fork = None;
+                if !self.pending_removals.is_empty() {
+                    self.pending_removals.clear();
+                    self.disk_usage
+                        .update(cx, |view, cx| view.clear_pending(cx));
+                }
                 self.subthread_bar.update(cx, |bar, cx| bar.note_error(cx));
                 self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.onboarding.note_error(&code, &message);
@@ -2088,6 +2374,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &keymap::ShareThread, window, cx| {
                 this.open_share(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::ArchiveThread, window, cx| {
+                this.archive_selected(window, cx);
             }))
             .on_action(cx.listener(|this, _: &keymap::ToggleAppearance, _, cx| {
                 this.toggle_appearance(cx);

@@ -23,6 +23,8 @@ pub enum ProjectsEvent {
     StartDaemon,
     /// Open the collaboration account dialog.
     OpenCollaboration,
+    /// Open the checkout disk usage dialog.
+    OpenDiskUsage,
 }
 
 pub struct ProjectsPanel {
@@ -497,6 +499,27 @@ impl Render for ProjectsPanel {
                 ),
         );
 
+        let disk_section = section(
+            &p,
+            "Disk usage",
+            h_flex()
+                .gap(theme::sp(2.))
+                .items_center()
+                .child(div().flex_1().child(muted(
+                    &p,
+                    "Thread checkouts are copy-on-write clones. See what each one really costs, and archive threads or delete copies you no longer need.",
+                )))
+                .child(
+                    Button::new("projects-disk-usage")
+                        .icon(IconName::HardDrive)
+                        .label("Disk usage\u{2026}")
+                        .disabled(!connected)
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.emit(ProjectsEvent::OpenDiskUsage);
+                        })),
+                ),
+        );
+
         v_flex()
             .w_full()
             .gap(theme::sp(5.))
@@ -504,6 +527,7 @@ impl Render for ProjectsPanel {
             .child(projects_section)
             .child(repos_section)
             .child(checkout_section)
+            .child(disk_section)
             .child(collaboration_section)
     }
 }

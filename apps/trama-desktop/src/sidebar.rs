@@ -11,6 +11,7 @@ use gpui_kit::component::{
     Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
+    menu::{ContextMenuExt as _, PopupMenuItem},
     scroll::ScrollableElement as _,
     tooltip::Tooltip,
     v_flex,
@@ -65,6 +66,9 @@ pub enum SidebarEvent {
     JoinShared,
     /// ⌥-click: show this thread (a subagent) in the side pane.
     OpenInPane(ThreadId),
+    /// Archive a thread (context menu); the workspace sends the request.
+    ArchiveThread(ThreadId),
+    UnarchiveThread(ThreadId),
 }
 
 pub struct SidebarPanel {
@@ -79,6 +83,8 @@ pub struct SidebarPanel {
     pub collab: crate::collab::SidebarCollab,
     /// Collapsed threads and fully shown child lists.
     pub tree: crate::thread_tree::TreeState,
+    /// The "Archived" section is expanded (collapsed by default).
+    archived_open: bool,
 }
 
 impl SidebarPanel {
@@ -92,6 +98,7 @@ impl SidebarPanel {
             clear_thread_title: false,
             collab: Default::default(),
             tree: Default::default(),
+            archived_open: false,
         }
     }
 
@@ -183,7 +190,7 @@ impl Render for SidebarPanel {
         let connected = self.onboarding.connected();
         let workspaces = self.onboarding.workspaces.clone();
         let selected_workspace = self.onboarding.selected_workspace.clone();
-        let threads = self.onboarding.threads.clone();
+        let (threads, archived) = crate::thread_tree::split_archived(&self.onboarding.threads);
         let selected_thread = self.onboarding.selected_thread.clone();
         let can_thread = self.onboarding.can_create_thread();
 
@@ -345,12 +352,17 @@ impl Render for SidebarPanel {
                         .gap(theme::sp(1.))
                         .text_size(theme::text_sm())
                         .text_color(p.text_faint)
-                        .child(if can_thread {
+                        .child(if !archived.is_empty() {
+                            "No active threads."
+                        } else if can_thread {
                             "No threads yet."
                         } else {
                             "Add a repository to start a thread."
                         }),
                 );
+                if !archived.is_empty() {
+                    list = list.child(self.archived_section(&archived, &selected_thread, &p, cx));
+                }
                 continue;
             }
             for tree_row in crate::thread_tree::tree_rows(&threads, &self.tree) {
@@ -385,6 +397,9 @@ impl Render for SidebarPanel {
                     &p,
                     cx,
                 ));
+            }
+            if !archived.is_empty() {
+                list = list.child(self.archived_section(&archived, &selected_thread, &p, cx));
             }
         }
 
@@ -494,6 +509,8 @@ impl SidebarPanel {
         let click_id = id.clone();
         let toggle_id = id.clone();
         let copy_id = id.to_string();
+        let menu_id = id.clone();
+        let sidebar = cx.entity().downgrade();
         let subagent = thread
             .subagent
             .as_ref()
@@ -627,6 +644,123 @@ impl SidebarPanel {
                             }),
                     ),
             )
+            .context_menu(move |menu, _, _| {
+                let sidebar = sidebar.clone();
+                let id = menu_id.clone();
+                menu.item(
+                    PopupMenuItem::new("Archive thread")
+                        .icon(IconName::Archive)
+                        .on_click(move |_, _, cx| {
+                            let id = id.clone();
+                            let _ = sidebar.update(cx, |_, cx| {
+                                cx.emit(SidebarEvent::ArchiveThread(id));
+                            });
+                        }),
+                )
+            })
+    }
+
+    /// Archived threads of the selected project, collapsed by default.
+    fn archived_section(
+        &self,
+        archived: &[trama_protocol::ThreadSnapshot],
+        selected: &Option<ThreadId>,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let open = self.archived_open;
+        let mut section = v_flex().gap(px(1.)).child(
+            h_flex()
+                .id("sidebar-archived")
+                .h(px(26.))
+                .mt(theme::sp(2.))
+                .px(theme::sp(2.))
+                .gap(theme::sp(1.5))
+                .items_center()
+                .rounded(theme::radius())
+                .cursor_pointer()
+                .text_size(theme::text_xs())
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.text_faint)
+                .hover(|style| style.bg(p.hover).text_color(p.text_muted))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.archived_open = !this.archived_open;
+                    cx.notify();
+                }))
+                .child(
+                    Icon::new(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .with_size(px(12.)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .child(format!("Archived ({})", archived.len())),
+                ),
+        );
+        if !open {
+            return section;
+        }
+        for thread in archived {
+            let id = thread.id.clone();
+            let click_id = id.clone();
+            let restore_id = id.clone();
+            let is_selected = selected.as_ref() == Some(&id);
+            let group = SharedString::from(format!("archived-row-{id}"));
+            section = section.child(
+                h_flex()
+                    .id(SharedString::from(format!("archived-{id}")))
+                    .group(group.clone())
+                    .h(px(28.))
+                    .pl(theme::sp(2.) + px(14.))
+                    .pr(theme::sp(1.))
+                    .gap(theme::sp(2.))
+                    .items_center()
+                    .rounded(theme::radius())
+                    .cursor_pointer()
+                    .text_size(theme::text_ui())
+                    .when(is_selected, |this| this.bg(p.selected).text_color(p.text))
+                    .when(!is_selected, |this| {
+                        this.text_color(p.text_faint)
+                            .hover(|style| style.bg(p.hover).text_color(p.text_muted))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_thread(click_id.clone(), cx);
+                    }))
+                    .child(
+                        Icon::new(IconName::Archive)
+                            .with_size(px(12.))
+                            .text_color(p.text_faint),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(thread.title.clone()),
+                    )
+                    .child(
+                        h_flex()
+                            .opacity(0.)
+                            .group_hover(group, |style| style.opacity(1.))
+                            .child(
+                                Button::new(SharedString::from(format!("unarchive-{id}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::ArchiveRestore)
+                                    .tooltip("Unarchive (recreates its checkouts)")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.emit(SidebarEvent::UnarchiveThread(restore_id.clone()));
+                                    })),
+                            ),
+                    ),
+            );
+        }
+        section
     }
 }
 
