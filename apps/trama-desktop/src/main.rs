@@ -23,6 +23,7 @@ mod onboarding;
 mod presence;
 mod projects;
 mod share_dialog;
+mod side_pane;
 mod sidebar;
 mod slash;
 mod snapshot;

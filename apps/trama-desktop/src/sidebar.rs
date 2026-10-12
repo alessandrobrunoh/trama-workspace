@@ -63,6 +63,8 @@ pub enum SidebarEvent {
     OpenShared(SharedThreadListing),
     RefreshShared,
     JoinShared,
+    /// ⌥-click: show this thread (a subagent) in the side pane.
+    OpenInPane(ThreadId),
 }
 
 pub struct SidebarPanel {
@@ -540,8 +542,12 @@ impl SidebarPanel {
                 this.text_color(p.text_muted)
                     .hover(|style| style.bg(p.hover).text_color(p.text))
             })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.select_thread(click_id.clone(), cx);
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                if event.modifiers().alt {
+                    cx.emit(SidebarEvent::OpenInPane(click_id.clone()));
+                } else {
+                    this.select_thread(click_id.clone(), cx);
+                }
             }))
             .child(chevron)
             .child(

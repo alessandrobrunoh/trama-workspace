@@ -579,11 +579,15 @@ impl ChatPanel {
         let (thread, connected) = (self.selected_thread.clone(), self.connected);
         self.popup
             .update(cx, |popup, cx| popup.set_thread(thread.clone(), cx));
-        self.model_picker
-            .update(cx, |picker, cx| picker.set_thread(thread.clone(), cx));
-        self.terminals.update(cx, |terminals, cx| {
-            terminals.set_thread(thread, connected, cx)
-        });
+        // The side pane only talks to its subagent: no terminals, and the
+        // model is the parent's choice.
+        if !self.pane_mode {
+            self.model_picker
+                .update(cx, |picker, cx| picker.set_thread(thread.clone(), cx));
+            self.terminals.update(cx, |terminals, cx| {
+                terminals.set_thread(thread, connected, cx)
+            });
+        }
         self.open_snapshots.clear();
         self.clear_transcript();
         self.draft = None;
@@ -684,12 +688,13 @@ impl ChatPanel {
 
     pub fn handle_daemon(&mut self, message: DaemonMessage, cx: &mut Context<Self>) {
         if self.popup.update(cx, |popup, cx| popup.apply(&message, cx))
-            || self
-                .model_picker
-                .update(cx, |picker, cx| picker.apply(&message, cx))
-            || self
-                .terminals
-                .update(cx, |terminals, cx| terminals.apply(&message, cx))
+            || !self.pane_mode
+                && (self
+                    .model_picker
+                    .update(cx, |picker, cx| picker.apply(&message, cx))
+                    || self
+                        .terminals
+                        .update(cx, |terminals, cx| terminals.apply(&message, cx)))
         {
             return;
         }
@@ -1253,7 +1258,7 @@ impl ChatPanel {
 
     /// ⌃` and the composer's terminal button.
     pub fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.uses_daemon() {
+        if !self.uses_daemon() || self.pane_mode {
             return;
         }
         self.terminals
@@ -1266,7 +1271,7 @@ impl ChatPanel {
     /// `!command` in the composer: run it in a new terminal instead of
     /// sending a prompt. `true` when it did.
     fn run_bang_command(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if !self.uses_daemon() {
+        if !self.uses_daemon() || self.pane_mode {
             return false;
         }
         let Some(command) = self.popup.read(cx).bang_command() else {
@@ -1335,7 +1340,7 @@ impl ChatPanel {
         let open = terminals.is_open();
         let attachments = terminals.attachments();
         let mut tools = Vec::new();
-        if self.uses_daemon() {
+        if self.uses_daemon() && !self.pane_mode {
             tools.push(
                 h_flex()
                     .id("composer-terminal")
@@ -2822,11 +2827,12 @@ impl Render for ChatPanel {
             cost_usd_micros: self.cost_usd_micros,
             turns: self.turns,
             billing: self.session_info.as_ref().map(billing_badge),
-            model_picker: uses_daemon.then(|| self.model_picker.clone().into_any_element()),
+            model_picker: (uses_daemon && !self.pane_mode)
+                .then(|| self.model_picker.clone().into_any_element()),
             tools: composer_tools,
             header: composer_header,
         };
-        let terminals_open = uses_daemon && self.terminals.read(cx).is_open();
+        let terminals_open = uses_daemon && !self.pane_mode && self.terminals.read(cx).is_open();
         let strip = if show_composer && uses_daemon {
             self.pending_strip(&card_ctx.groups, &p, cx)
         } else {
@@ -2933,10 +2939,6 @@ impl ChatPanel {
     /// selected thread).
     pub fn set_pane_mode(&mut self, pane: bool) {
         self.pane_mode = pane;
-    }
-
-    pub fn is_pane(&self) -> bool {
-        self.pane_mode
     }
 
     /// The selected thread's checkouts, for code comments on diff lines.

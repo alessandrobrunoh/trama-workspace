@@ -29,6 +29,8 @@ pub enum NetCommand {
     Send(ClientMessage),
     SelectWorkspace(WorkspaceId),
     SelectThread(ThreadId),
+    /// The thread the side pane follows (a subagent), or none.
+    SelectPaneThread(Option<ThreadId>),
 }
 
 /// Whether [`DaemonClient::send`] wrote the message onto the live socket queue.
@@ -99,6 +101,13 @@ impl DaemonClient {
     pub fn select_thread(&self, thread_id: ThreadId) {
         let _ = self.commands.try_send(NetCommand::SelectThread(thread_id));
     }
+
+    /// Follow `thread_id` in the side pane (`None` stops).
+    pub fn select_pane_thread(&self, thread_id: Option<ThreadId>) {
+        let _ = self
+            .commands
+            .try_send(NetCommand::SelectPaneThread(thread_id));
+    }
 }
 
 /// `<app dir>/daemon.sock`; see [`trama_protocol::default_app_dir`].
@@ -151,6 +160,7 @@ pub fn start() -> (DaemonClient, DaemonEvents) {
 pub(crate) fn replay_messages(
     workspace: Option<WorkspaceId>,
     thread: Option<ThreadId>,
+    pane: Option<ThreadId>,
 ) -> Vec<ClientMessage> {
     let mut messages = vec![ClientMessage::ListWorkspaces];
     if let Some(workspace_id) = workspace {
@@ -167,7 +177,51 @@ pub(crate) fn replay_messages(
             thread_id: thread_id.clone(),
         });
         // Subscribing does not replay comments.
-        messages.push(ClientMessage::ListComments { thread_id });
+        messages.push(ClientMessage::ListComments {
+            thread_id: thread_id.clone(),
+        });
+        if pane.as_ref() == Some(&thread_id) {
+            return messages;
+        }
+    }
+    if let Some(pane) = pane {
+        messages.extend(follow_messages(pane));
+    }
+    messages
+}
+
+/// Subscribe to a thread with its checkouts and comments.
+fn follow_messages(thread_id: ThreadId) -> Vec<ClientMessage> {
+    vec![
+        ClientMessage::SubscribeThread {
+            thread_id: thread_id.clone(),
+        },
+        ClientMessage::GetThreadCheckouts {
+            thread_id: thread_id.clone(),
+        },
+        ClientMessage::ListComments { thread_id },
+    ]
+}
+
+/// Move the side pane's subscription from `previous` to `next`, leaving
+/// the selected thread's (`main`) alone: one connection holds one
+/// subscription per thread.
+pub(crate) fn pane_thread_messages(
+    previous: Option<ThreadId>,
+    next: Option<ThreadId>,
+    main: Option<&ThreadId>,
+) -> Vec<ClientMessage> {
+    if previous == next {
+        return Vec::new();
+    }
+    let mut messages = Vec::new();
+    if let Some(previous) = previous.filter(|previous| Some(previous) != main) {
+        messages.push(ClientMessage::UnsubscribeThread {
+            thread_id: previous,
+        });
+    }
+    if let Some(next) = next.filter(|next| Some(next) != main) {
+        messages.extend(follow_messages(next));
     }
     messages
 }
@@ -213,6 +267,7 @@ pub(crate) fn classify_welcome(accepted: bool, protocol_version: u32) -> Welcome
 struct SessionState {
     workspace: Option<WorkspaceId>,
     thread: Option<ThreadId>,
+    pane: Option<ThreadId>,
     write_tx: Option<mpsc::UnboundedSender<ClientMessage>>,
 }
 
@@ -221,6 +276,7 @@ impl SessionState {
         Self {
             workspace: None,
             thread: None,
+            pane: None,
             write_tx: None,
         }
     }
@@ -267,10 +323,10 @@ async fn net_loop(
                     let mut st = lock_state(&state);
                     st.write_tx = Some(write_tx.clone());
                     connected.store(true, Ordering::Release);
-                    (st.workspace.clone(), st.thread.clone())
+                    (st.workspace.clone(), st.thread.clone(), st.pane.clone())
                 };
 
-                for message in replay_messages(replay.0, replay.1) {
+                for message in replay_messages(replay.0, replay.1, replay.2) {
                     let _ = write_tx.send(message);
                 }
 
@@ -348,8 +404,33 @@ async fn dispatch_commands(
                 NetCommand::SelectThread(thread_id) => {
                     let previous = st.thread.clone();
                     st.thread = Some(thread_id.clone());
+                    // The pane cannot show the selected thread: stop
+                    // following it there first, so subscribing replays.
+                    let mut messages = Vec::new();
+                    if st.pane.as_ref() == Some(&thread_id) {
+                        st.pane = None;
+                        messages.push(ClientMessage::UnsubscribeThread {
+                            thread_id: thread_id.clone(),
+                        });
+                    }
+                    let keep = st.pane.clone();
+                    messages.extend(
+                        select_thread_messages(previous, thread_id).into_iter().filter(
+                            |message| !matches!(message, ClientMessage::UnsubscribeThread { thread_id } if Some(thread_id) == keep.as_ref()),
+                        ),
+                    );
                     if let Some(tx) = st.write_tx.as_ref() {
-                        for message in select_thread_messages(previous, thread_id) {
+                        for message in messages {
+                            let _ = tx.send(message);
+                        }
+                    }
+                    None
+                }
+                NetCommand::SelectPaneThread(next) => {
+                    let previous = std::mem::replace(&mut st.pane, next.clone());
+                    let messages = pane_thread_messages(previous, next, st.thread.as_ref());
+                    if let Some(tx) = st.write_tx.as_ref() {
+                        for message in messages {
                             let _ = tx.send(message);
                         }
                     }
@@ -511,7 +592,7 @@ mod tests {
         let workspace_id = WorkspaceId::from("ws");
         let thread_id = ThreadId::from("th");
         assert_eq!(
-            replay_messages(Some(workspace_id.clone()), Some(thread_id.clone())),
+            replay_messages(Some(workspace_id.clone()), Some(thread_id.clone()), None),
             vec![
                 ClientMessage::ListWorkspaces,
                 ClientMessage::ListThreads {
@@ -527,6 +608,47 @@ mod tests {
                 ClientMessage::ListComments { thread_id },
             ]
         );
+    }
+
+    #[test]
+    fn the_side_pane_follows_its_own_thread() {
+        let main = ThreadId::from("main");
+        let a = ThreadId::from("a");
+        let b = ThreadId::from("b");
+        let follow = |thread: &ThreadId| {
+            vec![
+                ClientMessage::SubscribeThread {
+                    thread_id: thread.clone(),
+                },
+                ClientMessage::GetThreadCheckouts {
+                    thread_id: thread.clone(),
+                },
+                ClientMessage::ListComments {
+                    thread_id: thread.clone(),
+                },
+            ]
+        };
+        assert_eq!(
+            pane_thread_messages(None, Some(a.clone()), Some(&main)),
+            follow(&a)
+        );
+        let mut moved = vec![ClientMessage::UnsubscribeThread {
+            thread_id: a.clone(),
+        }];
+        moved.extend(follow(&b));
+        assert_eq!(
+            pane_thread_messages(Some(a.clone()), Some(b.clone()), Some(&main)),
+            moved
+        );
+        assert!(pane_thread_messages(Some(a.clone()), Some(a.clone()), Some(&main)).is_empty());
+        // The selected thread's subscription is never touched.
+        assert!(pane_thread_messages(Some(main.clone()), None, Some(&main)).is_empty());
+        assert!(pane_thread_messages(None, Some(main.clone()), Some(&main)).is_empty());
+        // A reconnect follows both.
+        let replay = replay_messages(None, Some(main.clone()), Some(a.clone()));
+        assert_eq!(replay[replay.len() - 3..], follow(&a)[..]);
+        let same = replay_messages(None, Some(main.clone()), Some(main.clone()));
+        assert_eq!(same.len(), 4, "one subscription for one thread");
     }
 
     #[test]

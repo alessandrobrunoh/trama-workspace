@@ -60,6 +60,10 @@ enum PaletteTarget {
 pub struct Workspace {
     focus_handle: FocusHandle,
     chat: Entity<ChatPanel>,
+    /// A subagent's transcript beside the selected thread's.
+    pane: crate::side_pane::SidePane,
+    pane_chat: Entity<ChatPanel>,
+    pane_comments: Entity<CommentStore>,
     copies: Entity<CopyPanel>,
     sidebar: Entity<SidebarPanel>,
     projects: Entity<ProjectsPanel>,
@@ -100,6 +104,14 @@ impl Workspace {
         let chat_client = client.clone();
         let chat_comments = comments.clone();
         let chat = cx.new(|cx| ChatPanel::new(window, cx, chat_client, chat_comments));
+        let pane_comments = cx.new(|_| CommentStore::new(client.clone()));
+        let pane_client = client.clone();
+        let pane_store = pane_comments.clone();
+        let pane_chat = cx.new(|cx| {
+            let mut chat = ChatPanel::new(window, cx, pane_client, pane_store);
+            chat.set_pane_mode(true);
+            chat
+        });
         let copies = cx.new(|_| CopyPanel::new());
         let sidebar = cx.new(|_| SidebarPanel::new());
         let projects = cx.new(|cx| ProjectsPanel::new(sidebar.clone(), window, cx));
@@ -183,11 +195,27 @@ impl Workspace {
                 &chat,
                 window,
                 |this, _, event: &ChatEvent, window, cx| match event {
-                    ChatEvent::OpenThread(thread) | ChatEvent::OpenInPane(thread) => {
+                    ChatEvent::OpenThread(thread) => {
                         let thread = thread.clone();
                         this.sidebar
                             .update(cx, |sidebar, cx| sidebar.select_thread(thread, cx));
                     }
+                    ChatEvent::OpenInPane(thread) => this.open_pane(thread.clone(), false, cx),
+                    ChatEvent::Fork(target) => this.open_fork(target.clone(), window, cx),
+                },
+            ),
+            cx.observe(&pane_chat, |_, _, cx| cx.notify()),
+            cx.subscribe_in(
+                &pane_chat,
+                window,
+                |this, _, event: &ChatEvent, window, cx| match event {
+                    ChatEvent::OpenThread(thread) => {
+                        let thread = thread.clone();
+                        this.sidebar
+                            .update(cx, |sidebar, cx| sidebar.select_thread(thread, cx));
+                    }
+                    // A subagent's own subagent: stack it in the pane.
+                    ChatEvent::OpenInPane(thread) => this.open_pane(thread.clone(), true, cx),
                     ChatEvent::Fork(target) => this.open_fork(target.clone(), window, cx),
                 },
             ),
@@ -221,6 +249,11 @@ impl Workspace {
                     &sidebar.read(cx).onboarding.threads,
                 );
                 this.chat.update(cx, |chat, cx| {
+                    chat.set_known_threads(threads.clone(), cx);
+                    chat.set_thread_models(models.clone(), cx);
+                    chat.set_thread_index(index.clone(), cx);
+                });
+                this.pane_chat.update(cx, |chat, cx| {
                     chat.set_known_threads(threads, cx);
                     chat.set_thread_models(models, cx);
                     chat.set_thread_index(index, cx);
@@ -275,6 +308,9 @@ impl Workspace {
         Self {
             focus_handle,
             chat,
+            pane: Default::default(),
+            pane_chat,
+            pane_comments,
             copies,
             sidebar,
             projects,
@@ -485,6 +521,9 @@ impl Workspace {
         if self.drawer_open && self.changes.read(cx).has_selection() {
             self.changes
                 .update(cx, |changes, cx| changes.comment_on_selection(window, cx));
+        } else if self.pane.is_open() && self.pane_chat.read(cx).has_comment_target() {
+            self.pane_chat
+                .update(cx, |chat, cx| chat.comment_on_selection(window, cx));
         } else {
             self.chat
                 .update(cx, |chat, cx| chat.comment_on_selection(window, cx));
@@ -517,6 +556,7 @@ impl Workspace {
                     .update(cx, |collab, cx| collab.refresh_shared(cx));
             }
             SidebarEvent::JoinShared => self.open_join(window, cx),
+            SidebarEvent::OpenInPane(thread) => self.open_pane(thread.clone(), false, cx),
         }
         cx.notify();
     }
@@ -524,10 +564,13 @@ impl Workspace {
     fn dispatch_request(&mut self, request: OnboardingRequest, cx: &mut Context<Self>) {
         match request {
             OnboardingRequest::SelectWorkspace { workspace_id } => {
+                self.close_pane(cx);
                 self.client.select_workspace(workspace_id);
                 self.focus_thread(None, cx);
             }
             OnboardingRequest::SelectThread { thread_id } => {
+                // Before subscribing: the pane may follow this thread.
+                self.close_pane(cx);
                 self.client.select_thread(thread_id.clone());
                 self.focus_thread(Some(thread_id), cx);
             }
@@ -537,6 +580,71 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    // -- side pane --------------------------------------------------------
+
+    /// Show `thread` (a subagent) beside the selected thread; `push` keeps
+    /// the one shown to go back to.
+    fn open_pane(&mut self, thread: ThreadId, push: bool, cx: &mut Context<Self>) {
+        let main = self.sidebar.read(cx).onboarding.selected_thread.clone();
+        let change = if push {
+            self.pane.push(thread, main.as_ref())
+        } else {
+            self.pane.open(thread, main.as_ref())
+        };
+        self.apply_pane_change(change, cx);
+    }
+
+    fn close_pane(&mut self, cx: &mut Context<Self>) {
+        let change = self.pane.close();
+        self.apply_pane_change(change, cx);
+    }
+
+    fn pane_back(&mut self, cx: &mut Context<Self>) {
+        let change = self.pane.go_back();
+        self.apply_pane_change(change, cx);
+    }
+
+    /// Move the pane's subscription, comments and transcript to the thread
+    /// it shows now.
+    fn apply_pane_change(
+        &mut self,
+        change: Option<crate::side_pane::PaneChange>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(change) = change else {
+            return;
+        };
+        self.client.select_pane_thread(change.to.clone());
+        let thread = change.to;
+        self.pane_comments.update(cx, |comments, cx| {
+            comments.set_thread(None, cx);
+            comments.set_thread(thread.clone(), cx);
+        });
+        self.pane_chat.update(cx, |chat, cx| {
+            chat.set_thread(None, cx);
+            chat.set_thread(thread, cx);
+        });
+        cx.notify();
+    }
+
+    /// What the pane's chrome says about the thread it shows.
+    fn pane_info(&self, cx: &App) -> Option<crate::side_pane::PaneInfo> {
+        let id = self.pane.thread()?;
+        let snapshot = self.sidebar.read(cx).onboarding.thread(id);
+        let title = snapshot
+            .map(|thread| thread.title.clone())
+            .unwrap_or_else(|| "Subagent".into());
+        let subagent = snapshot.and_then(|thread| thread.subagent.as_ref());
+        Some(crate::side_pane::PaneInfo {
+            title,
+            status: subagent.map(|subagent| subagent.status),
+            controlled: snapshot.is_some_and(|thread| thread.parent_thread_id.is_some()),
+            icon: subagent
+                .map(|subagent| crate::subagents::profile_icon(subagent.spawned_by.profile))
+                .unwrap_or(IconName::Bot),
+        })
     }
 
     fn focus_thread(&mut self, thread_id: Option<ThreadId>, cx: &mut Context<Self>) {
@@ -1076,6 +1184,9 @@ impl Workspace {
                 self.chat.update(cx, |chat, cx| {
                     chat.set_connected(true, cx);
                 });
+                self.pane_chat.update(cx, |chat, cx| {
+                    chat.set_connected(true, cx);
+                });
                 self.collab.update(cx, |collab, cx| collab.on_connected(cx));
             }
             NetEvent::Disconnected => {
@@ -1086,6 +1197,9 @@ impl Workspace {
                 self.chat.update(cx, |chat, cx| {
                     chat.set_connected(false, cx);
                 });
+                self.pane_chat.update(cx, |chat, cx| {
+                    chat.set_connected(false, cx);
+                });
             }
             NetEvent::ProtocolMismatch { daemon_protocol } => {
                 self.connected = false;
@@ -1093,6 +1207,9 @@ impl Workspace {
                     sidebar.set_link(Link::ProtocolMismatch { daemon_protocol }, cx);
                 });
                 self.chat.update(cx, |chat, cx| {
+                    chat.set_connected(false, cx);
+                });
+                self.pane_chat.update(cx, |chat, cx| {
                     chat.set_connected(false, cx);
                 });
             }
@@ -1119,6 +1236,9 @@ impl Workspace {
             });
             if let Some(text) = restore {
                 self.chat.update(cx, |chat, cx| {
+                    chat.restore_prompt(&thread_id, &text, window, cx);
+                });
+                self.pane_chat.update(cx, |chat, cx| {
                     chat.restore_prompt(&thread_id, &text, window, cx);
                 });
             }
@@ -1205,10 +1325,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self
+        let main_comment = self
             .comments
-            .update(cx, |comments, cx| comments.apply(&message, cx))
-        {
+            .update(cx, |comments, cx| comments.apply(&message, cx));
+        let pane_comment = self
+            .pane_comments
+            .update(cx, |comments, cx| comments.apply(&message, cx));
+        if main_comment || pane_comment {
             return;
         }
         if self
@@ -1245,6 +1368,12 @@ impl Workspace {
                 thread_id,
                 checkouts,
             } => {
+                self.chat.update(cx, |chat, cx| {
+                    chat.set_checkouts(&thread_id, &checkouts, cx)
+                });
+                self.pane_chat.update(cx, |chat, cx| {
+                    chat.set_checkouts(&thread_id, &checkouts, cx)
+                });
                 self.copies
                     .update(cx, |copies, cx| copies.apply(&thread_id, checkouts, cx));
             }
@@ -1492,6 +1621,12 @@ impl Workspace {
                 });
             }
             other => {
+                if self.pane.is_open() {
+                    let copy = other.clone();
+                    self.pane_chat.update(cx, |chat, cx| {
+                        chat.handle_daemon(copy, cx);
+                    });
+                }
                 self.chat.update(cx, |chat, cx| {
                     chat.handle_daemon(other, cx);
                 });
@@ -1809,14 +1944,82 @@ impl ThemeIsDark for App {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = theme::palette(cx);
         let link = self.sidebar.read(cx).onboarding.link().clone();
         let alert = self.sidebar.read(cx).onboarding.alert().map(str::to_string);
         let can_start = self.sidebar.read(cx).onboarding.can_start_daemon();
         let daemon_feedback = self.sidebar.read(cx).onboarding.daemon_feedback.clone();
 
-        let center = if matches!(link, Link::Online) {
+        let online = matches!(link, Link::Online);
+        // The room the transcript and the side pane share.
+        let viewport = f32::from(window.viewport_size().width);
+        let drawer = if self.drawer_open {
+            f32::from(theme::drawer_width())
+        } else {
+            0.
+        };
+        let available = viewport - f32::from(theme::sidebar_width()) - drawer;
+        let pane = match (online, self.pane_info(cx)) {
+            (true, Some(info)) => {
+                let weak = cx.weak_entity();
+                let actions = crate::side_pane::PaneActions {
+                    back: Box::new({
+                        let weak = weak.clone();
+                        move |_, _, cx| {
+                            let _ = weak.update(cx, |this, cx| this.pane_back(cx));
+                        }
+                    }),
+                    expand: Box::new({
+                        let weak = weak.clone();
+                        move |_, _, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.pane.toggle_expanded();
+                                cx.notify();
+                            });
+                        }
+                    }),
+                    open_main: Box::new({
+                        let weak = weak.clone();
+                        move |_, _, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                if let Some(thread) = this.pane.thread().cloned() {
+                                    this.sidebar.update(cx, |sidebar, cx| {
+                                        sidebar.select_thread(thread, cx)
+                                    });
+                                }
+                            });
+                        }
+                    }),
+                    close: Box::new({
+                        let weak = weak.clone();
+                        move |_, _, cx| {
+                            let _ = weak.update(cx, |this, cx| this.close_pane(cx));
+                        }
+                    }),
+                    start_resize: Box::new(move |_, _, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.pane.resizing = true;
+                            cx.notify();
+                        });
+                    }),
+                };
+                let running = self.pane_chat.read(cx).is_running();
+                let width = (!self.pane.expanded).then(|| self.pane.shown_width(available));
+                Some(crate::side_pane::render(
+                    &self.pane,
+                    &info,
+                    running,
+                    width,
+                    self.pane_chat.clone().into(),
+                    actions,
+                    &p,
+                ))
+            }
+            _ => None,
+        };
+        let center_hidden = pane.is_some() && self.pane.expanded;
+        let center = if online {
             v_flex()
                 .size_full()
                 .child(self.subthread_bar.clone())
@@ -1932,6 +2135,24 @@ impl Render for Workspace {
                 h_flex()
                     .flex_1()
                     .min_h_0()
+                    .when(self.pane.resizing, |this| {
+                        this.cursor_col_resize()
+                            .on_mouse_move(cx.listener(
+                                move |this, event: &MouseMoveEvent, window, cx| {
+                                    let right = f32::from(window.viewport_size().width) - drawer;
+                                    this.pane
+                                        .resize(right - f32::from(event.position.x), available);
+                                    cx.notify();
+                                },
+                            ))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.pane.resizing = false;
+                                    cx.notify();
+                                }),
+                            )
+                    })
                     .child(
                         div()
                             .w(theme::sidebar_width())
@@ -1941,7 +2162,10 @@ impl Render for Workspace {
                             .border_color(p.border)
                             .child(self.sidebar.clone()),
                     )
-                    .child(div().flex_1().min_w_0().h_full().child(center))
+                    .when(!center_hidden, |this| {
+                        this.child(div().flex_1().min_w_0().h_full().child(center))
+                    })
+                    .children(pane)
                     .when(self.drawer_open, |this| {
                         let body: AnyView = match self.drawer_tab {
                             DrawerTab::Changes => self.changes.clone().into(),
