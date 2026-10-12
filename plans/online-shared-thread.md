@@ -2,9 +2,15 @@
 
 ## Scope confirmed by the user
 
-Start with A: multiple authenticated people share a thread online and one
-authorized runner executes its commands. Concurrent filesystem replication
-between participants is not part of this first delivery.
+Start with A: multiple authenticated people share a thread online. Each turn
+runs on the machine of the person who pressed Send, using that person's own
+`claude` login (ADR 0008). The service replicates conversation, drafts,
+comments, verdicts and change summaries; it never routes one participant's
+prompt to another participant's runner or subscription. A runner credential
+belongs to exactly one user and may only claim commands authored by that
+user. Participants without a runner can read, comment and review, but their
+sends stay pending until their own runner is online. Concurrent filesystem
+replication between participants is not part of this first delivery.
 
 Identity is standalone: TramaWorkspace does not reuse Trama accounts, login,
 sessions or API tokens. The user selected simple username/password authentication.
@@ -42,7 +48,8 @@ Production path:
 2. Service checks thread membership on each request and event delivery.
 3. A transaction stores command ID, user message and ordered event.
 4. Clients catch up from a durable cursor, then receive live events.
-5. An assigned runner connects outbound and claims commands conditionally.
+5. The sender's own runner connects outbound and conditionally claims only
+   commands that sender authored.
 6. Runner reports events/results with command IDs; clients follow activity.
 
 ## Boundaries
@@ -77,11 +84,21 @@ Production path:
   duplicates or a catch-up/live gap.
 - Uninvited or revoked clients cannot list/read/subscribe/send/interrupt or
   continue receiving events.
-- Retrying a command ID yields one message and one authorized runner claim.
-- A second runner cannot claim the assigned command.
+- Retrying a command ID yields one message and one claim by the sender's runner.
+- A runner of another user cannot claim the command; a second runner of the
+  sender cannot claim it once claimed.
 - A crash after claim becomes visibly ambiguous, with no automatic retry.
+
+## Status
+
+The server side is implemented in `apps/trama-collab` (ADR 0009): thread ACLs
+with invite and revocable link access, the durable per-thread event log with
+cursor catch-up and live WebSocket delivery, ephemeral drafts and presence,
+idempotent commands, and runner credentials with owner-only conditional
+claims and ambiguous-on-loss. Wire types are in `crates/trama-collab-protocol`.
 
 ## Verification limits
 
-This is a plan, not working multiplayer. No service, public endpoint,
-authentication integration or production deployment has been added yet.
+Desktop and daemon integration are not built: no client renders shared
+threads and the daemon does not act as a runner yet. The service remains
+loopback-only with no public endpoint or production deployment.
