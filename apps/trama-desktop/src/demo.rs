@@ -206,6 +206,7 @@ pub fn threads() -> Vec<ThreadSnapshot> {
             review_verdict: None,
             model: None,
             depth: 0,
+            archived: false,
             subagent: None,
         },
         ThreadSnapshot {
@@ -217,6 +218,7 @@ pub fn threads() -> Vec<ThreadSnapshot> {
             review_verdict: None,
             model: Some("claude-opus-4-1".into()),
             depth: 1,
+            archived: false,
             subagent: Some(SubagentSnapshot {
                 spawned_by: SpawnedBy {
                     parent_thread_id: ThreadId::from(PARENT),
