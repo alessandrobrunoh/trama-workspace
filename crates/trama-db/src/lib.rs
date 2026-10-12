@@ -7,6 +7,7 @@
 //! Open/migrate stay synchronous so a runtime is not required to construct
 //! the store. Concurrent async calls serialize on the mutex.
 
+mod activity;
 mod agents;
 mod checkouts;
 mod codec;

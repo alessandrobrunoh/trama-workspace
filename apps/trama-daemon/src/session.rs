@@ -1,5 +1,8 @@
 //! Persistent session manager: TramaDB + injected `AgentAdapter`.
 
+mod activity;
+#[cfg(test)]
+mod activity_tests;
 mod agents;
 #[cfg(test)]
 mod agents_tests;
@@ -88,6 +91,9 @@ struct ThreadRuntime {
     comments_delivered_with: Option<MessageId>,
     /// Transcript uuid of the in-flight turn's last assistant entry.
     last_claude_uuid: Option<String>,
+    /// Tool calls and thinking of the in-flight turn, stored with the
+    /// message that ends it.
+    activity: trama_domain::activity::ActivityLog,
 }
 
 /// A permission request blocking a Claude Code hook process. The hook's
@@ -823,20 +829,28 @@ impl SessionManager {
         }
         let mut history = self.inherited_messages(thread_id).await?;
         history.extend(self.db.list_messages_by_thread(thread_id).await?);
+        let frames = self.history_frames(thread_id, history).await;
+        // Registered and replayed under one lock: agent events (and the
+        // in-flight turn's activity, updated with them) cannot slip between
+        // the replay and the live stream.
         let id = {
             let mut inner = self.lock();
             let id = SubscriptionId(inner.next_sub);
             inner.next_sub += 1;
             let thread = inner.threads.entry(thread_id.clone()).or_default();
             thread.subscribers.push(Subscriber { id, tx: tx.clone() });
+            for frame in frames {
+                let _ = tx.send(frame);
+            }
+            if thread.reservation == Some(Reservation::Turn) {
+                let _ = tx.send(DaemonMessage::TurnActivity {
+                    thread_id: thread_id.clone(),
+                    message_id: None,
+                    items: thread.activity.items().to_vec(),
+                });
+            }
             id
         };
-        for message in history {
-            let _ = tx.send(DaemonMessage::MessageAppended {
-                thread_id: thread_id.clone(),
-                message,
-            });
-        }
         let totals = self.db.usage_totals_for_thread(thread_id).await?;
         if usage_report_present(&totals) {
             let _ = tx.send(DaemonMessage::UsageSnapshot {
@@ -1005,6 +1019,7 @@ impl SessionManager {
             thread.acc_text.clear();
             thread.comments_delivered_with = None;
             thread.last_claude_uuid = None;
+            thread.activity = Default::default();
         }
         // Reject a prompt that cannot run before it is stored, so a failed send
         // is not replayed or started later without another user action. The
@@ -1529,6 +1544,18 @@ impl SessionManager {
     /// broadcast it, so the outcome is visible after a restart. A store
     /// failure is logged; it must not lose the in-memory turn state cleanup.
     pub(crate) async fn append_system_notice(&self, thread_id: &ThreadId, text: String) {
+        self.append_system_notice_with_activity(thread_id, text, Vec::new())
+            .await;
+    }
+
+    /// [`Self::append_system_notice`] for a turn that ended without an
+    /// answer: `activity` (what the turn did) is stored with the notice.
+    async fn append_system_notice_with_activity(
+        &self,
+        thread_id: &ThreadId,
+        text: String,
+        activity: Vec<trama_domain::activity::ActivityItem>,
+    ) {
         let message = Message {
             id: MessageId::generate(),
             thread_id: thread_id.clone(),
@@ -1558,6 +1585,8 @@ impl SessionManager {
         {
             crate::log::warn(format!("failed to append MessageAdded: {err}"));
         }
+        self.record_activity(thread_id, &message.id, Actor::System, activity)
+            .await;
         self.broadcast(
             thread_id,
             DaemonMessage::MessageAppended {
@@ -1977,13 +2006,7 @@ impl SessionManager {
             _ => None,
         };
 
-        self.broadcast(
-            thread_id,
-            DaemonMessage::AgentEventEnvelope {
-                thread_id: thread_id.clone(),
-                event,
-            },
-        );
+        self.broadcast_agent_event(thread_id, event);
 
         if let Some((num_turns, cost_usd_micros)) = turn_completed {
             self.finish_turn(thread_id, num_turns, cost_usd_micros)
@@ -1998,7 +2021,7 @@ impl SessionManager {
     /// and release the thread. Once a turn has completed, its reservation is
     /// already released, so a late `Failed` event appends nothing.
     async fn finish_failed_turn(&self, thread_id: &ThreadId, failure: &str) {
-        let (reserved, interrupted, partial) = {
+        let (reserved, interrupted, partial, activity) = {
             let mut inner = self.lock();
             match inner.threads.get_mut(thread_id) {
                 Some(thread) if thread.reservation == Some(Reservation::Turn) => {
@@ -2007,9 +2030,10 @@ impl SessionManager {
                         true,
                         thread.interrupt_requested,
                         std::mem::take(&mut thread.acc_text),
+                        std::mem::take(&mut thread.activity),
                     )
                 }
-                _ => (false, false, String::new()),
+                _ => (false, false, String::new(), Default::default()),
             }
         };
         if !reserved {
@@ -2026,7 +2050,8 @@ impl SessionManager {
             text.push_str("\n\nPartial output before the failure:\n");
             text.push_str(&partial);
         }
-        self.append_system_notice(thread_id, text).await;
+        self.append_system_notice_with_activity(thread_id, text, activity.into_items())
+            .await;
         self.after_turn(thread_id, agents::TurnEnd::Failed(failure.to_owned()));
     }
 
@@ -2036,13 +2061,14 @@ impl SessionManager {
         num_turns: u32,
         cost_usd_micros: Option<u64>,
     ) {
-        let (text, session, claude_uuid) = {
+        let (text, session, claude_uuid, activity) = {
             let mut inner = self.lock();
             match inner.threads.get_mut(thread_id) {
                 Some(thread) => (
                     std::mem::take(&mut thread.acc_text),
                     thread.live_session.clone(),
                     thread.last_claude_uuid.take(),
+                    std::mem::take(&mut thread.activity),
                 ),
                 None => return,
             }
@@ -2083,6 +2109,13 @@ impl SessionManager {
 
         let answer_id = assistant.id.clone();
         if persisted.is_ok() {
+            self.record_activity(
+                thread_id,
+                &answer_id,
+                assistant.actor.clone(),
+                activity.into_items(),
+            )
+            .await;
             // Before the turn is released: no other turn can edit meanwhile.
             self.record_turn_checkpoint(thread_id, &answer_id).await;
         }
@@ -2150,7 +2183,7 @@ impl SessionManager {
     /// the stream closes after a completed (or failed) turn, nothing is
     /// appended and only the live session is dropped.
     async fn on_pump_closed(&self, thread_id: &ThreadId) {
-        let (in_flight, partial) = {
+        let (in_flight, partial, activity) = {
             let mut inner = self.lock();
             let token = inner
                 .threads
@@ -2166,12 +2199,16 @@ impl SessionManager {
                     thread.session_info = None;
                     if thread.reservation == Some(Reservation::Turn) {
                         thread.reservation = None;
-                        (true, std::mem::take(&mut thread.acc_text))
+                        (
+                            true,
+                            std::mem::take(&mut thread.acc_text),
+                            std::mem::take(&mut thread.activity),
+                        )
                     } else {
-                        (false, String::new())
+                        (false, String::new(), Default::default())
                     }
                 }
-                None => (false, String::new()),
+                None => (false, String::new(), Default::default()),
             }
         };
         // A hook still waiting would otherwise block until its timeout.
@@ -2191,7 +2228,8 @@ impl SessionManager {
             text.push_str("\n\nPartial output before the session ended:\n");
             text.push_str(&partial);
         }
-        self.append_system_notice(thread_id, text).await;
+        self.append_system_notice_with_activity(thread_id, text, activity.into_items())
+            .await;
         self.broadcast(
             thread_id,
             DaemonMessage::AgentEventEnvelope {

@@ -1,3 +1,4 @@
+use crate::activity::ActivityItem;
 use crate::agent::ApprovalDecision;
 use crate::checkpoint::Checkpoint;
 use crate::checkpoint::RepoState;
@@ -227,6 +228,14 @@ pub enum DomainEvent {
         at_message_id: MessageId,
         checkpoint_id: Option<CheckpointId>,
     },
+    /// The tool calls, thinking and subagent lifecycle of the turn that
+    /// `message_id` ends (its answer, or the notice of a failed turn),
+    /// bounded in size. Recorded on the thread aggregate.
+    TurnActivityRecorded {
+        thread_id: ThreadId,
+        message_id: MessageId,
+        items: Vec<ActivityItem>,
+    },
 }
 
 impl DomainEvent {
@@ -256,6 +265,7 @@ impl DomainEvent {
             Self::SubagentStatusChanged { .. } => "subagent.status_changed",
             Self::AgentMessageSent { .. } => "agent.message_sent",
             Self::ThreadForkedAtMessage { .. } => "thread.forked_at_message",
+            Self::TurnActivityRecorded { .. } => "turn.activity_recorded",
         }
     }
 }
@@ -614,6 +624,18 @@ mod tests {
                 },
                 Aggregate::Thread { id: sub },
                 "thread.forked_at_message",
+            ),
+            (
+                DomainEvent::TurnActivityRecorded {
+                    thread_id: th.id.clone(),
+                    message_id: MessageId::from("m6"),
+                    items: vec![ActivityItem::Thinking {
+                        text: "plan".into(),
+                        truncated: false,
+                    }],
+                },
+                Aggregate::Thread { id: th.id.clone() },
+                "turn.activity_recorded",
             ),
         ]
     }

@@ -35,7 +35,9 @@
 //! MCP helper's [`ClientMessage::McpToolCall`] /
 //! [`DaemonMessage::McpToolResult`], [`DaemonMessage::SubagentStatusChanged`],
 //! `depth` and `subagent` in thread snapshots, message annotations), nesting
-//! at any depth, and [`ClientMessage::ForkThread`] at a message. Each bump is
+//! at any depth, and [`ClientMessage::ForkThread`] at a message. **10** adds
+//! [`DaemonMessage::TurnActivity`]: a turn's stored tool calls and thinking,
+//! replayed on subscribe before the message that ends the turn. Each bump is
 //! transport-only. Persisted domain ids and SQLite rows are not rewritten.
 //!
 //! A version mismatch fails the handshake (`Welcome.accepted = false`). Extra object
@@ -46,6 +48,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::PathBuf;
 
+pub use trama_domain::activity::ActivityItem;
 pub use trama_domain::agent::{AgentEvent, ApprovalDecision, BillingSource, UsageReport};
 pub use trama_domain::comment::{AnchorStatus, CodeAnchor, CommentDelivery, CommentTarget};
 pub use trama_domain::ids::{CommentId, MessageId, RepositoryId, ThreadId, WorkspaceId};
@@ -66,7 +69,10 @@ pub use trama_collab_protocol::{
 
 /// Wire protocol version carried in `Hello` / `Welcome`.
 ///
-/// Version 9 adds subagents spawned through Trama's MCP tools
+/// Version 10 adds `TurnActivity`: the bounded tool calls, thinking and
+/// subagent lifecycle of each stored turn (and of the turn in flight), sent
+/// on subscribe so tool views survive restarts.
+/// Version 9 added subagents spawned through Trama's MCP tools
 /// (`McpToolCall`, `McpToolResult`, `SubagentStatusChanged`, `depth` and
 /// `subagent` in `ThreadSnapshot`, `Message::annotation`), subthreads of
 /// subthreads at any depth, and `ForkThread` (fork at a message: the
@@ -91,7 +97,7 @@ pub use trama_collab_protocol::{
 /// Version 4 added the Claude approval channel and 3 thread checkout
 /// discovery. It does not migrate stored data; peers with a different version
 /// are rejected at handshake time.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Environment variable that relocates the whole app-data directory (socket,
 /// database, config, legacy checkouts). Use it for isolated test instances
@@ -885,6 +891,18 @@ pub enum DaemonMessage {
         status: SubagentStatus,
         detail: Option<String>,
     },
+    /// Sent on subscribe only (live clients already saw the events): the
+    /// tool calls, thinking and subagent lifecycle of the turn that
+    /// `message_id` ends, right before that message's `MessageAppended`.
+    /// `message_id: None` is the turn in flight (what it did so far), sent
+    /// after the history; its later steps arrive as agent events. Inputs and
+    /// outputs are bounded ([`trama_domain::activity`]); unfinished calls
+    /// of a stored turn have `finished: false`.
+    TurnActivity {
+        thread_id: ThreadId,
+        message_id: Option<MessageId>,
+        items: Vec<ActivityItem>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1337,8 +1355,58 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_nine() {
-        assert_eq!(PROTOCOL_VERSION, 9);
+    fn protocol_version_is_ten() {
+        assert_eq!(PROTOCOL_VERSION, 10);
+    }
+
+    #[test]
+    fn turn_activity_contract_shape() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let stored = DaemonMessage::TurnActivity {
+            thread_id: thread_id(),
+            message_id: Some(MessageId::from("m1")),
+            items: vec![
+                ActivityItem::Thinking {
+                    text: "plan".into(),
+                    truncated: false,
+                },
+                ActivityItem::ToolCall {
+                    tool_use_id: "toolu_1".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "ls"}),
+                    output: Some(serde_json::json!("a")),
+                    is_error: false,
+                    finished: true,
+                    started_at: at,
+                    finished_at: Some(at),
+                    truncated: false,
+                },
+            ],
+        };
+        roundtrip_json(&stored);
+        let json = serde_json::to_value(&stored).unwrap();
+        assert_eq!(json["type"], "turn_activity");
+        assert_eq!(json["payload"]["message_id"], "m1");
+        assert_eq!(json["payload"]["items"][0]["kind"], "thinking");
+        assert_eq!(json["payload"]["items"][1]["kind"], "tool_call");
+        assert_eq!(
+            json["payload"]["items"][1]["started_at"],
+            "2026-01-01T00:00:00Z"
+        );
+        let in_flight: DaemonMessage = serde_json::from_value(serde_json::json!({
+            "type": "turn_activity",
+            "payload": {"thread_id": thread_id().to_string(), "message_id": null, "items": []}
+        }))
+        .unwrap();
+        assert!(matches!(
+            in_flight,
+            DaemonMessage::TurnActivity {
+                message_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]
