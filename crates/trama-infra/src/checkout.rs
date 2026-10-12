@@ -2,6 +2,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use trama_domain::ids::{RepositoryId, ThreadId};
@@ -67,12 +68,8 @@ impl CheckoutManager {
     }
 
     /// Reject a managed root that lies inside a source repository (for example
-    /// a dotfiles repo that contains Application Support). Provisioning such a
-    /// root would create directories inside the source working tree and dirty
-    /// it. The comparison resolves only ancestors that already exist, so a
-    /// managed root that has not been created yet is still detected through
-    /// its canonical existing ancestors, and it runs before any directory is
-    /// created.
+    /// a dotfiles repo that contains Application Support). The comparison
+    /// resolves only ancestors that already exist and runs before creating it.
     fn assert_not_nested(&self, source: &Path) -> Result<(), CheckoutError> {
         let canonical_source = fs::canonicalize(source).map_err(|_| CheckoutError::Missing {
             path: source.to_path_buf(),
@@ -241,6 +238,220 @@ impl CheckoutManager {
         Ok(())
     }
 
+    pub fn repo_local_path(
+        &self,
+        source: &Path,
+        thread: &ThreadId,
+        checkout: &trama_domain::ids::CheckoutId,
+    ) -> Result<PathBuf, CheckoutError> {
+        if !safe_id(&thread.0) || !safe_id(&checkout.0) {
+            return Err(CheckoutError::Containment(source.join(".trama")));
+        }
+        let source = fs::canonicalize(source).map_err(|_| CheckoutError::Missing {
+            path: source.to_path_buf(),
+        })?;
+        Ok(source
+            .join(".trama/worktrees")
+            .join(&thread.0)
+            .join(&checkout.0))
+    }
+
+    pub fn provision_repo_local(
+        &self,
+        source: &Path,
+        thread: &ThreadId,
+        repository: &RepositoryId,
+        checkout: &trama_domain::ids::CheckoutId,
+    ) -> Result<ProvisionedCheckout, CheckoutError> {
+        if !safe_id(&repository.0) {
+            return Err(CheckoutError::Containment(source.join(".trama")));
+        }
+        let source = fs::canonicalize(source).map_err(|_| CheckoutError::Missing {
+            path: source.to_path_buf(),
+        })?;
+        if !source.is_dir() {
+            return Err(CheckoutError::Invalid(source));
+        }
+        let destination = self.repo_local_path(&source, thread, checkout)?;
+        let worktrees = source.join(".trama/worktrees");
+        let thread_directory = worktrees.join(&thread.0);
+        // Inspect every existing component before changing Git ignore metadata
+        // or creating the owner marker. Never follow a known directory alias.
+        for path in [
+            &source.join(".trama"),
+            &worktrees,
+            &thread_directory,
+            &destination,
+        ] {
+            if let Ok(metadata) = fs::symlink_metadata(path) {
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                    || fs::canonicalize(path)? != *path
+                {
+                    return Err(CheckoutError::Containment(path.to_path_buf()));
+                }
+            }
+        }
+        let tracked = git(&source, ["ls-files", "--", ".trama"])?;
+        let trama = source.join(".trama");
+        if !tracked.stdout.is_empty()
+            || fs::symlink_metadata(&trama)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
+        {
+            return Err(CheckoutError::Invalid(trama));
+        }
+        Self::assert_clean(&source)?;
+        let base_revision = text(git(&source, ["rev-parse", "HEAD"])?);
+        let marker = format!("trama-repo-local-v1\n{}\n", source.display());
+        let marker_path = trama.join(".trama-workspace.json");
+        if fs::symlink_metadata(&trama).is_ok() {
+            if fs::symlink_metadata(&marker_path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+                || fs::read_to_string(&marker_path)
+                    .map_err(CheckoutError::Io)?
+                    .as_str()
+                    != marker.as_str()
+            {
+                return Err(CheckoutError::Invalid(trama));
+            }
+        }
+        ensure_local_exclude(&source)?;
+        if !trama.exists() {
+            fs::create_dir(&trama)?;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker_path)?
+                .write_all(marker.as_bytes())?;
+        }
+        for path in [&worktrees, &worktrees.join(&thread.0)] {
+            if fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
+            {
+                return Err(CheckoutError::Containment(path.to_path_buf()));
+            }
+        }
+        fs::create_dir_all(&worktrees)?;
+        fs::create_dir_all(worktrees.join(&thread.0))?;
+        if fs::canonicalize(&worktrees)? != worktrees
+            || fs::canonicalize(worktrees.join(&thread.0))? != worktrees.join(&thread.0)
+        {
+            return Err(CheckoutError::Containment(destination));
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| CheckoutError::Containment(destination.clone()))?;
+        if destination.exists() {
+            let recorded_base = fs::read_to_string(destination.join(".git/trama-base-commit"))
+                .map_err(|_| CheckoutError::Invalid(destination.clone()))?;
+            let recorded_base = recorded_base.trim().to_owned();
+            self.validate_repo_local(&source, &destination, &recorded_base)?;
+            return Ok(ProvisionedCheckout {
+                path: destination,
+                base_revision: recorded_base,
+            });
+        }
+        let staging = parent.join(format!(".staging-{}", ulid::Ulid::new()));
+        let result = (|| {
+            git(
+                &source,
+                [
+                    OsStr::new("clone"),
+                    OsStr::new("--no-hardlinks"),
+                    OsStr::new("--"),
+                    source.as_os_str(),
+                    staging.as_os_str(),
+                ],
+            )?;
+            git(
+                &staging,
+                [
+                    OsStr::new("remote"),
+                    OsStr::new("add"),
+                    OsStr::new("local"),
+                    source.as_os_str(),
+                ],
+            )?;
+            if text(git(&staging, ["rev-parse", "HEAD"])?) != base_revision {
+                return Err(CheckoutError::Invalid(staging.clone()));
+            }
+            fs::write(staging.join(".git/trama-base-commit"), &base_revision)?;
+            fs::rename(&staging, &destination)?;
+            Ok(())
+        })();
+        if result.is_err() && staging.exists() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        result?;
+        Ok(ProvisionedCheckout {
+            path: destination,
+            base_revision,
+        })
+    }
+
+    pub fn validate_repo_local(
+        &self,
+        source: &Path,
+        checkout: &Path,
+        base_revision: &str,
+    ) -> Result<(), CheckoutError> {
+        let canonical_source = fs::canonicalize(source).map_err(|_| CheckoutError::Missing {
+            path: source.to_path_buf(),
+        })?;
+        let thread_id = checkout
+            .parent()
+            .and_then(Path::file_name)
+            .ok_or_else(|| CheckoutError::Containment(checkout.to_path_buf()))?;
+        let checkout_id = checkout
+            .file_name()
+            .ok_or_else(|| CheckoutError::Containment(checkout.to_path_buf()))?;
+        let expected = self.repo_local_path(
+            &canonical_source,
+            &ThreadId::from(thread_id.to_string_lossy().as_ref()),
+            &trama_domain::ids::CheckoutId::from(checkout_id.to_string_lossy().as_ref()),
+        )?;
+        if checkout != expected
+            || fs::canonicalize(checkout)
+                .map_err(|_| CheckoutError::Invalid(checkout.to_path_buf()))?
+                != expected
+        {
+            return Err(CheckoutError::Containment(checkout.to_path_buf()));
+        }
+        let source = canonical_source;
+        let marker = source.join(".trama/.trama-workspace.json");
+        let expected_marker = format!("trama-repo-local-v1\n{}\n", source.display());
+        let marker_metadata = fs::symlink_metadata(&marker)
+            .map_err(|_| CheckoutError::Invalid(checkout.to_path_buf()))?;
+        if marker_metadata.file_type().is_symlink()
+            || !marker_metadata.is_file()
+            || fs::read_to_string(&marker).map_err(CheckoutError::Io)? != expected_marker
+        {
+            return Err(CheckoutError::Invalid(checkout.to_path_buf()));
+        }
+        let git_dir = PathBuf::from(text(git(checkout, ["rev-parse", "--absolute-git-dir"])?));
+        if !git_dir.starts_with(checkout)
+            || git(
+                checkout,
+                ["cat-file", "-e", &format!("{base_revision}^{{commit}}")],
+            )
+            .is_err()
+        {
+            return Err(CheckoutError::Invalid(checkout.to_path_buf()));
+        }
+        let recorded_base = fs::read_to_string(checkout.join(".git/trama-base-commit"))
+            .map_err(|_| CheckoutError::Invalid(checkout.to_path_buf()))?;
+        if recorded_base.trim() != base_revision {
+            return Err(CheckoutError::Invalid(checkout.to_path_buf()));
+        }
+        let remote = text(git(checkout, ["remote", "get-url", "local"])?);
+        if fs::canonicalize(remote).map_err(|_| CheckoutError::Invalid(checkout.to_path_buf()))?
+            != source
+        {
+            return Err(CheckoutError::Invalid(checkout.to_path_buf()));
+        }
+        Ok(())
+    }
+
     /// Require `path` itself to be an existing non-bare Git working tree root.
     /// Does not walk up to a parent repository or down into a nested one, and
     /// does not clone.
@@ -319,6 +530,36 @@ fn safe_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn ensure_local_exclude(source: &Path) -> Result<(), CheckoutError> {
+    let value = git_text(source, ["rev-parse", "--git-path", "info/exclude"])?;
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        source.join(path)
+    };
+    let existing = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(CheckoutError::Io(error)),
+    };
+    if existing.lines().any(|line| line.trim() == "/.trama/") {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        file.write_all(b"\n")?;
+    }
+    file.write_all(b"/.trama/\n")?;
+    Ok(())
 }
 
 /// Canonicalize `path` through its deepest ancestor that already exists, so a
@@ -449,6 +690,203 @@ mod tests {
         fs::write(path.join("same.txt"), "original\n").unwrap();
         git(path, &["add", "same.txt"]);
         git(path, &["commit", "-m", "initial"]);
+    }
+
+    #[test]
+    fn repeated_local_provision_keeps_base_and_work_after_source_advances() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        repository(&source);
+        let manager = CheckoutManager::new(temp.path().join("legacy"));
+        let thread = ThreadId::from("thread");
+        let repo = RepositoryId::from("repo");
+        let checkout = trama_domain::ids::CheckoutId::from("copy");
+        let first = manager
+            .provision_repo_local(&source, &thread, &repo, &checkout)
+            .unwrap();
+        fs::write(first.path.join("same.txt"), "local uncommitted work\n").unwrap();
+        fs::write(source.join("new-file.txt"), "new source commit\n").unwrap();
+        git(&source, &["add", "new-file.txt"]);
+        git(&source, &["commit", "-m", "advance source"]);
+        git(&first.path, &["fetch", "local"]);
+        let again = manager
+            .provision_repo_local(&source, &thread, &repo, &checkout)
+            .unwrap();
+        assert_eq!(again.base_revision, first.base_revision);
+        assert_eq!(again.path, first.path);
+        assert_eq!(
+            fs::read_to_string(again.path.join("same.txt")).unwrap(),
+            "local uncommitted work\n"
+        );
+        assert_ne!(
+            again.base_revision,
+            text(super::git(&source, ["rev-parse", "HEAD"]).unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_alias_is_rejected_before_marker_or_exclude_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        repository(&source);
+        let trama = source.join(".trama");
+        fs::create_dir(&trama).unwrap();
+        let marker = trama.join(".trama-workspace.json");
+        let marker_text = format!(
+            "trama-repo-local-v1\n{}\n",
+            source.canonicalize().unwrap().display()
+        );
+        fs::write(&marker, &marker_text).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, trama.join("worktrees")).unwrap();
+        let exclude = source.join(".git/info/exclude");
+        let before = fs::read(&exclude).unwrap();
+        let manager = CheckoutManager::new(temp.path().join("legacy"));
+        assert!(
+            manager
+                .provision_repo_local(
+                    &source,
+                    &ThreadId::from("thread"),
+                    &RepositoryId::from("repo"),
+                    &trama_domain::ids::CheckoutId::from("copy"),
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(&exclude).unwrap(), before);
+        assert_eq!(fs::read_to_string(marker).unwrap(), marker_text);
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn repo_local_provisioning_isolated_and_idempotently_excluded() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        repository(&source);
+        let original_gitignore = fs::read(source.join(".gitignore")).ok();
+        let source_status = git_text(&source, ["status", "--porcelain"]).unwrap();
+        let manager = CheckoutManager::new(temp.path().join("global"));
+        let thread = ThreadId::from("thread-a");
+        let repo = RepositoryId::from("repo-a");
+        let id = trama_domain::ids::CheckoutId::from("checkout-a");
+        let checkout = manager
+            .provision_repo_local(&source, &thread, &repo, &id)
+            .unwrap();
+        assert_eq!(
+            checkout.path,
+            fs::canonicalize(&source)
+                .unwrap()
+                .join(".trama/worktrees/thread-a/checkout-a")
+        );
+        fs::write(checkout.path.join("local-edit.txt"), "keep me").unwrap();
+        let again = manager
+            .provision_repo_local(&source, &thread, &repo, &id)
+            .unwrap();
+        assert_eq!(again.path, checkout.path);
+        assert_eq!(
+            fs::read_to_string(again.path.join("local-edit.txt")).unwrap(),
+            "keep me"
+        );
+        assert_eq!(
+            git_text(&source, ["status", "--porcelain"]).unwrap(),
+            source_status
+        );
+        assert_eq!(fs::read(source.join(".gitignore")).ok(), original_gitignore);
+        let exclude =
+            PathBuf::from(git_text(&source, ["rev-parse", "--git-path", "info/exclude"]).unwrap());
+        let exclude = if exclude.is_absolute() {
+            exclude
+        } else {
+            source.join(exclude)
+        };
+        let contents = fs::read_to_string(exclude).unwrap();
+        assert_eq!(
+            contents
+                .lines()
+                .filter(|line| line.trim() == "/.trama/")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn repo_local_provisioning_rejects_tracked_trama() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        repository(&source);
+        fs::create_dir_all(source.join(".trama")).unwrap();
+        fs::write(source.join(".trama/owned"), "tracked").unwrap();
+        git(&source, &["add", ".trama/owned"]);
+        git(&source, &["commit", "-m", "tracked trama"]);
+        let manager = CheckoutManager::new(temp.path().join("global"));
+        assert!(
+            manager
+                .provision_repo_local(
+                    &source,
+                    &ThreadId::from("t"),
+                    &RepositoryId::from("r"),
+                    &trama_domain::ids::CheckoutId::from("c")
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn repo_local_provisioning_does_not_claim_foreign_trama_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        repository(&source);
+        fs::create_dir(source.join(".trama")).unwrap();
+        fs::write(source.join(".trama/foreign"), "keep").unwrap();
+        let exclude =
+            PathBuf::from(git_text(&source, ["rev-parse", "--git-path", "info/exclude"]).unwrap());
+        let exclude = if exclude.is_absolute() {
+            exclude
+        } else {
+            source.join(exclude)
+        };
+        fs::write(&exclude, "/.trama/\n").unwrap();
+        let manager = CheckoutManager::new(temp.path().join("global"));
+        assert!(
+            manager
+                .provision_repo_local(
+                    &source,
+                    &ThreadId::from("t"),
+                    &RepositoryId::from("r"),
+                    &trama_domain::ids::CheckoutId::from("c"),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(source.join(".trama/foreign")).unwrap(),
+            "keep"
+        );
+        assert!(!source.join(".trama/.trama-workspace.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_local_provisioning_rejects_symlinked_trama_root() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        repository(&source);
+        let foreign = temp.path().join("foreign");
+        fs::create_dir_all(&foreign).unwrap();
+        symlink(&foreign, source.join(".trama")).unwrap();
+        let manager = CheckoutManager::new(temp.path().join("global"));
+        assert!(
+            manager
+                .provision_repo_local(
+                    &source,
+                    &ThreadId::from("t"),
+                    &RepositoryId::from("r"),
+                    &trama_domain::ids::CheckoutId::from("c")
+                )
+                .is_err()
+        );
+        assert!(fs::read_dir(&foreign).unwrap().next().is_none());
     }
 
     #[test]
@@ -604,6 +1042,78 @@ mod tests {
             ),
             Err(CheckoutError::Containment(_))
         ));
+    }
+
+    #[test]
+    fn repo_local_checkouts_are_isolated_and_excluded_from_source_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        repository(&source);
+        fs::write(source.join(".gitignore"), "ignored.local\n").unwrap();
+        git(&source, &["add", ".gitignore"]);
+        git(&source, &["commit", "-m", "ignore local file"]);
+        fs::write(source.join("ignored.local"), "secret").unwrap();
+        let manager = CheckoutManager::new(temp.path().join("unused"));
+        let a = manager
+            .provision_repo_local(
+                &source,
+                &ThreadId::from("a"),
+                &RepositoryId::from("r"),
+                &trama_domain::ids::CheckoutId::from("c"),
+            )
+            .unwrap();
+        let b = manager
+            .provision_repo_local(
+                &source,
+                &ThreadId::from("b"),
+                &RepositoryId::from("r"),
+                &trama_domain::ids::CheckoutId::from("c"),
+            )
+            .unwrap();
+        assert_ne!(a.path, b.path);
+        fs::write(a.path.join("same.txt"), "edited").unwrap();
+        assert_eq!(
+            fs::read_to_string(source.join("same.txt")).unwrap(),
+            "original\n"
+        );
+        assert!(!a.path.join("ignored.local").exists());
+        assert_eq!(
+            fs::read_to_string(source.join(".gitignore")).unwrap(),
+            "ignored.local\n"
+        );
+        manager
+            .provision_repo_local(
+                &source,
+                &ThreadId::from("a"),
+                &RepositoryId::from("r"),
+                &trama_domain::ids::CheckoutId::from("c"),
+            )
+            .unwrap();
+        let exclude = PathBuf::from(text(
+            super::git(&source, ["rev-parse", "--git-path", "info/exclude"]).unwrap(),
+        ));
+        let exclude = if exclude.is_absolute() {
+            exclude
+        } else {
+            source.join(exclude)
+        };
+        assert_eq!(
+            fs::read_to_string(exclude)
+                .unwrap()
+                .matches("/.trama/")
+                .count(),
+            1
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(["status", "--porcelain"])
+                .output()
+                .unwrap()
+                .stdout
+                .is_empty()
+        );
     }
 
     #[test]

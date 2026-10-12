@@ -20,7 +20,7 @@
 //! Unknown `type` tags are **denied**. Serde rejects them at deserialize time; the
 //! daemon must not silently ignore a variant it does not understand. Because of that,
 //! a new variant is a breaking handshake change: an older peer would accept `Hello`
-//! and then fail the command. [`PROTOCOL_VERSION`] is **2** for workspace creation,
+//! and then fail the command. [`PROTOCOL_VERSION`] is **3** for checkout discovery,
 //! repository membership, and legacy-thread migration. The bump is transport-only.
 //! Persisted domain ids and SQLite rows are not rewritten.
 //!
@@ -37,10 +37,10 @@ pub use trama_domain::message::Message;
 
 /// Wire protocol version carried in `Hello` / `Welcome`.
 ///
-/// Version 2 adds workspace, repository, and legacy-migration commands. It does
+/// Version 3 adds thread checkout discovery. It does
 /// not migrate stored data; peers with a different version are rejected at
 /// handshake time.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Encode `value` as one JSON line (compact JSON plus a trailing `\n`).
 pub fn encode_json_line<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
@@ -106,6 +106,9 @@ pub enum ClientMessage {
     MigrateLegacyThread {
         thread_id: ThreadId,
     },
+    GetThreadCheckouts {
+        thread_id: ThreadId,
+    },
     Shutdown,
 }
 
@@ -147,6 +150,29 @@ pub enum DaemonMessage {
         repository: RepositorySnapshot,
     },
     ThreadMigrated(ThreadSnapshot),
+    ThreadCheckouts {
+        thread_id: ThreadId,
+        checkouts: Vec<CheckoutSnapshot>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckoutSnapshot {
+    pub repository_id: RepositoryId,
+    pub title: String,
+    pub source_path: PathBuf,
+    pub checkout_path: Option<PathBuf>,
+    pub status: CheckoutStatus,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckoutStatus {
+    Ready,
+    NeedsPreparation,
+    Missing,
+    Invalid,
 }
 
 /// Minimal workspace view for IPC. Not the domain `Workspace` aggregate.
@@ -472,7 +498,27 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_two() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+    fn protocol_version_is_three() {
+        assert_eq!(PROTOCOL_VERSION, 3);
+    }
+
+    #[test]
+    fn thread_checkout_discovery_contract_uses_snake_case_status() {
+        let message = DaemonMessage::ThreadCheckouts {
+            thread_id: ThreadId::from("thread-1"),
+            checkouts: vec![CheckoutSnapshot {
+                repository_id: RepositoryId::from("repo-1"),
+                title: "backend".into(),
+                source_path: PathBuf::from("/src/backend"),
+                checkout_path: Some(PathBuf::from("/src/backend/.trama/worktrees/t/c")),
+                status: CheckoutStatus::Ready,
+                detail: None,
+            }],
+        };
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["type"], "thread_checkouts");
+        assert_eq!(json["payload"]["checkouts"][0]["status"], "ready");
+        let decoded = serde_json::from_value::<DaemonMessage>(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), json);
     }
 }

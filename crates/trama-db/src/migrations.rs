@@ -3,7 +3,10 @@ use rusqlite_migration::{M, Migrations};
 use trama_domain::{DomainError, Result};
 
 pub(crate) fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(include_str!("../migrations/0001_schema.sql"))])
+    Migrations::new(vec![
+        M::up(include_str!("../migrations/0001_schema.sql")),
+        M::up(include_str!("../migrations/0002_checkout_locations.sql")),
+    ])
 }
 
 pub(crate) fn apply(conn: &mut Connection) -> Result<()> {

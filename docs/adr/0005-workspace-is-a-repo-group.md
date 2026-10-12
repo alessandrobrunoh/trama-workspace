@@ -23,18 +23,17 @@ share a dirty working tree.
   `AttachMode::Isolated`. Later membership edits never mutate existing threads.
 - **Multi-repo rules:**
   - independent git per repo (own remotes, branches, commits);
-  - per-thread isolated checkouts (default); `Adopted` is an explicit opt-in
-    to the user's existing working copy;
+  - per-thread isolated checkouts; legacy `Adopted` attachments require
+    explicit preparation before execution;
   - no cross-repo index or combined commit.
 - An isolated attachment is provisioned with `git clone --no-hardlinks`,
-  atomically published below Application Support using only
-  thread/repository/checkout IDs. Its `checkout_id` and starting commit are
-  stored with the attachment; the checkout directory itself is derived from
-  those IDs. The managed checkout root must not lie inside any source
-  repository (a dotfiles repo containing Application Support, say):
-  provisioning rejects that before creating any directory, resolving
-  not-yet-created roots through their canonical existing ancestors, because
-  clones under such a root would dirty the source working tree.
+  atomically published at `<source>/.trama/worktrees/<thread>/<checkout>`.
+  Concrete paths are persisted with attachment identity. The controlled local
+  subtree is ignored in Git `info/exclude`, without changing tracked files.
+  The first source commit is recorded in the clone's Git metadata and does
+  not advance when provisioning is repeated.
+  Historical global clones stay below Application Support and retain their
+  old resolver; arbitrary nested global roots remain prohibited.
 - The clone's `local` remote points to the configured source repo. Creating a
   thread does not push or land changes.
 - Thread creation rejects dirty source repos instead of silently dropping

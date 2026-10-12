@@ -4,7 +4,7 @@ The database under Application Support is the source of truth. Do not hand-edit
 `config.json` to create a workspace or attach a repository. An empty config
 file does not delete workspaces, repositories, or threads created from the UI.
 
-Protocol version is 2. `Hello` / `Welcome` carry that version. A rejected
+Protocol version is 3. `Hello` / `Welcome` carry that version. A rejected
 handshake means the app and the daemon were not restarted together. It does
 not rewrite stored ids or messages.
 
@@ -52,12 +52,30 @@ and `origin`, exactly like repositories added through the protocol.
 
 ### Managed checkout storage location
 
-The managed checkout root (under Application Support by default) must live
-outside every source repository. If the root is inside a source working tree —
-for example a dotfiles repo that contains Application Support — provisioning
-and migration reject it before creating any directory, because clones under
-that root would dirty the source. Move the managed root out of the repository,
-or keep Application Support out of the repo.
+New threads and explicit legacy preparation store checkouts beside the source
+at `<source>/.trama/worktrees/<thread-id>/<checkout-id>`.
+The daemon records each concrete path with the checkout identity in SQLite;
+open/readiness and session startup resolve through that record rather than
+guessing a path. `GetThreadCheckouts` returns a validated path only for a
+`ready` entry.
+
+The one permitted nested checkout root is exactly this `.trama/worktrees`
+layout. The daemon rejects tracked `.trama` content and unsafe/symlinked
+pre-existing paths, and adds `/.trama/` to that repository's Git
+`info/exclude` (not its tracked `.gitignore`). The source must otherwise be
+clean before provisioning; ignored files are not copied. The clone uses
+`--no-hardlinks` and retains its local remote.
+
+Existing Application Support checkouts remain at their original paths. Rows
+without a concrete path record use the historical global resolver, and a
+recorded old path remains authoritative even if the source moves. The daemon
+does not migrate, reset, or remove old checkouts automatically.
+
+The UI's **Copie di lavoro** panel shows original and isolated paths separately.
+Only a validated ready copy enables Zed/Finder/clipboard actions. This remains
+a local, operator-owned filesystem workflow, not a sandbox against another
+process running as the same user and concurrently replacing directory entries.
+No source repository is silently substituted when a stored copy fails validation.
 
 ## Recover a thread that predates managed checkouts
 
@@ -82,11 +100,11 @@ The command:
   deleted
 - on any failure, leaves the previous attachment metadata and the transcript
   unchanged and does not start the agent
-- on success, publishes isolated clones for the legacy attachments only —
+- on success, publishes repo-local isolated clones for the legacy attachments only —
   already-managed attachments are validated and kept, together with any edits
   the agent made in them — then in one transaction stores `checkout_id`,
-  `base_revision`, and `attach_mode = isolated`, clears the external session
-  ids of the thread's agent sessions, and appends a system message. The
+  `base_revision`, `attach_mode = isolated`, and each actual checkout path,
+  clears the external session ids of the thread's agent sessions, and appends a system message. The
   transcript is kept. The previous agent session is not resumed — including
   on a mixed thread whose first checkout, and therefore cwd, is unchanged
 - is safe to repeat. An already-managed thread is validated and left as-is,

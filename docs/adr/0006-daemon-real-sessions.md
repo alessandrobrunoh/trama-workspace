@@ -44,9 +44,9 @@ process that must join them without changing frozen domain or protocol types.
   order is repository id ascending — the persisted reload order — both at
   creation and after a restart, not alias or insertion order. The source
   repositories are never passed to Claude for isolated attachments.
-- The checkout root is
-  `$HOME/Library/Application Support/TramaWorkspace/checkouts`; checkout
-  directories are derived from persisted thread, repository, and checkout IDs.
+- New checkout paths are persisted under each source repository's
+  `.trama/worktrees/<thread>/<checkout>`. Application Support retains app data
+  and historical global checkouts; old copies are never relocated implicitly.
 - Old threads without checkout metadata, and legacy adopted threads, fail
   closed until the user runs `migrate_legacy_thread`. The original session is
   not resumed after the checkout path changes. A turn that fails after the

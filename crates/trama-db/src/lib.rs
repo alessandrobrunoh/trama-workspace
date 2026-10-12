@@ -7,6 +7,7 @@
 //! Open/migrate stay synchronous so a runtime is not required to construct
 //! the store. Concurrent async calls serialize on the mutex.
 
+mod checkouts;
 mod codec;
 mod content;
 mod event;
@@ -15,6 +16,7 @@ mod projections;
 mod revision;
 mod store;
 
+pub use checkouts::CheckoutLocation;
 pub use store::TramaDb;
 
 #[cfg(test)]
@@ -65,6 +67,167 @@ mod tests {
         };
         db.create_thread(&thread).await.unwrap();
         (workspace, thread)
+    }
+
+    #[tokio::test]
+    async fn concrete_checkout_locations_survive_database_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locations.db");
+        let db = TramaDb::open(&path).unwrap();
+        let workspace = Workspace::new("locations");
+        db.create_workspace(&workspace).await.unwrap();
+        let repository = WorkspaceMembership {
+            workspace_id: workspace.id.clone(),
+            repository_id: RepositoryId::generate(),
+            alias: None,
+            default_enabled: true,
+        };
+        db.create_repository(&Repository {
+            id: repository.repository_id.clone(),
+            canonical_remote: None,
+            local_path: Some(PathBuf::from("/src/repo")),
+            default_branch: Some("main".into()),
+        })
+        .await
+        .unwrap();
+        let thread = Thread {
+            id: ThreadId::generate(),
+            workspace_id: Some(workspace.id),
+            parent_thread_id: None,
+            kind: ThreadKind::Top,
+            title: Some("location".into()),
+            repo_attachments: vec![ThreadRepositoryAttachment {
+                repository_id: repository.repository_id.clone(),
+                base_revision: Some("abc".into()),
+                checkout_id: Some(CheckoutId::from("checkout")),
+                attach_mode: AttachMode::Isolated,
+            }],
+        };
+        let location = PathBuf::from("/src/repo/.trama/worktrees/t/r/c");
+        db.create_thread_with_locations(
+            &thread,
+            &[CheckoutLocation {
+                checkout_id: CheckoutId::from("checkout"),
+                repository_id: repository.repository_id.clone(),
+                path: location.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+        drop(db);
+        let reopened = TramaDb::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .checkout_location(
+                    &thread.id,
+                    &repository.repository_id,
+                    &CheckoutId::from("checkout")
+                )
+                .await
+                .unwrap(),
+            Some(location.clone())
+        );
+        assert!(
+            reopened
+                .checkout_location(
+                    &ThreadId::generate(),
+                    &repository.repository_id,
+                    &CheckoutId::from("checkout"),
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            reopened
+                .checkout_location(
+                    &thread.id,
+                    &RepositoryId::generate(),
+                    &CheckoutId::from("checkout"),
+                )
+                .await
+                .is_err()
+        );
+        let message = Message::new_user(thread.id.clone(), "user", "must roll back");
+        let event = EventRecord::new(
+            Aggregate::Thread {
+                id: thread.id.clone(),
+            },
+            Actor::System,
+            trama_domain::event::DomainEvent::MessageAdded {
+                message: message.clone(),
+            },
+            vec![],
+        )
+        .unwrap();
+        let retarget = reopened
+            .persist_thread_migration_with_locations(
+                &thread.id,
+                &thread.repo_attachments,
+                &message,
+                &event,
+                &[CheckoutLocation {
+                    checkout_id: CheckoutId::from("checkout"),
+                    repository_id: repository.repository_id.clone(),
+                    path: PathBuf::from("/different/checkout"),
+                }],
+            )
+            .await;
+        assert!(retarget.is_err());
+        assert_eq!(
+            reopened
+                .checkout_location(
+                    &thread.id,
+                    &repository.repository_id,
+                    &CheckoutId::from("checkout")
+                )
+                .await
+                .unwrap(),
+            Some(location.clone())
+        );
+        assert!(
+            reopened
+                .list_messages_by_thread(&thread.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let repeated_message = Message::new_user(thread.id.clone(), "user", "same migration");
+        let repeated_event = EventRecord::new(
+            Aggregate::Thread {
+                id: thread.id.clone(),
+            },
+            Actor::System,
+            trama_domain::event::DomainEvent::MessageAdded {
+                message: repeated_message.clone(),
+            },
+            vec![],
+        )
+        .unwrap();
+        reopened
+            .persist_thread_migration_with_locations(
+                &thread.id,
+                &thread.repo_attachments,
+                &repeated_message,
+                &repeated_event,
+                &[CheckoutLocation {
+                    checkout_id: CheckoutId::from("checkout"),
+                    repository_id: repository.repository_id.clone(),
+                    path: location.clone(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .checkout_location(
+                    &thread.id,
+                    &repository.repository_id,
+                    &CheckoutId::from("checkout")
+                )
+                .await
+                .unwrap(),
+            Some(location)
+        );
     }
 
     #[test]

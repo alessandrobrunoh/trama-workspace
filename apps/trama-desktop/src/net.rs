@@ -161,7 +161,10 @@ pub(crate) fn replay_messages(
         messages.push(ClientMessage::ListRepositories { workspace_id });
     }
     if let Some(thread_id) = thread {
-        messages.push(ClientMessage::SubscribeThread { thread_id });
+        messages.push(ClientMessage::SubscribeThread {
+            thread_id: thread_id.clone(),
+        });
+        messages.push(ClientMessage::GetThreadCheckouts { thread_id });
     }
     messages
 }
@@ -178,7 +181,10 @@ pub(crate) fn select_thread_messages(
             thread_id: previous,
         });
     }
-    messages.push(ClientMessage::SubscribeThread { thread_id });
+    messages.push(ClientMessage::SubscribeThread {
+        thread_id: thread_id.clone(),
+    });
+    messages.push(ClientMessage::GetThreadCheckouts { thread_id });
     messages
 }
 
@@ -505,7 +511,10 @@ mod tests {
                     workspace_id: workspace_id.clone(),
                 },
                 ClientMessage::ListRepositories { workspace_id },
-                ClientMessage::SubscribeThread { thread_id },
+                ClientMessage::SubscribeThread {
+                    thread_id: thread_id.clone()
+                },
+                ClientMessage::GetThreadCheckouts { thread_id },
             ]
         );
     }
@@ -519,7 +528,10 @@ mod tests {
                 ClientMessage::UnsubscribeThread {
                     thread_id: thread_id.clone(),
                 },
-                ClientMessage::SubscribeThread { thread_id },
+                ClientMessage::SubscribeThread {
+                    thread_id: thread_id.clone()
+                },
+                ClientMessage::GetThreadCheckouts { thread_id },
             ]
         );
     }

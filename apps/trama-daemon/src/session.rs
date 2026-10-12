@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::mpsc;
-use trama_db::TramaDb;
+use trama_db::{CheckoutLocation, TramaDb};
 use trama_domain::agent::{
     AgentAdapter, AgentEvent, AgentKind, AgentPrompt, AgentSession, ApprovalDecision,
     SessionConfig, UsageReport,
@@ -193,6 +193,159 @@ impl SessionManager {
         Ok(threads.iter().map(thread_snapshot).collect())
     }
 
+    /// Return thread checkout readiness, exposing a path only after validation.
+    pub async fn thread_checkouts(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Vec<trama_protocol::CheckoutSnapshot>> {
+        use trama_protocol::{CheckoutSnapshot, CheckoutStatus};
+        let thread = self
+            .db
+            .get_thread(thread_id)
+            .await?
+            .ok_or_else(|| DaemonError::NotFound(format!("thread {thread_id}")))?;
+        let memberships = match &thread.workspace_id {
+            Some(workspace) => self.db.list_memberships(workspace).await?,
+            None => Vec::new(),
+        };
+        let mut rows = Vec::with_capacity(thread.repo_attachments.len());
+        for attachment in thread.repo_attachments {
+            let repository = self
+                .db
+                .get_repository(&attachment.repository_id)
+                .await?
+                .ok_or_else(|| {
+                    DaemonError::NotFound(format!("repository {}", attachment.repository_id))
+                })?;
+            let source = repository.local_path.ok_or_else(|| {
+                DaemonError::Invalid(format!(
+                    "repository {} has no local path",
+                    attachment.repository_id
+                ))
+            })?;
+            let source = std::fs::canonicalize(&source).unwrap_or(source);
+            let (status, checkout_path, detail) = if let (Some(_id), Some(base)) = (
+                attachment.checkout_id.as_ref(),
+                attachment.base_revision.as_ref(),
+            ) {
+                let resolved = self.checkout_path(thread_id, &attachment, &source).await;
+                let (path, repo_local) = match resolved {
+                    Ok(resolved) if attachment.attach_mode == AttachMode::Isolated => resolved,
+                    other => {
+                        let detail = match other {
+                            Err(error) => error.to_string(),
+                            Ok(_) => "Prepara la copia di lavoro prima di aprirla.".into(),
+                        };
+                        rows.push(CheckoutSnapshot {
+                            repository_id: attachment.repository_id,
+                            title: source
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned(),
+                            source_path: source,
+                            checkout_path: None,
+                            status: if attachment.attach_mode == AttachMode::Adopted {
+                                CheckoutStatus::NeedsPreparation
+                            } else {
+                                CheckoutStatus::Invalid
+                            },
+                            detail: Some(detail),
+                        });
+                        continue;
+                    }
+                };
+                let manager = self.checkout_manager.clone();
+                let source_check = source.clone();
+                let path_check = path.clone();
+                let base_check = base.clone();
+                let validation = tokio::task::spawn_blocking(move || {
+                    validate_managed_checkout(
+                        &manager,
+                        &source_check,
+                        &path_check,
+                        &base_check,
+                        repo_local,
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    DaemonError::Invalid(format!("checkout validation task failed: {e}"))
+                })?;
+                match validation {
+                    Ok(()) => (CheckoutStatus::Ready, Some(path), None),
+                    Err(e) if !path.exists() => (
+                        CheckoutStatus::Missing,
+                        None,
+                        Some(format!("{e}. Prepare the checkout to continue.")),
+                    ),
+                    Err(e) => (CheckoutStatus::Invalid, None, Some(e.to_string())),
+                }
+            } else {
+                (
+                    CheckoutStatus::NeedsPreparation,
+                    None,
+                    Some("Prepare this thread's checkout before opening it".into()),
+                )
+            };
+            rows.push(CheckoutSnapshot {
+                repository_id: attachment.repository_id.clone(),
+                title: memberships
+                    .iter()
+                    .find(|membership| membership.repository_id == attachment.repository_id)
+                    .and_then(|membership| membership.alias.clone())
+                    .unwrap_or_else(|| {
+                        source
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    }),
+                source_path: source,
+                checkout_path,
+                status,
+                detail,
+            });
+        }
+        Ok(rows)
+    }
+
+    /// A recorded local path is authoritative; absence means a legacy global
+    /// checkout, never permission to guess or create a replacement.
+    async fn checkout_path(
+        &self,
+        thread: &ThreadId,
+        attachment: &ThreadRepositoryAttachment,
+        source: &std::path::Path,
+    ) -> Result<(PathBuf, bool)> {
+        let id = attachment.checkout_id.as_ref().ok_or_else(|| {
+            DaemonError::Invalid("la copia di lavoro deve essere preparata".into())
+        })?;
+        if let Some(path) = self
+            .db
+            .checkout_location(thread, &attachment.repository_id, id)
+            .await?
+        {
+            let expected = self
+                .checkout_manager
+                .repo_local_path(source, thread, id)
+                .map_err(checkout_to_invalid)?;
+            if path != expected {
+                return Err(DaemonError::Invalid(
+                    "la posizione registrata non corrisponde a questa copia di lavoro".into(),
+                ));
+            }
+            Ok((path, true))
+        } else {
+            Ok((
+                self.checkout_manager
+                    .path(thread, &attachment.repository_id, id)
+                    .map_err(checkout_to_invalid)?,
+                false,
+            ))
+        }
+    }
+
     pub async fn create_thread(
         &self,
         workspace_id: WorkspaceId,
@@ -245,8 +398,17 @@ impl SessionManager {
                 .into_iter()
                 .map(|(source, repository_id, checkout_id)| {
                     checkout_manager
-                        .provision(&source, &thread_id, &repository_id, &checkout_id)
-                        .map(|checkout| (checkout_id, checkout.base_revision))
+                        .provision_repo_local(&source, &thread_id, &repository_id, &checkout_id)
+                        .map(|checkout| {
+                            (
+                                CheckoutLocation {
+                                    checkout_id,
+                                    repository_id,
+                                    path: checkout.path,
+                                },
+                                checkout.base_revision,
+                            )
+                        })
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()
         })
@@ -255,13 +417,17 @@ impl SessionManager {
             DaemonError::Invalid(format!("checkout provisioning task failed: {error}"))
         })?
         .map_err(checkout_to_invalid)?;
-        for (attachment, (checkout_id, base_revision)) in
+        let mut locations = Vec::with_capacity(provisioned.len());
+        for (attachment, (location, base_revision)) in
             thread.repo_attachments.iter_mut().zip(provisioned)
         {
-            attachment.checkout_id = Some(checkout_id);
+            attachment.checkout_id = Some(location.checkout_id.clone());
             attachment.base_revision = Some(base_revision);
+            locations.push(location);
         }
-        self.db.create_thread(&thread).await?;
+        self.db
+            .create_thread_with_locations(&thread, &locations)
+            .await?;
         let record = EventRecord::new(
             Aggregate::Thread {
                 id: thread.id.clone(),
@@ -421,10 +587,14 @@ impl SessionManager {
                 && attachment.checkout_id.is_some()
                 && attachment.base_revision.is_some();
             if managed {
+                let (checkout_path, repo_local) =
+                    self.checkout_path(&thread_id, attachment, &source).await?;
                 plans.push(MigrationPlan {
                     source: inspected.path,
                     attachment: attachment.clone(),
                     provision: false,
+                    checkout_path: Some(checkout_path),
+                    repo_local,
                 });
             } else {
                 plans.push(MigrationPlan {
@@ -436,6 +606,8 @@ impl SessionManager {
                         attach_mode: AttachMode::Isolated,
                     },
                     provision: true,
+                    checkout_path: None,
+                    repo_local: true,
                 });
             }
         }
@@ -455,6 +627,17 @@ impl SessionManager {
         }
 
         let attachments: Vec<_> = plans.iter().map(|plan| plan.attachment.clone()).collect();
+        let locations: Vec<_> = plans
+            .iter()
+            .filter(|plan| plan.repo_local)
+            .filter_map(|plan| {
+                Some(CheckoutLocation {
+                    checkout_id: plan.attachment.checkout_id.clone()?,
+                    repository_id: plan.attachment.repository_id.clone(),
+                    path: plan.checkout_path.clone()?,
+                })
+            })
+            .collect();
         if attachments.iter().any(|attachment| {
             attachment.checkout_id.is_none() || attachment.base_revision.is_none()
         }) {
@@ -484,7 +667,13 @@ impl SessionManager {
             vec![],
         )?;
         self.db
-            .persist_thread_migration(&thread.id, &attachments, &message, &event)
+            .persist_thread_migration_with_locations(
+                &thread.id,
+                &attachments,
+                &message,
+                &event,
+                &locations,
+            )
             .await?;
         self.broadcast(
             &thread.id,
@@ -890,11 +1079,14 @@ impl SessionManager {
                     let base_revision = attachment.base_revision.as_deref().ok_or_else(|| {
                         DaemonError::Invalid("managed checkout has no recorded base commit".into())
                     })?;
-                    let path = self
-                        .checkout_manager
-                        .path(&thread.id, &attachment.repository_id, checkout_id)
-                        .map_err(|error| DaemonError::Invalid(error.to_string()))?;
-                    validations.push((source.clone(), path.clone(), base_revision.to_owned()));
+                    let (path, repo_local) =
+                        self.checkout_path(&thread.id, attachment, &source).await?;
+                    validations.push((
+                        source.clone(),
+                        path.clone(),
+                        base_revision.to_owned(),
+                        repo_local,
+                    ));
                     paths.push(path);
                 }
                 AttachMode::Adopted => {
@@ -907,8 +1099,14 @@ impl SessionManager {
         }
         let checkout_manager = self.checkout_manager.clone();
         tokio::task::spawn_blocking(move || {
-            for (source, path, base_revision) in validations {
-                checkout_manager.validate(&source, &path, &base_revision)?;
+            for (source, path, base_revision, repo_local) in validations {
+                validate_managed_checkout(
+                    &checkout_manager,
+                    &source,
+                    &path,
+                    &base_revision,
+                    repo_local,
+                )?;
             }
             Ok::<_, trama_infra::checkout::CheckoutError>(())
         })
@@ -1217,6 +1415,22 @@ struct MigrationPlan {
     source: PathBuf,
     attachment: ThreadRepositoryAttachment,
     provision: bool,
+    checkout_path: Option<PathBuf>,
+    repo_local: bool,
+}
+
+fn validate_managed_checkout(
+    manager: &CheckoutManager,
+    source: &std::path::Path,
+    path: &std::path::Path,
+    base: &str,
+    repo_local: bool,
+) -> std::result::Result<(), CheckoutError> {
+    if repo_local {
+        manager.validate_repo_local(source, path, base)
+    } else {
+        manager.validate(source, path, base)
+    }
 }
 
 fn prepare_migration(
@@ -1228,19 +1442,22 @@ fn prepare_migration(
         if plan.provision {
             CheckoutManager::assert_clean(&plan.source)?;
         } else {
-            let checkout_id = plan
-                .attachment
-                .checkout_id
-                .as_ref()
-                .ok_or_else(|| CheckoutError::Invalid(plan.source.clone()))?;
             let base_revision = plan
                 .attachment
                 .base_revision
                 .as_deref()
                 .ok_or_else(|| CheckoutError::Invalid(plan.source.clone()))?;
-            let path =
-                checkout_manager.path(thread_id, &plan.attachment.repository_id, checkout_id)?;
-            checkout_manager.validate(&plan.source, &path, base_revision)?;
+            let path = plan
+                .checkout_path
+                .as_ref()
+                .ok_or_else(|| CheckoutError::Invalid(plan.source.clone()))?;
+            validate_managed_checkout(
+                &checkout_manager,
+                &plan.source,
+                path,
+                base_revision,
+                plan.repo_local,
+            )?;
         }
     }
     for plan in &mut plans {
@@ -1252,12 +1469,13 @@ fn prepare_migration(
             .checkout_id
             .clone()
             .ok_or_else(|| CheckoutError::Invalid(plan.source.clone()))?;
-        let provisioned = checkout_manager.provision(
+        let provisioned = checkout_manager.provision_repo_local(
             &plan.source,
             thread_id,
             &plan.attachment.repository_id,
             &checkout_id,
         )?;
+        plan.checkout_path = Some(provisioned.path);
         plan.attachment.base_revision = Some(provisioned.base_revision);
         plan.attachment.attach_mode = AttachMode::Isolated;
     }
@@ -1500,6 +1718,14 @@ mod tests {
         assert!(first_thread.repo_attachments.iter().all(|attachment| {
             attachment.checkout_id.is_some() && attachment.base_revision.is_some()
         }));
+        let snapshots = manager.thread_checkouts(&first.id).await.unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots.iter().all(|snapshot| {
+            snapshot.status == trama_protocol::CheckoutStatus::Ready
+                && snapshot.checkout_path.as_ref().is_some_and(|path| {
+                    path.starts_with(&snapshot.source_path.join(".trama/worktrees"))
+                })
+        }));
 
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         let (tx2, mut rx2) = mpsc::unbounded_channel();
@@ -1524,18 +1750,22 @@ mod tests {
         assert_eq!(configs.len(), 2);
         assert_eq!(configs[0].extra_dirs.len(), 1);
         assert_eq!(configs[1].extra_dirs.len(), 1);
+        let sources: Vec<_> = sources
+            .iter()
+            .map(|source| source.canonicalize().unwrap())
+            .collect();
         let first_paths = [&configs[0].cwd, &configs[0].extra_dirs[0]];
         let second_paths = [&configs[1].cwd, &configs[1].extra_dirs[0]];
-        assert!(
-            first_paths
+        assert!(first_paths.iter().all(|path| {
+            sources
                 .iter()
-                .all(|path| path.starts_with(dir.path().join("managed")))
-        );
-        assert!(
-            second_paths
+                .any(|source| path.starts_with(source.join(".trama/worktrees")))
+        }));
+        assert!(second_paths.iter().all(|path| {
+            sources
                 .iter()
-                .all(|path| path.starts_with(dir.path().join("managed")))
-        );
+                .any(|source| path.starts_with(source.join(".trama/worktrees")))
+        }));
         assert!(first_paths.iter().all(|path| !sources.contains(path)));
         assert!(second_paths.iter().all(|path| !sources.contains(path)));
         std::fs::write(first_paths[0].join("same.txt"), "first edit\n").unwrap();
@@ -1580,8 +1810,8 @@ mod tests {
         );
         let resumed_config = after_restart.session_config(&first.id).await.unwrap();
         let expected_path = after_restart
-            .checkout_manager
-            .path(
+            .db
+            .checkout_location(
                 &first.id,
                 &first_thread.repo_attachments[0].repository_id,
                 first_thread.repo_attachments[0]
@@ -1589,6 +1819,8 @@ mod tests {
                     .as_ref()
                     .unwrap(),
             )
+            .await
+            .unwrap()
             .unwrap();
         assert_eq!(resumed_config.cwd, expected_path);
     }
@@ -1651,10 +1883,26 @@ mod tests {
         })
         .await
         .unwrap();
-        let valid_thread = manager
-            .create_thread(workspace.id.clone(), "valid".into())
-            .await
+        // Deliberately model a historical global checkout. Losing its source
+        // must not delete the local work kept outside that source repository.
+        let mut valid_thread = Thread::new_for_workspace(
+            &workspace,
+            &db.list_memberships(&workspace.id).await.unwrap(),
+            Some("valid".into()),
+        );
+        let checkout_id = CheckoutId::generate();
+        let provisioned = manager
+            .checkout_manager
+            .provision(
+                &valid_source,
+                &valid_thread.id,
+                &valid_repo.id,
+                &checkout_id,
+            )
             .unwrap();
+        valid_thread.repo_attachments[0].checkout_id = Some(checkout_id);
+        valid_thread.repo_attachments[0].base_revision = Some(provisioned.base_revision);
+        db.create_thread(&valid_thread).await.unwrap();
         let attachment = db
             .get_thread(&valid_thread.id)
             .await
@@ -2237,9 +2485,16 @@ mod tests {
             .clone();
         assert_eq!(configs.len(), 1);
         assert!(configs[0].resume_external_session.is_none());
-        assert!(configs[0].cwd.starts_with(&managed));
+        assert!(sources.iter().any(|source| {
+            configs[0]
+                .cwd
+                .starts_with(source.canonicalize().unwrap().join(".trama/worktrees"))
+        }));
         assert_eq!(configs[0].extra_dirs.len(), 1);
-        assert!(configs[0].extra_dirs[0].starts_with(&managed));
+        assert!(sources.iter().any(|source| {
+            configs[0].extra_dirs[0]
+                .starts_with(source.canonicalize().unwrap().join(".trama/worktrees"))
+        }));
         assert!(
             sources
                 .iter()
@@ -2284,17 +2539,14 @@ mod tests {
         );
 
         std::fs::remove_file(sources[1].join("dirty.txt")).unwrap();
-        let blocked = manager
-            .checkout_manager
-            .path(
-                &thread.id,
-                &thread.repo_attachments[1].repository_id,
-                &CheckoutId::from("placeholder"),
-            )
-            .unwrap();
-        let parent = blocked.parent().unwrap();
-        std::fs::create_dir_all(parent.parent().unwrap()).unwrap();
-        std::fs::write(parent, "not-a-directory\n").unwrap();
+        let blocked = sources[1].join(".trama");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(
+            blocked.join("foreign.txt"),
+            "foreign content: do not replace\n",
+        )
+        .unwrap();
+        std::fs::write(sources[1].join(".git/info/exclude"), "/.trama/\n").unwrap();
         let failed = manager
             .migrate_legacy_thread(thread.id.clone())
             .await
@@ -2327,7 +2579,7 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&sources[0]).unwrap();
-        std::fs::remove_file(parent).unwrap();
+        std::fs::remove_dir_all(blocked).unwrap();
         let missing = manager
             .migrate_legacy_thread(thread.id.clone())
             .await
@@ -2427,7 +2679,11 @@ mod tests {
             .clone();
         assert_eq!(configs.len(), 1);
         assert!(configs[0].resume_external_session.is_none());
-        assert!(configs[0].cwd.starts_with(&managed));
+        assert!(
+            configs[0]
+                .cwd
+                .starts_with(sources[0].canonicalize().unwrap().join(".trama/worktrees"))
+        );
         assert_ne!(configs[0].cwd, sources[0]);
         assert_eq!(
             std::fs::read_to_string(sources[0].join("same.txt")).unwrap(),

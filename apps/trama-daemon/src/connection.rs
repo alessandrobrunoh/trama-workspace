@@ -215,6 +215,13 @@ async fn handle_line(
             let snapshot = sessions.migrate_legacy_thread(thread_id).await?;
             let _ = out_tx.send(DaemonMessage::ThreadMigrated(snapshot));
         }
+        ClientMessage::GetThreadCheckouts { thread_id } => {
+            let checkouts = sessions.thread_checkouts(&thread_id).await?;
+            let _ = out_tx.send(DaemonMessage::ThreadCheckouts {
+                thread_id,
+                checkouts,
+            });
+        }
         ClientMessage::Shutdown => {
             let _ = shutdown.send(true);
             return Ok(ConnectionControl::Close);
@@ -613,7 +620,7 @@ mod tests {
             &mut client_write,
             &ClientMessage::AddRepository {
                 workspace_id: workspace.id.clone(),
-                path: source,
+                path: source.clone(),
                 alias: "app".into(),
             },
         )
@@ -709,6 +716,10 @@ mod tests {
             .clone();
         assert_eq!(configs.len(), 1);
         assert!(configs[0].resume_external_session.is_none());
-        assert!(configs[0].cwd.starts_with(dir.path().join("managed")));
+        assert!(
+            configs[0]
+                .cwd
+                .starts_with(source.canonicalize().unwrap().join(".trama/worktrees"))
+        );
     }
 }

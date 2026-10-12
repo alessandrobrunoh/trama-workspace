@@ -16,12 +16,14 @@ use trama_domain::ids::{ThreadId, WorkspaceId};
 use trama_protocol::{ClientMessage, DaemonMessage, WorkspaceSnapshot};
 
 use crate::chat::{AgentStatus, ChatPanel};
+use crate::copies::CopyPanel;
 use crate::net::{DaemonClient, NetEvent};
 use crate::onboarding::{Feedback, Link, Onboarding, OnboardingRequest};
 use crate::startup::{DaemonLocate, DaemonStart};
 
 pub struct Workspace {
     chat: Entity<ChatPanel>,
+    copies: Entity<CopyPanel>,
     sidebar: Entity<SidebarPanel>,
     client: DaemonClient,
     connected: bool,
@@ -38,6 +40,7 @@ impl Workspace {
         let (client, events) = crate::net::start();
         let chat_client = client.clone();
         let chat = cx.new(|cx| ChatPanel::new(window, cx, chat_client));
+        let copies = cx.new(|_| CopyPanel::new());
         let sidebar = cx.new(|cx| SidebarPanel::new(window, cx));
 
         let observe_chat = cx.observe(&chat, |_, _, cx| cx.notify());
@@ -59,6 +62,7 @@ impl Workspace {
 
         Self {
             chat,
+            copies,
             sidebar,
             client,
             connected: false,
@@ -100,6 +104,8 @@ impl Workspace {
     }
 
     fn focus_thread(&mut self, thread_id: Option<ThreadId>, cx: &mut Context<Self>) {
+        self.copies
+            .update(cx, |copies, cx| copies.select(thread_id.clone(), cx));
         self.chat.update(cx, |chat, cx| {
             chat.set_thread(None, cx);
             chat.set_thread(thread_id, cx);
@@ -241,6 +247,13 @@ impl Workspace {
 
     fn on_daemon_message(&mut self, message: DaemonMessage, cx: &mut Context<Self>) {
         match message {
+            DaemonMessage::ThreadCheckouts {
+                thread_id,
+                checkouts,
+            } => {
+                self.copies
+                    .update(cx, |copies, cx| copies.apply(&thread_id, checkouts, cx));
+            }
             DaemonMessage::Workspaces(list) => {
                 self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.onboarding.apply_workspaces(list);
@@ -362,7 +375,7 @@ impl Render for Workspace {
             .sidebar
             .read(cx)
             .selected_thread_title()
-            .unwrap_or_else(|| "Select a thread".into());
+            .unwrap_or_else(|| "Seleziona un thread".into());
         let start_daemon = cx.listener(|this, _, _, cx| this.start_daemon(cx));
 
         v_flex()
@@ -423,7 +436,13 @@ impl Render for Workspace {
                     )
                     .child(div().flex_1().min_w_0().h_full().child({
                         if matches!(link, Link::Online) {
-                            self.chat.clone().into_any_element()
+                            v_flex()
+                                .h_full()
+                                .w_full()
+                                .min_h_0()
+                                .child(self.copies.clone())
+                                .child(div().flex_1().min_h_0().child(self.chat.clone()))
+                                .into_any_element()
                         } else {
                             connection_panel(
                                 matches!(link, Link::ProtocolMismatch { .. }),
@@ -578,6 +597,8 @@ struct SidebarPanel {
     clear_workspace_name: bool,
     clear_repo_fields: bool,
     clear_thread_title: bool,
+    editing_workspace: bool,
+    editing_repository: bool,
     picker_open: bool,
     _picker: Option<Task<()>>,
     _workspace_enter: Subscription,
@@ -587,11 +608,12 @@ struct SidebarPanel {
 
 impl SidebarPanel {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let workspace_name = cx.new(|cx| InputState::new(window, cx).placeholder("New workspace"));
-        let repo_path =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Existing local repo path"));
+        let workspace_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Nome del workspace"));
+        let repo_path = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Percorso del repository originale"));
         let repo_alias = cx.new(|cx| InputState::new(window, cx).placeholder("Alias"));
-        let new_thread = cx.new(|cx| InputState::new(window, cx).placeholder("New thread"));
+        let new_thread = cx.new(|cx| InputState::new(window, cx).placeholder("Titolo del thread"));
         let workspace_enter =
             cx.subscribe_in(&workspace_name, window, |this, _, event, window, cx| {
                 if let InputEvent::PressEnter { shift: false, .. } = event {
@@ -617,6 +639,8 @@ impl SidebarPanel {
             clear_workspace_name: false,
             clear_repo_fields: false,
             clear_thread_title: false,
+            editing_workspace: false,
+            editing_repository: false,
             picker_open: false,
             _picker: None,
             _workspace_enter: workspace_enter,
@@ -632,10 +656,12 @@ impl SidebarPanel {
 
     fn mark_workspace_saved(&mut self) {
         self.clear_workspace_name = true;
+        self.editing_workspace = false;
     }
 
     fn mark_repository_saved(&mut self) {
         self.clear_repo_fields = true;
+        self.editing_repository = false;
     }
 
     fn mark_thread_saved(&mut self) {
@@ -755,6 +781,9 @@ impl Render for SidebarPanel {
         let workspaces = self.onboarding.workspaces.clone();
         let selected_workspace = self.onboarding.selected_workspace.clone();
         let repositories = self.onboarding.repositories.clone();
+        let show_workspace_form = self.editing_workspace || workspaces.is_empty();
+        let show_repo_form =
+            self.editing_repository || (selected_workspace.is_some() && repositories.is_empty());
         let repos_loaded = self.onboarding.repositories_loaded();
         let threads = self.onboarding.threads.clone();
         let selected_thread = self.onboarding.selected_thread.clone();
@@ -791,18 +820,9 @@ impl Render for SidebarPanel {
                     .gap_4()
                     .overflow_y_scrollbar()
                     .child(
-                        v_flex().gap_1().child(section_label("Pinned", cx)).child(
-                            div()
-                                .px_2()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("Pinning unavailable"),
-                        ),
-                    )
-                    .child(
                         v_flex()
                             .gap_1()
-                            .child(section_label("Projects", cx))
+                            .child(section_label("Workspace", cx))
                             .when(!detail.is_empty(), |this| {
                                 this.child(feedback_line(
                                     &Feedback::Error(detail.clone()),
@@ -836,7 +856,7 @@ impl Render for SidebarPanel {
                                         .px_2()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child("No workspaces yet. Name one below."),
+                                        .child("Nessun workspace. Usa «Nuovo workspace» per iniziare."),
                                 )
                             })
                             .children(workspace_rows.into_iter().map(|(ws, count)| {
@@ -885,7 +905,14 @@ impl Render for SidebarPanel {
                                             ),
                                     )
                             }))
-                            .child(
+                            .child(Button::new("toggle-workspace-form").ghost().small()
+                                .label("+ Nuovo workspace")
+                                .disabled(!connected)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.editing_workspace = !this.editing_workspace;
+                                    cx.notify();
+                                })))
+                            .when(show_workspace_form, |this| this.child(
                                 h_flex()
                                     .gap_1()
                                     .items_center()
@@ -898,13 +925,13 @@ impl Render for SidebarPanel {
                                     .child(
                                         Button::new("create-workspace")
                                             .ghost()
-                                            .label("New workspace")
+                                            .label("Crea")
                                             .disabled(!can_workspace)
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.submit_workspace(window, cx);
                                             })),
                                     ),
-                            )
+                            ))
                             .children(workspace_feedback.clone().map(|feedback| {
                                 feedback_line(&feedback, cx).into_any_element()
                             })),
@@ -912,7 +939,7 @@ impl Render for SidebarPanel {
                     .child(
                         v_flex()
                             .gap_1()
-                            .child(section_label("Repositories", cx))
+                            .child(section_label("Repository originali", cx))
                             .child(
                                 div()
                                     .px_2()
@@ -932,7 +959,7 @@ impl Render for SidebarPanel {
                                         .px_2()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child("No repositories yet. Add an existing local repo."),
+                                        .child("Nessun repository. Aggiungi una cartella Git esistente."),
                                 )
                             })
                             .children(repositories.iter().cloned().map(|repo| {
@@ -970,20 +997,27 @@ impl Render for SidebarPanel {
                                     .px_2()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("Existing local repo. Remote URLs are not cloned."),
+                                    .child("Repository originale: la cartella resta dov’è. Gli URL remoti non vengono clonati."),
                             )
-                            .child(Input::new(&self.repo_path).id("repo-path"))
-                            .child(
+                            .child(Button::new("toggle-repository-form").ghost().small()
+                                .label("+ Aggiungi repository")
+                                .disabled(!connected || selected_workspace.is_none())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.editing_repository = !this.editing_repository;
+                                    cx.notify();
+                                })))
+                            .when(show_repo_form, |this| this.child(Input::new(&self.repo_path).id("repo-path")))
+                            .when(show_repo_form, |this| this.child(
                                 h_flex().gap_1().items_center().child(
                                     Button::new("choose-repo-dir")
                                         .ghost()
-                                        .label("Choose folder")
+                                        .label("Scegli cartella")
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.choose_folder(cx);
                                         })),
                                 ),
-                            )
-                            .child(
+                            ))
+                            .when(show_repo_form, |this| this.child(
                                 h_flex()
                                     .gap_1()
                                     .items_center()
@@ -995,13 +1029,13 @@ impl Render for SidebarPanel {
                                     .child(
                                         Button::new("add-repo")
                                             .ghost()
-                                            .label("Add repo")
+                                            .label("Aggiungi repository")
                                             .disabled(!can_repo)
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.submit_repository(window, cx);
                                             })),
                                     ),
-                            )
+                            ))
                             .children(
                                 repo_feedback
                                     .clone()
@@ -1027,7 +1061,7 @@ impl Render for SidebarPanel {
                                         .px_2()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child("No threads yet"),
+                                        .child("Nessun thread. Aggiungi un repository, poi crea un thread."),
                                 )
                             })
                             .children(threads.iter().cloned().map(|thread| {
@@ -1071,12 +1105,12 @@ impl Render for SidebarPanel {
                                     .pt_2()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("Prepare isolated checkout is available for the selected thread even when it is not marked legacy."),
+                                    .child("La copia di lavoro è separata dal repository originale. La posizione globale esistente non viene spostata."),
                             )
                             .child(
                                 Button::new("prepare-isolated-checkout")
                                     .ghost()
-                                    .label("Prepare isolated checkout")
+                                    .label("Prepara copia di lavoro")
                                     .disabled(!can_prepare)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.open_prepare(window, cx);
@@ -1099,7 +1133,7 @@ impl Render for SidebarPanel {
                                         .child(
                                             Button::new("create-thread")
                                                 .ghost()
-                                                .label("New")
+                                                .label("Nuovo thread")
                                                 .disabled(!can_thread)
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     this.submit_thread(window, cx);

@@ -1,7 +1,9 @@
 mod agent;
 mod chat;
 mod composer;
+mod copies;
 mod dialog;
+mod editor;
 mod net;
 mod onboarding;
 mod startup;

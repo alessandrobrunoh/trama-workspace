@@ -4,7 +4,7 @@ use crate::codec::{
 };
 use crate::store::TramaDb;
 use chrono::Utc;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use trama_domain::Result;
 use trama_domain::agent::{AgentSession, UsageReport};
@@ -152,7 +152,16 @@ impl TramaDb {
     }
 
     pub async fn create_thread(&self, thread: &Thread) -> Result<()> {
+        self.create_thread_with_locations(thread, &[]).await
+    }
+
+    pub async fn create_thread_with_locations(
+        &self,
+        thread: &Thread,
+        locations: &[crate::CheckoutLocation],
+    ) -> Result<()> {
         let thread = thread.clone();
+        let locations = locations.to_vec();
         self.blocking_mut(move |conn| {
             let tx = conn.transaction().map_err(sql_err)?;
             let now = rfc3339(Utc::now());
@@ -186,6 +195,12 @@ impl TramaDb {
                 )
                 .map_err(sql_err)?;
             }
+            crate::checkouts::insert_locations(
+                &tx,
+                &thread.id.to_string(),
+                &thread.repo_attachments,
+                &locations,
+            )?;
             tx.commit().map_err(sql_err)?;
             Ok(())
         })
@@ -892,8 +907,21 @@ impl TramaDb {
         message: &Message,
         event: &EventRecord,
     ) -> Result<()> {
+        self.persist_thread_migration_with_locations(thread_id, attachments, message, event, &[])
+            .await
+    }
+
+    pub async fn persist_thread_migration_with_locations(
+        &self,
+        thread_id: &ThreadId,
+        attachments: &[ThreadRepositoryAttachment],
+        message: &Message,
+        event: &EventRecord,
+        locations: &[crate::CheckoutLocation],
+    ) -> Result<()> {
         let thread_id = thread_id.to_string();
         let attachments = attachments.to_vec();
+        let locations = locations.to_vec();
         let message = message.clone();
         let event = event.clone();
         self.blocking_mut(move |conn| {
@@ -920,6 +948,7 @@ impl TramaDb {
                     )));
                 }
             }
+            crate::checkouts::insert_locations(&tx, &thread_id, &attachments, &locations)?;
             tx.execute(
                 "UPDATE agent_sessions SET external_session_id = NULL WHERE thread_id = ?1",
                 params![thread_id],
