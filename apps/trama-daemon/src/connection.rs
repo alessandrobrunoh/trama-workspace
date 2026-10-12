@@ -368,6 +368,62 @@ async fn handle_line(
                 verdict,
             });
         }
+        ClientMessage::SendComments { thread_id } => {
+            if let Err(error) = sessions.send_comments(thread_id.clone()).await {
+                let message = error.to_string();
+                let _ = out_tx.send(DaemonMessage::Error {
+                    code: error.code().into(),
+                    message: message.clone(),
+                });
+                let _ = out_tx.send(DaemonMessage::AgentEventEnvelope {
+                    thread_id,
+                    event: trama_domain::agent::AgentEvent::Failed { message },
+                });
+            }
+        }
+        // Comment changes are broadcast to the thread's subscribers; a
+        // requester that is not subscribed gets the reply directly.
+        ClientMessage::CreateComment {
+            thread_id,
+            target,
+            body,
+            parent_comment_id,
+        } => {
+            let snapshot = sessions
+                .create_comment(thread_id.clone(), target, body, parent_comment_id)
+                .await?;
+            if !subscriptions.contains_key(&thread_id) {
+                let _ = out_tx.send(DaemonMessage::CommentCreated(snapshot));
+            }
+        }
+        ClientMessage::ListComments { thread_id } => {
+            let comments = sessions.list_comments(&thread_id).await?;
+            let _ = out_tx.send(DaemonMessage::Comments {
+                thread_id,
+                comments,
+            });
+        }
+        ClientMessage::ResolveComment { comment_id } => {
+            let snapshot = sessions.resolve_comment(&comment_id).await?;
+            if !subscriptions.contains_key(&snapshot.thread_id) {
+                let _ = out_tx.send(DaemonMessage::CommentUpdated(snapshot));
+            }
+        }
+        ClientMessage::ReopenComment { comment_id } => {
+            let snapshot = sessions.reopen_comment(&comment_id).await?;
+            if !subscriptions.contains_key(&snapshot.thread_id) {
+                let _ = out_tx.send(DaemonMessage::CommentUpdated(snapshot));
+            }
+        }
+        ClientMessage::DeleteComment { comment_id } => {
+            let (thread_id, comment_ids) = sessions.delete_comment(&comment_id).await?;
+            if !subscriptions.contains_key(&thread_id) {
+                let _ = out_tx.send(DaemonMessage::CommentDeleted {
+                    thread_id,
+                    comment_ids,
+                });
+            }
+        }
         ClientMessage::Shutdown => {
             let _ = shutdown.send(true);
             return Ok(ConnectionControl::Close);
@@ -484,6 +540,127 @@ mod tests {
                 thread_id: id,
                 event: AgentEvent::Failed { .. }
             } if id == thread_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn comment_commands_reply_once_whether_or_not_subscribed() {
+        use trama_domain::comment::{CodeAnchor, CommentTarget};
+        let sessions = test_sessions().await;
+        let workspace_id = sessions.default_workspace_id().await.unwrap();
+        let thread = sessions
+            .create_thread(workspace_id, "comments".into())
+            .await
+            .unwrap();
+        let checkouts = sessions.thread_checkouts(&thread.id).await.unwrap();
+        let target = CommentTarget::Code {
+            anchor: CodeAnchor {
+                repository_id: checkouts[0].repository_id.clone(),
+                path: "same.txt".into(),
+                revision: 0,
+                start_line: 1,
+                end_line: 1,
+                text_hash: None,
+                context_hash: None,
+            },
+        };
+        let create = serde_json::to_string(&ClientMessage::CreateComment {
+            thread_id: thread.id.clone(),
+            target,
+            body: "why?".into(),
+            parent_comment_id: None,
+        })
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (shutdown, _) = watch::channel(false);
+        let mut subscriptions = HashMap::new();
+
+        // Not subscribed: the requester gets the reply directly.
+        handle_line(&create, &sessions, &tx, &mut subscriptions, &shutdown)
+            .await
+            .unwrap();
+        let first = match rx.try_recv().unwrap() {
+            DaemonMessage::CommentCreated(snapshot) => snapshot,
+            other => panic!("expected comment_created, got {other:?}"),
+        };
+        assert_eq!(first.excerpt.as_deref(), Some("source"));
+        assert!(rx.try_recv().is_err());
+
+        // Subscribed: exactly one copy, through the broadcast.
+        let subscribe = serde_json::to_string(&ClientMessage::SubscribeThread {
+            thread_id: thread.id.clone(),
+        })
+        .unwrap();
+        handle_line(&subscribe, &sessions, &tx, &mut subscriptions, &shutdown)
+            .await
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+        handle_line(&create, &sessions, &tx, &mut subscriptions, &shutdown)
+            .await
+            .unwrap();
+        let second = match rx.try_recv().unwrap() {
+            DaemonMessage::CommentCreated(snapshot) => snapshot,
+            other => panic!("expected comment_created, got {other:?}"),
+        };
+        assert!(rx.try_recv().is_err());
+
+        let delete = serde_json::to_string(&ClientMessage::DeleteComment {
+            comment_id: second.id.clone(),
+        })
+        .unwrap();
+        handle_line(&delete, &sessions, &tx, &mut subscriptions, &shutdown)
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            DaemonMessage::CommentDeleted { comment_ids, .. } if comment_ids == vec![second.id.clone()]
+        ));
+        assert!(rx.try_recv().is_err());
+
+        let list = serde_json::to_string(&ClientMessage::ListComments {
+            thread_id: thread.id.clone(),
+        })
+        .unwrap();
+        handle_line(&list, &sessions, &tx, &mut subscriptions, &shutdown)
+            .await
+            .unwrap();
+        match rx.try_recv().unwrap() {
+            DaemonMessage::Comments { comments, .. } => {
+                assert_eq!(comments.len(), 1);
+                assert_eq!(comments[0].id, first.id);
+            }
+            other => panic!("expected comments, got {other:?}"),
+        }
+
+        // Resolved comments are not delivered, so nothing is left to send.
+        let resolve = serde_json::to_string(&ClientMessage::ResolveComment {
+            comment_id: first.id.clone(),
+        })
+        .unwrap();
+        handle_line(&resolve, &sessions, &tx, &mut subscriptions, &shutdown)
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            DaemonMessage::CommentUpdated(snapshot) if snapshot.id == first.id
+        ));
+        let send = serde_json::to_string(&ClientMessage::SendComments {
+            thread_id: thread.id.clone(),
+        })
+        .unwrap();
+        handle_line(&send, &sessions, &tx, &mut subscriptions, &shutdown)
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            DaemonMessage::Error { code, .. } if code == "invalid"
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            DaemonMessage::AgentEventEnvelope {
+                event: AgentEvent::Failed { .. },
+                ..
+            }
         ));
     }
 

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// A comment anchored to code, designed to survive edits.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeAnchor {
     pub repository_id: RepositoryId,
     /// Relative to the repository's checkout root.
@@ -33,7 +33,7 @@ pub enum AnchorStatus {
     Orphaned,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "target", rename_all = "snake_case")]
 pub enum CommentTarget {
     MessageRange {

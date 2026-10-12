@@ -24,20 +24,24 @@
 //! repository membership, and legacy-thread migration. **3** added thread
 //! checkout discovery. **4** added the approval channel
 //! ([`ClientMessage::ApprovalHook`], [`DaemonMessage::ApprovalHookDecision`])
-//! and the `session_info` / `approval_resolved` agent events. **5** adds
-//! subthreads, changes, pull changes, review verdicts and land results. Each
-//! bump is transport-only. Persisted domain ids and SQLite rows are not rewritten.
+//! and the `session_info` / `approval_resolved` agent events. **5** added
+//! subthreads, changes, pull changes, review verdicts and land results. **6**
+//! adds anchored comments (create, list, reply, resolve, reopen, delete, send)
+//! and delivers pending comments with `SendPrompt`. Each bump is
+//! transport-only. Persisted domain ids and SQLite rows are not rewritten.
 //!
 //! A version mismatch fails the handshake (`Welcome.accepted = false`). Extra object
 //! fields inside a known payload are ignored (serde default). Bump [`PROTOCOL_VERSION`]
 //! again for further tag or payload shape changes.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::PathBuf;
 
 pub use trama_domain::agent::{AgentEvent, ApprovalDecision, BillingSource, UsageReport};
-pub use trama_domain::ids::{RepositoryId, ThreadId, WorkspaceId};
-pub use trama_domain::message::Message;
+pub use trama_domain::comment::{AnchorStatus, CodeAnchor, CommentDelivery, CommentTarget};
+pub use trama_domain::ids::{CommentId, MessageId, RepositoryId, ThreadId, WorkspaceId};
+pub use trama_domain::message::{Actor, Message};
 pub use trama_domain::subthread::{
     FileChange, FileChangeStatus, LandOutcome, PullFileOutcome, PullFileResult, RepoPullResult,
     ReviewVerdict,
@@ -46,12 +50,15 @@ pub use trama_domain::thread::ThreadKind;
 
 /// Wire protocol version carried in `Hello` / `Welcome`.
 ///
-/// Version 5 adds subthreads (create/list, parent and kind in thread
+/// Version 6 adds anchored comments: `CreateComment`, `ListComments`,
+/// `ResolveComment`, `ReopenComment`, `DeleteComment`, `SendComments`, and
+/// `SendPrompt` now delivers the thread's pending comments with the prompt.
+/// Version 5 added subthreads (create/list, parent and kind in thread
 /// snapshots), changes, pull changes, review verdicts and land results.
 /// Version 4 added the Claude approval channel and 3 thread checkout
 /// discovery. It does not migrate stored data; peers with a different version
 /// are rejected at handshake time.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Environment variable that relocates the whole app-data directory (socket,
 /// database, config, legacy checkouts). Use it for isolated test instances
@@ -102,6 +109,9 @@ pub enum ClientMessage {
     UnsubscribeThread {
         thread_id: ThreadId,
     },
+    /// Run a turn. The thread's pending comments are delivered with it: the
+    /// agent receives a comment block followed by `text`, and the stored user
+    /// message holds exactly what was sent.
     SendPrompt {
         thread_id: ThreadId,
         text: String,
@@ -181,7 +191,80 @@ pub enum ClientMessage {
         review_thread_id: ThreadId,
         verdict: ReviewVerdict,
     },
+    /// Comment on a transcript span, code lines or a diff hunk of this thread
+    /// (a subthread's comments stay in the subthread). For `Code` targets the
+    /// daemon reads the file in the thread's checkout and fills the anchor's
+    /// hashes itself; client-sent hashes are ignored. A reply sets
+    /// `parent_comment_id` and repeats the parent's target. The comment is
+    /// pending until the next `SendPrompt` or `SendComments`. Answered with
+    /// `CommentCreated` (also broadcast to the thread's subscribers).
+    CreateComment {
+        thread_id: ThreadId,
+        target: CommentTarget,
+        body: String,
+        #[serde(default)]
+        parent_comment_id: Option<CommentId>,
+    },
+    /// Answered with `Comments`; code anchors are relocated against the
+    /// thread's current checkout.
+    ListComments {
+        thread_id: ThreadId,
+    },
+    /// Resolve a root comment (its replies follow it). Resolved comments are
+    /// never delivered. Answered with `CommentUpdated`.
+    ResolveComment {
+        comment_id: CommentId,
+    },
+    ReopenComment {
+        comment_id: CommentId,
+    },
+    /// Delete one of your own pending comments (with its pending replies).
+    /// Answered with `CommentDeleted`.
+    DeleteComment {
+        comment_id: CommentId,
+    },
+    /// Deliver the pending comments without extra text, as a turn of their
+    /// own. Fails when nothing is pending.
+    SendComments {
+        thread_id: ThreadId,
+    },
     Shutdown,
+}
+
+/// Where a comment is in its lifecycle. Serialized with a `kind` tag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommentState {
+    /// Not yet sent to the agent.
+    Pending,
+    /// Sent with the user prompt `message_id` (turn `turn`);
+    /// `answer_message_id` is set once that turn's reply is stored.
+    Delivered(CommentDelivery),
+    /// Resolved by a person; `delivery` keeps where it was answered, if it
+    /// was delivered.
+    Resolved {
+        resolved_at: DateTime<Utc>,
+        delivery: Option<CommentDelivery>,
+    },
+}
+
+/// One comment as the UI shows it. Replies are separate snapshots that carry
+/// `parent_comment_id`; resolution lives on the root.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommentSnapshot {
+    pub id: CommentId,
+    pub thread_id: ThreadId,
+    pub parent_comment_id: Option<CommentId>,
+    pub author: Actor,
+    pub target: CommentTarget,
+    pub body: String,
+    /// The anchored passage captured at creation.
+    pub excerpt: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub state: CommentState,
+    /// Code targets only: where the anchor is in the current checkout.
+    /// `orphaned` comments stay visible but are never reattached.
+    pub anchor_status: Option<AnchorStatus>,
 }
 
 /// The kind of subthread to create.
@@ -314,6 +397,22 @@ pub enum DaemonMessage {
         parent_thread_id: ThreadId,
         outcome: LandOutcome,
         summary: String,
+    },
+    /// A comment was created. Sent to the thread's subscribers, and to the
+    /// requester when it is not subscribed.
+    CommentCreated(CommentSnapshot),
+    /// A comment changed state (delivered, answered, resolved, reopened, or
+    /// pending again after a failed send). Same audience as `CommentCreated`.
+    CommentUpdated(CommentSnapshot),
+    /// Reply to `ListComments`: every comment of the thread, oldest first.
+    Comments {
+        thread_id: ThreadId,
+        comments: Vec<CommentSnapshot>,
+    },
+    /// Pending comments were deleted (a root with its replies).
+    CommentDeleted {
+        thread_id: ThreadId,
+        comment_ids: Vec<CommentId>,
     },
 }
 
@@ -743,8 +842,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_five() {
-        assert_eq!(PROTOCOL_VERSION, 5);
+    fn protocol_version_is_six() {
+        assert_eq!(PROTOCOL_VERSION, 6);
     }
 
     #[test]
@@ -873,6 +972,170 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.kind, ThreadKind::Top);
         assert!(legacy.parent_thread_id.is_none());
+    }
+
+    #[test]
+    fn comment_contract_shapes() {
+        let tid = thread_id();
+        let cid = CommentId::from("01hcomment00000000000000001");
+        let code = CommentTarget::Code {
+            anchor: CodeAnchor {
+                repository_id: RepositoryId::from("repo"),
+                path: PathBuf::from("src/lib.rs"),
+                revision: 0,
+                start_line: 3,
+                end_line: 4,
+                text_hash: None,
+                context_hash: None,
+            },
+        };
+        let client = [
+            ClientMessage::CreateComment {
+                thread_id: tid.clone(),
+                target: code.clone(),
+                body: "rename".into(),
+                parent_comment_id: None,
+            },
+            ClientMessage::CreateComment {
+                thread_id: tid.clone(),
+                target: CommentTarget::MessageRange {
+                    message_id: MessageId::from("m1"),
+                    start_byte: 0,
+                    end_byte: 5,
+                },
+                body: "why?".into(),
+                parent_comment_id: Some(cid.clone()),
+            },
+            ClientMessage::ListComments {
+                thread_id: tid.clone(),
+            },
+            ClientMessage::ResolveComment {
+                comment_id: cid.clone(),
+            },
+            ClientMessage::ReopenComment {
+                comment_id: cid.clone(),
+            },
+            ClientMessage::DeleteComment {
+                comment_id: cid.clone(),
+            },
+            ClientMessage::SendComments {
+                thread_id: tid.clone(),
+            },
+        ];
+        for msg in &client {
+            roundtrip_eq(msg);
+            roundtrip_json(msg);
+        }
+        assert_eq!(
+            serde_json::to_value(&client[0]).unwrap(),
+            serde_json::json!({"type":"create_comment","payload":{
+                "thread_id": tid.to_string(),
+                "target": {"target":"code","anchor":{
+                    "repository_id":"repo","path":"src/lib.rs","revision":0,
+                    "start_line":3,"end_line":4,"text_hash":null,"context_hash":null}},
+                "body":"rename","parent_comment_id":null}})
+        );
+        assert_eq!(
+            serde_json::to_value(&client[6]).unwrap(),
+            serde_json::json!({"type":"send_comments","payload":{"thread_id": tid.to_string()}})
+        );
+        // A UI may omit the parent, the revision and the hashes.
+        let minimal: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type":"create_comment","payload":{
+                "thread_id": tid.to_string(),
+                "target":{"target":"diff_hunk","repository_id":"repo","path":"a.rs",
+                    "base_revision":"abc","hunk_header":"@@ -1,2 +1,3 @@"},
+                "body":"hm"}}))
+        .unwrap();
+        assert!(matches!(
+            minimal,
+            ClientMessage::CreateComment {
+                parent_comment_id: None,
+                target: CommentTarget::DiffHunk { .. },
+                ..
+            }
+        ));
+        let lean: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type":"create_comment","payload":{
+                "thread_id": tid.to_string(),
+                "target":{"target":"code","anchor":{"repository_id":"repo",
+                    "path":"src/lib.rs","start_line":1,"end_line":1}},
+                "body":"hm"}}))
+        .unwrap();
+        assert!(matches!(lean, ClientMessage::CreateComment { .. }));
+
+        let created_at = "2026-10-12T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let delivery = CommentDelivery {
+            message_id: MessageId::from("m2"),
+            turn: 3,
+            delivered_at: created_at,
+            answer_message_id: Some(MessageId::from("m3")),
+        };
+        let snapshot = CommentSnapshot {
+            id: cid.clone(),
+            thread_id: tid.clone(),
+            parent_comment_id: None,
+            author: Actor::Human { id: "user".into() },
+            target: code,
+            body: "rename".into(),
+            excerpt: Some("let a = 1;\nlet b = 2;".into()),
+            created_at,
+            state: CommentState::Delivered(delivery.clone()),
+            anchor_status: Some(AnchorStatus::Resolved { line: 5 }),
+        };
+        let json = serde_json::to_value(DaemonMessage::CommentUpdated(snapshot.clone())).unwrap();
+        assert_eq!(json["type"], "comment_updated");
+        assert_eq!(
+            json["payload"]["state"],
+            serde_json::json!({"kind":"delivered","message_id":"m2","turn":3,
+                "delivered_at":"2026-10-12T10:00:00Z","answer_message_id":"m3"})
+        );
+        assert_eq!(
+            json["payload"]["anchor_status"],
+            serde_json::json!({"resolved":{"line":5}})
+        );
+        assert_eq!(
+            json["payload"]["author"],
+            serde_json::json!({"kind":"human","id":"user"})
+        );
+        let mut pending = snapshot.clone();
+        pending.state = CommentState::Pending;
+        pending.anchor_status = Some(AnchorStatus::Orphaned);
+        let json = serde_json::to_value(&pending).unwrap();
+        assert_eq!(json["state"], serde_json::json!({"kind":"pending"}));
+        assert_eq!(json["anchor_status"], "orphaned");
+        let mut resolved = snapshot.clone();
+        resolved.state = CommentState::Resolved {
+            resolved_at: created_at,
+            delivery: Some(delivery),
+        };
+        assert_eq!(
+            serde_json::to_value(&resolved).unwrap()["state"]["kind"],
+            "resolved"
+        );
+        for state in [&snapshot, &pending, &resolved] {
+            roundtrip_eq(state);
+        }
+        let daemon = [
+            DaemonMessage::CommentCreated(pending),
+            DaemonMessage::CommentUpdated(resolved.clone()),
+            DaemonMessage::Comments {
+                thread_id: tid.clone(),
+                comments: vec![snapshot, resolved],
+            },
+            DaemonMessage::CommentDeleted {
+                thread_id: tid.clone(),
+                comment_ids: vec![cid.clone()],
+            },
+        ];
+        for msg in &daemon {
+            roundtrip_json(msg);
+        }
+        assert_eq!(
+            serde_json::to_value(&daemon[3]).unwrap(),
+            serde_json::json!({"type":"comment_deleted","payload":{
+                "thread_id": tid.to_string(), "comment_ids":[cid.to_string()]}})
+        );
     }
 
     #[test]

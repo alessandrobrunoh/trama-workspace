@@ -1,5 +1,6 @@
 //! Persistent session manager: TramaDB + injected `AgentAdapter`.
 
+mod comments;
 mod subthreads;
 
 use crate::approval::{self, ApprovalHookSettings, HookDecision};
@@ -17,7 +18,7 @@ use trama_domain::agent::{
     SessionConfig, UsageReport,
 };
 use trama_domain::event::{Aggregate, DomainEvent, EventRecord, EventStore};
-use trama_domain::ids::{AgentSessionId, CheckoutId, MessageId, ThreadId, WorkspaceId};
+use trama_domain::ids::{AgentSessionId, CheckoutId, CommentId, MessageId, ThreadId, WorkspaceId};
 use trama_domain::message::{Actor, ContentBlock, Message, Role};
 use trama_domain::thread::{AttachMode, Thread, ThreadRepositoryAttachment};
 use trama_domain::workspace::{Repository, Workspace, WorkspaceMembership};
@@ -61,6 +62,9 @@ struct ThreadRuntime {
     session_allowed_tools: HashSet<String>,
     /// Last `SessionInfo` of the live session, replayed to new subscribers.
     session_info: Option<AgentEvent>,
+    /// User prompt of the in-flight turn that delivered comments; taken when
+    /// the turn ends to link (or return) them.
+    comments_delivered_with: Option<MessageId>,
 }
 
 /// A permission request blocking a Claude Code hook process. The hook's
@@ -843,10 +847,26 @@ impl SessionManager {
         }
     }
 
-    /// Persist the user message, then spawn the adapter turn.
-    /// A second prompt on a busy or migrating thread returns
-    /// [`DaemonError::Busy`].
+    /// Persist the user message, then spawn the adapter turn. The thread's
+    /// pending comments go out with it, as a block before `text`; the stored
+    /// message is exactly the prompt sent. A second prompt on a busy or
+    /// migrating thread returns [`DaemonError::Busy`].
     pub async fn send_prompt(&self, thread_id: ThreadId, text: String) -> Result<Message> {
+        self.start_turn(thread_id, text, false).await
+    }
+
+    /// Deliver the pending comments as a turn of their own. Fails with
+    /// [`DaemonError::Invalid`] when nothing is pending.
+    pub async fn send_comments(&self, thread_id: ThreadId) -> Result<Message> {
+        self.start_turn(thread_id, String::new(), true).await
+    }
+
+    async fn start_turn(
+        &self,
+        thread_id: ThreadId,
+        text: String,
+        comments_only: bool,
+    ) -> Result<Message> {
         if self.db.get_thread(&thread_id).await?.is_none() {
             return Err(DaemonError::NotFound(format!("thread {thread_id}")));
         }
@@ -859,6 +879,7 @@ impl SessionManager {
             thread.reservation = Some(Reservation::Turn);
             thread.interrupt_requested = false;
             thread.acc_text.clear();
+            thread.comments_delivered_with = None;
         }
         // Reject a prompt that cannot run before it is stored, so a failed send
         // is not replayed or started later without another user action. The
@@ -869,25 +890,58 @@ impl SessionManager {
             return Err(err);
         }
 
-        let message = Message::new_user(thread_id.clone(), "user", text.clone());
-        if let Err(err) = self.db.append_message(&message).await {
+        let delivery = match self.pending_delivery(&thread_id).await {
+            Ok(delivery) => delivery,
+            Err(err) => {
+                self.release_turn(&thread_id);
+                return Err(err);
+            }
+        };
+        if comments_only && delivery.is_none() {
             self.release_turn(&thread_id);
-            return Err(err.into());
+            return Err(DaemonError::Invalid(
+                "there are no pending comments to send".into(),
+            ));
         }
-        if let Err(err) = self
-            .append_event(
-                Aggregate::Thread {
-                    id: thread_id.clone(),
-                },
-                message.actor.clone(),
-                DomainEvent::MessageAdded {
-                    message: message.clone(),
-                },
-            )
-            .await
-        {
-            crate::log::warn(format!("failed to append MessageAdded: {err}"));
-        }
+        let prompt = comments::compose_prompt(
+            delivery.as_ref().map(|delivery| delivery.block.as_str()),
+            &text,
+        );
+        let message = Message::new_user(thread_id.clone(), comments::LOCAL_USER, prompt.clone());
+        let delivered_ids = match &delivery {
+            None => {
+                if let Err(err) = self.db.append_message(&message).await {
+                    self.release_turn(&thread_id);
+                    return Err(err.into());
+                }
+                if let Err(err) = self
+                    .append_event(
+                        Aggregate::Thread {
+                            id: thread_id.clone(),
+                        },
+                        message.actor.clone(),
+                        DomainEvent::MessageAdded {
+                            message: message.clone(),
+                        },
+                    )
+                    .await
+                {
+                    crate::log::warn(format!("failed to append MessageAdded: {err}"));
+                }
+                Vec::new()
+            }
+            Some(delivery) => {
+                if let Err(err) = self.persist_delivery(&message, &delivery.ids).await {
+                    self.release_turn(&thread_id);
+                    return Err(err);
+                }
+                let mut inner = self.lock();
+                if let Some(thread) = inner.threads.get_mut(&thread_id) {
+                    thread.comments_delivered_with = Some(message.id.clone());
+                }
+                delivery.ids.clone()
+            }
+        };
 
         self.broadcast(
             &thread_id,
@@ -896,14 +950,50 @@ impl SessionManager {
                 message: message.clone(),
             },
         );
+        self.broadcast_comment_updates(&thread_id, &delivered_ids)
+            .await;
 
         let manager = self.clone();
         tokio::spawn(async move {
-            if let Err(failure) = manager.run_turn(thread_id.clone(), text).await {
+            if let Err(failure) = manager.run_turn(thread_id.clone(), prompt).await {
                 manager.handle_turn_failure(&thread_id, failure).await;
             }
         });
         Ok(message)
+    }
+
+    /// Store the prompt carrying comments and mark them delivered, atomically.
+    async fn persist_delivery(&self, message: &Message, ids: &[CommentId]) -> Result<()> {
+        let thread_id = &message.thread_id;
+        let turn = self.db.count_user_prompts(thread_id).await? + 1;
+        let aggregate = Aggregate::Thread {
+            id: thread_id.clone(),
+        };
+        let events = vec![
+            EventRecord::new(
+                aggregate.clone(),
+                message.actor.clone(),
+                DomainEvent::MessageAdded {
+                    message: message.clone(),
+                },
+                vec![],
+            )?,
+            EventRecord::new(
+                aggregate,
+                message.actor.clone(),
+                DomainEvent::CommentsDelivered {
+                    thread_id: thread_id.clone(),
+                    comment_ids: ids.to_vec(),
+                    message_id: message.id.clone(),
+                    turn,
+                },
+                vec![],
+            )?,
+        ];
+        self.db
+            .deliver_comments(message, ids, turn, &events)
+            .await?;
+        Ok(())
     }
 
     pub async fn interrupt(&self, thread_id: &ThreadId) -> Result<bool> {
@@ -1347,6 +1437,13 @@ impl SessionManager {
             format!("The agent did not run: {}", failure.error)
         };
         self.append_system_notice(thread_id, text).await;
+        if failure.agent_started {
+            // The session may have read part of the prompt; never redeliver
+            // silently, but the comments are not answered either.
+            self.take_turn_delivery(thread_id);
+        } else {
+            self.return_undelivered_comments(thread_id).await;
+        }
         self.release_turn(thread_id);
         self.broadcast(
             thread_id,
@@ -1396,6 +1493,7 @@ impl SessionManager {
         };
         if interrupted {
             let _ = self.adapter.interrupt(&session).await;
+            self.return_undelivered_comments(&thread_id).await;
             self.release_turn(&thread_id);
             return Ok(());
         }
@@ -1717,6 +1815,8 @@ impl SessionManager {
         if !reserved {
             return;
         }
+        // The agent received the prompt: its comments stay delivered, unanswered.
+        self.take_turn_delivery(thread_id);
         let mut text = if interrupted {
             format!("The agent turn was interrupted: {failure}")
         } else {
@@ -1756,7 +1856,8 @@ impl SessionManager {
             session.id.clone(),
             vec![ContentBlock::Text { text }],
         );
-        if let Err(err) = self.db.append_message(&assistant).await {
+        let persisted = self.db.append_message(&assistant).await;
+        if let Err(err) = &persisted {
             crate::log::warn(format!("failed to persist assistant message: {err}"));
         } else if let Err(err) = self
             .append_event(
@@ -1773,6 +1874,7 @@ impl SessionManager {
             crate::log::warn(format!("failed to append assistant MessageAdded: {err}"));
         }
 
+        let answer_id = assistant.id.clone();
         self.broadcast(
             thread_id,
             DaemonMessage::MessageAppended {
@@ -1780,6 +1882,11 @@ impl SessionManager {
                 message: assistant,
             },
         );
+        if persisted.is_ok() {
+            self.link_comment_answers(thread_id, &answer_id).await;
+        } else {
+            self.take_turn_delivery(thread_id);
+        }
 
         if let Err(err) = self
             .append_event(
@@ -1865,6 +1972,7 @@ impl SessionManager {
         if !in_flight {
             return;
         }
+        self.take_turn_delivery(thread_id);
         let mut text = "The agent session ended unexpectedly before the turn completed.".to_owned();
         if !partial.is_empty() {
             text.push_str("\n\nPartial output before the session ended:\n");

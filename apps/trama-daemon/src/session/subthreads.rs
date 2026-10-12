@@ -38,10 +38,10 @@ impl Drop for CheckoutsGuard {
 }
 
 /// One managed checkout of a thread, validated.
-struct ResolvedCheckout {
-    repository_id: RepositoryId,
-    title: String,
-    path: PathBuf,
+pub(super) struct ResolvedCheckout {
+    pub(super) repository_id: RepositoryId,
+    pub(super) title: String,
+    pub(super) path: PathBuf,
     source: PathBuf,
     base_revision: String,
 }
@@ -69,7 +69,7 @@ impl SessionManager {
     }
 
     /// Validated managed checkouts of `thread`, in attachment order.
-    async fn resolve_checkouts(&self, thread: &Thread) -> Result<Vec<ResolvedCheckout>> {
+    pub(super) async fn resolve_checkouts(&self, thread: &Thread) -> Result<Vec<ResolvedCheckout>> {
         let memberships = match &thread.workspace_id {
             Some(workspace) => self.db.list_memberships(workspace).await?,
             None => Vec::new(),

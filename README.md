@@ -15,6 +15,8 @@ Thread creation requires each source repo to be clean. Uncommitted or non-ignore
 
 Subthreads (plain, review, land) are children of a top-level thread and cannot nest. A subthread gets its own repo-local copy of each parent checkout at its current state (uncommitted and untracked non-ignored files included, ignored files never) and forks the parent's Claude session (`--resume <id> --fork-session`); it then diverges. **Changes** diffs a thread against its base, `HEAD`, or the last turn's starting state; **Pull Changes** merges a subthread's edits since its fork point into the parent's working tree file by file and reports conflicts, without committing. A review subthread starts with a change guide and its verdict (approve / request changes) is posted to the parent. A land subthread follows the repository's land skill (`SKILL.md` with `metadata: { trama-action: land }` under `.claude/skills` or `.agents/skills`) or proposes one; Trama itself still never pushes or merges.
 
+Comments anchor to a transcript span (byte range of the message text), to code lines in a thread's checkout, or to a diff hunk, and support replies and resolve/reopen. A new comment is pending until the next prompt (or an explicit **send comments**): the agent then receives a `<review-comments>` block quoting each anchored passage, followed by the user's text, and the stored user message is exactly what was sent. Delivered comments record the prompt and turn that carried them and the assistant message that answered. Code anchors are relocated against the current checkout on every listing (resolved line, fuzzy, or orphaned; never reattached silently). A subthread's comments stay in that subthread.
+
 ## Crate map
 
 ```
@@ -55,11 +57,11 @@ Do not override `HOME` for that: the `claude` child process needs your real
 Starting the binaries directly does not acquire Cargo's build lock. Do not
 start parallel `cargo run`/check/test commands while building. The desktop also
 offers **Start daemon** when the sibling binary is installed and no daemon is
-listening. Stop old app/daemon processes before restarting with protocol v5.
+listening. Stop old app/daemon processes before restarting with protocol v6.
 Build profiles and editor-check settings are described in
 [build and disk usage](docs/build-and-space.md).
 
-The UI and daemon speak newline-delimited JSON (`crates/trama-protocol`). First message on a connection must be `Hello` with `protocol_version = 5`. A mismatch is rejected at the handshake; it does not rewrite stored threads or workspace ids. See [onboarding and legacy migration](docs/onboarding-and-migration.md).
+The UI and daemon speak newline-delimited JSON (`crates/trama-protocol`). First message on a connection must be `Hello` with `protocol_version = 6`. A mismatch is rejected at the handshake; it does not rewrite stored threads or workspace ids. See [onboarding and legacy migration](docs/onboarding-and-migration.md).
 
 ## Roadmap
 
