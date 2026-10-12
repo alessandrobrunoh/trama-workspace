@@ -17,6 +17,7 @@ mod startup;
 mod subthreads;
 mod theme;
 mod tools;
+mod turns;
 mod workspace;
 
 use std::borrow::Cow;
@@ -31,6 +32,7 @@ gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
         ArrowUpRight,
+        Bookmark,
         Brain,
         CircleCheckBig,
         Command,
