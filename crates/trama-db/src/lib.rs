@@ -9,6 +9,7 @@
 
 mod activity;
 mod agents;
+mod archive;
 mod checkouts;
 mod codec;
 mod collab;
@@ -23,6 +24,7 @@ mod store;
 mod subthreads;
 
 pub use agents::SubagentRecord;
+pub use archive::ThreadCheckoutRow;
 pub use checkouts::CheckoutLocation;
 pub use collab::{CollabLink, CollabTurn};
 pub use comments::CommentRecord;
