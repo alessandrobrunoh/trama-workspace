@@ -9,6 +9,7 @@
 
 mod checkouts;
 mod codec;
+mod comments;
 mod content;
 mod event;
 mod migrations;
@@ -18,6 +19,7 @@ mod store;
 mod subthreads;
 
 pub use checkouts::CheckoutLocation;
+pub use comments::CommentRecord;
 pub use store::TramaDb;
 pub use subthreads::{ReviewVerdictRecord, SubthreadFork};
 
