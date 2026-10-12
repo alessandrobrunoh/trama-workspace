@@ -10,6 +10,7 @@
 mod checkouts;
 mod codec;
 mod comments;
+mod composer;
 mod content;
 mod event;
 mod migrations;
@@ -20,6 +21,7 @@ mod subthreads;
 
 pub use checkouts::CheckoutLocation;
 pub use comments::CommentRecord;
+pub use composer::AgentCommands;
 pub use store::TramaDb;
 pub use subthreads::{ReviewVerdictRecord, SubthreadFork};
 
