@@ -1,0 +1,53 @@
+# TLS termination and reverse proxy for trama-collab.
+#
+# Caddy obtains and renews the certificate for {$TRAMA_DOMAIN} itself
+# (Let's Encrypt, HTTP-01/TLS-ALPN-01 on ports 80/443), redirects HTTP to
+# HTTPS, and serves HTTP/1.1, HTTP/2 and HTTP/3.
+
+{
+	# Contact address for the ACME account (expiry notices).
+	email {$ACME_EMAIL}
+}
+
+{$TRAMA_DOMAIN} {
+	# The container health endpoint is for Docker only.
+	@internal path /healthz
+	respond @internal 404
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Cache-Control "no-store"
+		-Server
+	}
+
+	# The service accepts bodies up to 64 KiB (4 KiB on /auth/*).
+	request_body {
+		max_size 128KB
+	}
+
+	reverse_proxy collab:8787 {
+		# trama-collab honors exactly one forwarding header, and only from
+		# this proxy's address. Overwrite whatever the client sent so the
+		# value is the TCP peer address Caddy saw, and drop the RFC 7239
+		# header, which the service never reads.
+		#
+		# If another proxy or a CDN sits in front of Caddy, {remote_host} is
+		# that proxy's address; see deploy/README.md before changing this.
+		header_up X-Forwarded-For {remote_host}
+		header_up -Forwarded
+
+		# WebSocket upgrades (thread and runner sockets) pass through
+		# unchanged; failed upstreams are detected quickly.
+		transport http {
+			dial_timeout 5s
+		}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

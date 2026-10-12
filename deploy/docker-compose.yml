@@ -1,0 +1,118 @@
+# TramaWorkspace collaboration service behind Caddy (automatic HTTPS).
+#
+#   cd deploy && cp .env.example .env   # edit TRAMA_DOMAIN and ACME_EMAIL
+#   docker compose up -d --build
+#
+# Only Caddy publishes ports. `collab` listens on plain HTTP on the private
+# Compose network and is reachable from the host only through Caddy.
+
+name: trama-collab
+
+services:
+  collab:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        RUST_IMAGE: ${RUST_IMAGE:-rust:1-slim-bookworm}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-gcr.io/distroless/cc-debian12:nonroot}
+    image: trama-collab:local
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 15s
+    environment:
+      # Explicit opt-in: bind a non-loopback address because the only peer
+      # that can reach it is the TLS proxy on the private network below.
+      TRAMA_COLLAB_BIND: 0.0.0.0:8787
+      TRAMA_COLLAB_BEHIND_PROXY: "1"
+      # Peers allowed to set the client address via X-Forwarded-For.
+      TRAMA_COLLAB_TRUSTED_PROXIES: ${TRAMA_COLLAB_TRUSTED_PROXIES:-127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7}
+      TRAMA_COLLAB_FORWARDED_HEADER: x-forwarded-for
+      TRAMA_COLLAB_DB: /data/collab.sqlite
+    expose:
+      - "8787"
+    volumes:
+      - collab-data:/data
+      # Where `trama-collab backup` writes. A host directory so snapshots
+      # survive losing the Docker volume; see deploy/README.md.
+      - ${TRAMA_BACKUP_DIR:-./backups}:/backups
+    networks:
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+          pids: 256
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/trama-collab", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      collab:
+        condition: service_healthy
+    environment:
+      TRAMA_DOMAIN: ${TRAMA_DOMAIN:?set TRAMA_DOMAIN in deploy/.env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in deploy/.env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - backend
+      - default
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+          pids: 512
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  # Private network shared by Caddy and the service. `internal` means the
+  # service has no route to the internet (it needs none) and nothing outside
+  # this project can reach it. Caddy also joins the default network for the
+  # published ports and for Let's Encrypt.
+  backend:
+    internal: true
+
+volumes:
+  collab-data:
+  caddy-data:
+  caddy-config:

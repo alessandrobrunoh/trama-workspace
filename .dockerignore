@@ -1,0 +1,11 @@
+# The image build context is an allowlist: only what `deploy/Dockerfile`
+# copies is sent to the daemon, so local build output, checkouts (.trama),
+# the git history and any `deploy/.env` never enter an image layer.
+*
+!Cargo.toml
+!Cargo.lock
+!LICENSE
+!crates/trama-collab-protocol/Cargo.toml
+!crates/trama-collab-protocol/src
+!apps/trama-collab/Cargo.toml
+!apps/trama-collab/src
