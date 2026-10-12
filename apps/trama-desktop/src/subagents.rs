@@ -447,6 +447,7 @@ mod tests {
                 status: SubagentStatus::Running,
                 detail: None,
             }),
+            archived: false,
         }
     }
 

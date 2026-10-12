@@ -54,6 +54,7 @@ fn status_label(status: CheckoutStatus) -> &'static str {
         CheckoutStatus::NeedsPreparation => "Needs preparation",
         CheckoutStatus::Missing => "Missing",
         CheckoutStatus::Invalid => "Error",
+        CheckoutStatus::Removed => "Removed \u{2014} recreated on next use",
     }
 }
 
@@ -248,7 +249,7 @@ impl Render for CopyPanel {
 fn status_color(status: CheckoutStatus, p: &Palette) -> Hsla {
     match status {
         CheckoutStatus::Ready => p.success,
-        CheckoutStatus::NeedsPreparation => p.warning,
+        CheckoutStatus::NeedsPreparation | CheckoutStatus::Removed => p.warning,
         CheckoutStatus::Missing | CheckoutStatus::Invalid => p.danger,
     }
 }

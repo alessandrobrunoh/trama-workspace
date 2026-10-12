@@ -2462,6 +2462,7 @@ fn thread_snapshot(thread: &Thread) -> ThreadSnapshot {
         model: None,
         depth: 0,
         subagent: None,
+        archived: false,
     }
 }
 

@@ -37,7 +37,11 @@
 //! `depth` and `subagent` in thread snapshots, message annotations), nesting
 //! at any depth, and [`ClientMessage::ForkThread`] at a message. **10** adds
 //! [`DaemonMessage::TurnActivity`]: a turn's stored tool calls and thinking,
-//! replayed on subscribe before the message that ends the turn. Each bump is
+//! replayed on subscribe before the message that ends the turn. **11** adds
+//! checkout disk accounting and archiving ([`ClientMessage::GetDiskUsage`],
+//! [`ClientMessage::ArchiveThread`], [`ClientMessage::UnarchiveThread`],
+//! [`ClientMessage::DeleteThreadCheckouts`], their replies,
+//! `ThreadSnapshot.archived` and [`CheckoutStatus::Removed`]). Each bump is
 //! transport-only. Persisted domain ids and SQLite rows are not rewritten.
 //!
 //! A version mismatch fails the handshake (`Welcome.accepted = false`). Extra object
@@ -69,6 +73,13 @@ pub use trama_collab_protocol::{
 
 /// Wire protocol version carried in `Hello` / `Welcome`.
 ///
+/// Version 11 adds checkout disk usage (`GetDiskUsage` / `DiskUsage`: apparent
+/// vs. private bytes of every copy-on-write checkout), archiving
+/// (`ArchiveThread`, `UnarchiveThread`, `ThreadArchived`, `ThreadUnarchived`,
+/// `ThreadSnapshot.archived`) and removing a thread's checkouts to free disk
+/// (`DeleteThreadCheckouts`, `ThreadCheckoutsDeleted`,
+/// `CheckoutRemovalRefused`, `CheckoutStatus::Removed`); removed checkouts are
+/// recreated on demand (ADR 0012).
 /// Version 10 adds `TurnActivity`: the bounded tool calls, thinking and
 /// subagent lifecycle of each stored turn (and of the turn in flight), sent
 /// on subscribe so tool views survive restarts.
@@ -97,7 +108,7 @@ pub use trama_collab_protocol::{
 /// Version 4 added the Claude approval channel and 3 thread checkout
 /// discovery. It does not migrate stored data; peers with a different version
 /// are rejected at handshake time.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Environment variable that relocates the whole app-data directory (socket,
 /// database, config, legacy checkouts). Use it for isolated test instances
@@ -442,6 +453,41 @@ pub enum ClientMessage {
         arguments: serde_json::Value,
         #[serde(default)]
         tool_use_id: Option<String>,
+    },
+    /// Disk used by the managed checkouts of `workspace_id` (every workspace
+    /// when `None`). Answered with `DiskUsage`.
+    GetDiskUsage {
+        #[serde(default)]
+        workspace_id: Option<WorkspaceId>,
+    },
+    /// Archive a thread: it leaves the active list, its conversation and
+    /// history stay in TramaDB. With `delete_checkouts` its checkouts are
+    /// removed from disk after their state (commits, uncommitted and
+    /// untracked files) is saved as a snapshot outside them; they are
+    /// recreated from it on `UnarchiveThread`. Refused while a turn runs, and
+    /// (unless `force`) when a checkout holds work that is not in the source
+    /// repository: answered with `CheckoutRemovalRefused` listing it.
+    /// Otherwise answered with `ThreadArchived`.
+    ArchiveThread {
+        thread_id: ThreadId,
+        #[serde(default)]
+        delete_checkouts: bool,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Bring an archived thread back, recreating removed checkouts.
+    /// Answered with `ThreadUnarchived`.
+    UnarchiveThread {
+        thread_id: ThreadId,
+    },
+    /// Remove a thread's checkouts to free disk without archiving it (same
+    /// rules as `ArchiveThread { delete_checkouts: true }`). They are
+    /// recreated the next time the thread needs them. Answered with
+    /// `ThreadCheckoutsDeleted` or `CheckoutRemovalRefused`.
+    DeleteThreadCheckouts {
+        thread_id: ThreadId,
+        #[serde(default)]
+        force: bool,
     },
     Shutdown,
 }
@@ -903,6 +949,80 @@ pub enum DaemonMessage {
         message_id: Option<MessageId>,
         items: Vec<ActivityItem>,
     },
+    /// Reply to `GetDiskUsage`: one item per checkout present on disk,
+    /// largest private size first.
+    DiskUsage {
+        workspace_id: Option<WorkspaceId>,
+        items: Vec<DiskUsageItem>,
+    },
+    /// Reply to `ArchiveThread`. `removed` lists the checkouts deleted from
+    /// disk (empty when `delete_checkouts` was false).
+    ThreadArchived {
+        thread: ThreadSnapshot,
+        removed: Vec<CheckoutRemoval>,
+    },
+    ThreadUnarchived(ThreadSnapshot),
+    ThreadCheckoutsDeleted {
+        thread_id: ThreadId,
+        removed: Vec<CheckoutRemoval>,
+    },
+    /// `ArchiveThread` / `DeleteThreadCheckouts` without `force` found work
+    /// that exists only in these checkouts. Nothing was changed.
+    CheckoutRemovalRefused {
+        thread_id: ThreadId,
+        checkouts: Vec<CheckoutRemoval>,
+    },
+}
+
+/// Disk used by one managed checkout. `apparent_bytes` is what `du` reports
+/// (allocated size, blind to sharing); `private_bytes` is what deleting the
+/// checkout would free: on APFS the blocks not shared with any clone
+/// (`ATTR_CMNEXT_PRIVATESIZE`). When the volume cannot report it,
+/// `private_estimated` is true and `private_bytes` equals the allocated size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskUsageItem {
+    pub thread_id: ThreadId,
+    pub thread_title: String,
+    pub repository_id: RepositoryId,
+    pub repository_title: String,
+    pub path: PathBuf,
+    pub apparent_bytes: u64,
+    pub private_bytes: u64,
+    #[serde(default)]
+    pub private_estimated: bool,
+    /// Latest message of the thread (its creation when it has none).
+    #[serde(default)]
+    pub last_active: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub archived: bool,
+}
+
+/// One checkout considered for removal, and the work that exists only in it.
+/// `changed_files` lists up to 50 paths with uncommitted or untracked
+/// (non-ignored) changes; `changed_file_count` counts all of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckoutRemoval {
+    pub repository_id: RepositoryId,
+    pub title: String,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+    #[serde(default)]
+    pub changed_file_count: u32,
+    /// Commits reachable from the checkout's branches that the source
+    /// repository does not have.
+    #[serde(default)]
+    pub commits_not_in_source: u32,
+    /// Bytes freed (or that would be freed) by removing the checkout.
+    #[serde(default)]
+    pub freed_bytes: Option<u64>,
+}
+
+impl CheckoutRemoval {
+    /// True when removing the checkout needs `force`.
+    pub fn has_unsaved_work(&self) -> bool {
+        self.changed_file_count > 0 || self.commits_not_in_source > 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -922,6 +1042,9 @@ pub enum CheckoutStatus {
     NeedsPreparation,
     Missing,
     Invalid,
+    /// Removed to free disk (archived, or `DeleteThreadCheckouts`); recreated
+    /// on demand from the saved snapshot.
+    Removed,
 }
 
 /// Minimal workspace view for IPC. Not the domain `Workspace` aggregate.
@@ -956,6 +1079,10 @@ pub struct ThreadSnapshot {
     /// Set for threads spawned by another thread's agent (Trama subagents).
     #[serde(default)]
     pub subagent: Option<SubagentSnapshot>,
+    /// Archived threads are hidden from the active list; their history is
+    /// kept and their checkouts may have been removed.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 fn top_kind() -> ThreadKind {
@@ -1046,6 +1173,7 @@ mod tests {
             model: None,
             depth: 0,
             subagent: None,
+            archived: false,
         }
     }
 
@@ -1289,7 +1417,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&DaemonMessage::ThreadMigrated(snapshot_th())).unwrap(),
             format!(
-                r#"{{"type":"thread_migrated","payload":{{"id":"{thread}","title":"Fix auth","repo_count":1,"parent_thread_id":null,"kind":"top","review_verdict":null,"model":null,"depth":0,"subagent":null}}}}"#
+                r#"{{"type":"thread_migrated","payload":{{"id":"{thread}","title":"Fix auth","repo_count":1,"parent_thread_id":null,"kind":"top","review_verdict":null,"model":null,"depth":0,"subagent":null,"archived":false}}}}"#
             )
         );
         roundtrip_eq(&repo);
@@ -1355,8 +1483,101 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_ten() {
-        assert_eq!(PROTOCOL_VERSION, 10);
+    fn protocol_version_is_eleven() {
+        assert_eq!(PROTOCOL_VERSION, 11);
+    }
+
+    #[test]
+    fn disk_usage_and_archive_contract_shape() {
+        let request: ClientMessage =
+            serde_json::from_str(r#"{"type":"get_disk_usage","payload":{}}"#).unwrap();
+        assert_eq!(request, ClientMessage::GetDiskUsage { workspace_id: None });
+        let archive: ClientMessage = serde_json::from_str(
+            r#"{"type":"archive_thread","payload":{"thread_id":"t1","delete_checkouts":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            archive,
+            ClientMessage::ArchiveThread {
+                thread_id: ThreadId::from("t1"),
+                delete_checkouts: true,
+                force: false,
+            }
+        );
+        for message in [
+            ClientMessage::UnarchiveThread {
+                thread_id: thread_id(),
+            },
+            ClientMessage::DeleteThreadCheckouts {
+                thread_id: thread_id(),
+                force: true,
+            },
+            ClientMessage::GetDiskUsage {
+                workspace_id: Some(workspace_id()),
+            },
+        ] {
+            roundtrip_eq(&message);
+        }
+        let removal = CheckoutRemoval {
+            repository_id: RepositoryId::from("repo-1"),
+            title: "app".into(),
+            path: PathBuf::from("/src/app/.trama/worktrees/t/c"),
+            changed_files: vec!["src/lib.rs".into()],
+            changed_file_count: 1,
+            commits_not_in_source: 2,
+            freed_bytes: Some(4096),
+        };
+        assert!(removal.has_unsaved_work());
+        let usage = DaemonMessage::DiskUsage {
+            workspace_id: None,
+            items: vec![DiskUsageItem {
+                thread_id: thread_id(),
+                thread_title: "Fix auth".into(),
+                repository_id: RepositoryId::from("repo-1"),
+                repository_title: "app".into(),
+                path: PathBuf::from("/src/app/.trama/worktrees/t/c"),
+                apparent_bytes: 20 << 30,
+                private_bytes: 1 << 20,
+                private_estimated: false,
+                last_active: None,
+                archived: false,
+            }],
+        };
+        let json = serde_json::to_value(&usage).unwrap();
+        assert_eq!(json["type"], "disk_usage");
+        assert_eq!(json["payload"]["items"][0]["private_bytes"], 1 << 20);
+        roundtrip_json(&usage);
+        let mut archived = snapshot_th();
+        archived.archived = true;
+        for message in [
+            DaemonMessage::ThreadArchived {
+                thread: archived.clone(),
+                removed: vec![removal.clone()],
+            },
+            DaemonMessage::ThreadUnarchived(snapshot_th()),
+            DaemonMessage::ThreadCheckoutsDeleted {
+                thread_id: thread_id(),
+                removed: vec![],
+            },
+            DaemonMessage::CheckoutRemovalRefused {
+                thread_id: thread_id(),
+                checkouts: vec![removal],
+            },
+        ] {
+            roundtrip_json(&message);
+        }
+        // Older snapshots without `archived` still decode.
+        let mut value = serde_json::to_value(snapshot_th()).unwrap();
+        value.as_object_mut().unwrap().remove("archived");
+        assert!(
+            !serde_json::from_value::<ThreadSnapshot>(value)
+                .unwrap()
+                .archived
+        );
+        assert_eq!(
+            serde_json::to_value(CheckoutStatus::Removed).unwrap(),
+            "removed"
+        );
     }
 
     #[test]
@@ -1831,6 +2052,7 @@ mod tests {
             model: Some("claude-opus-5-5".into()),
             depth: 1,
             subagent: None,
+            archived: false,
         };
         let daemon = [
             DaemonMessage::SubthreadCreated(child.clone()),
@@ -1984,6 +2206,7 @@ mod tests {
                 status: SubagentStatus::Running,
                 detail: None,
             }),
+            archived: false,
         };
         roundtrip_eq(&snapshot);
         let json = serde_json::to_value(&snapshot).unwrap();

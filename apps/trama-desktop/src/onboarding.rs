@@ -842,6 +842,7 @@ mod tests {
             model: None,
             depth: 0,
             subagent: None,
+            archived: false,
         }
     }
 
