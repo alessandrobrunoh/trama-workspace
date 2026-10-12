@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{Icon, Sizable as _, h_flex, spinner::Spinner, tooltip::Tooltip, v_flex};
+use gpui_kit::component::{Icon, Sizable as _, h_flex, spinner::Spinner, tooltip::Tooltip};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use trama_domain::ids::{MessageId, ThreadId};
@@ -173,6 +173,8 @@ pub struct ThreadIndex {
     titles: HashMap<ThreadId, String>,
     profiles: HashMap<ThreadId, SubagentProfile>,
     by_tool_use: HashMap<String, ThreadId>,
+    models: HashMap<ThreadId, String>,
+    statuses: HashMap<ThreadId, SubagentStatus>,
 }
 
 impl ThreadIndex {
@@ -180,7 +182,11 @@ impl ThreadIndex {
         let mut index = Self::default();
         for thread in threads {
             index.titles.insert(thread.id.clone(), thread.title.clone());
+            if let Some(model) = &thread.model {
+                index.models.insert(thread.id.clone(), model.clone());
+            }
             if let Some(subagent) = &thread.subagent {
+                index.statuses.insert(thread.id.clone(), subagent.status);
                 index
                     .profiles
                     .insert(thread.id.clone(), subagent.spawned_by.profile);
@@ -200,6 +206,16 @@ impl ThreadIndex {
 
     pub fn profile(&self, id: &ThreadId) -> Option<SubagentProfile> {
         self.profiles.get(id).copied()
+    }
+
+    /// The thread's model override, if it has one.
+    pub fn model(&self, id: &ThreadId) -> Option<&str> {
+        self.models.get(id).map(String::as_str)
+    }
+
+    /// A subagent's task status.
+    pub fn status(&self, id: &ThreadId) -> Option<SubagentStatus> {
+        self.statuses.get(id).copied()
     }
 
     /// The subagent thread a `spawn_subagent` call (by Claude's tool use
@@ -337,17 +353,6 @@ fn display_title(row: &AnnotationRow, index: &ThreadIndex) -> String {
         .to_string()
 }
 
-const BODY_LIMIT: usize = 1600;
-
-fn clipped(text: &str) -> String {
-    if text.chars().count() <= BODY_LIMIT {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(BODY_LIMIT).collect();
-    out.push('…');
-    out
-}
-
 /// A thread link: "@Title", clickable when the sidebar knows the thread.
 fn thread_link(
     id: SharedString,
@@ -383,137 +388,6 @@ fn thread_link(
         .into_any_element()
 }
 
-/// A subagent lifecycle row ("Subagent <title> started (worker)") or an
-/// agent message block ("Sent agent message to @thread" and the text).
-pub fn render_annotation(
-    ix: usize,
-    row: &AnnotationRow,
-    index: &ThreadIndex,
-    p: &Palette,
-    cx: &mut Context<ChatPanel>,
-) -> AnyElement {
-    match &row.kind {
-        AnnotationKind::SubagentStarted(_) | AnnotationKind::SubagentFinished(_) => {
-            render_lifecycle(ix, row, index, p, cx)
-        }
-        AnnotationKind::Sent | AnnotationKind::Received => {
-            let header = agent_message_header(ix, row, index, p, cx);
-            div()
-                .w_full()
-                .pl(theme::sp(7.))
-                .child(
-                    v_flex()
-                        .w_full()
-                        .gap(theme::sp(1.5))
-                        .child(header)
-                        .when_some(row.body.clone(), |this, body| {
-                            this.child(message_body(&body, p))
-                        }),
-                )
-                .into_any_element()
-        }
-    }
-}
-
-fn render_lifecycle(
-    ix: usize,
-    row: &AnnotationRow,
-    index: &ThreadIndex,
-    p: &Palette,
-    cx: &mut Context<ChatPanel>,
-) -> AnyElement {
-    let known = index.title(&row.thread_id).is_some();
-    let thread = row.thread_id.clone();
-    let (icon, icon_color, verb, status) = match &row.kind {
-        AnnotationKind::SubagentStarted(profile) => {
-            (profile_icon(*profile), p.accent_text, "started", None)
-        }
-        AnnotationKind::SubagentFinished(status) => (
-            index
-                .profile(&row.thread_id)
-                .map(profile_icon)
-                .unwrap_or(IconName::Bot),
-            p.accent_text,
-            if *status == SubagentStatus::Failed {
-                "failed"
-            } else {
-                "finished"
-            },
-            Some(*status),
-        ),
-        _ => (IconName::Bot, p.accent_text, "", None),
-    };
-    let profile = match &row.kind {
-        AnnotationKind::SubagentStarted(profile) => Some(*profile),
-        _ => index.profile(&row.thread_id),
-    };
-    let detail: SharedString = match &row.body {
-        Some(detail) => format!("{}: {detail}", row_text(row, index)).into(),
-        None => row_text(row, index).into(),
-    };
-    div()
-        .w_full()
-        .pl(theme::sp(7.))
-        .child(
-            h_flex()
-                .id(("annotation-row", ix))
-                .w_full()
-                .h(px(28.))
-                .px(theme::sp(2.))
-                .gap(theme::sp(2.))
-                .items_center()
-                .rounded(theme::radius())
-                .border_1()
-                .border_color(p.border)
-                .bg(p.elevated)
-                .text_size(theme::text_sm())
-                .when(known, |this| {
-                    this.cursor_pointer()
-                        .hover(|style| style.bg(p.hover))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_thread(thread.clone(), cx);
-                        }))
-                })
-                .tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx))
-                .child(Icon::new(icon).with_size(px(13.)).text_color(icon_color))
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_color(p.text_muted)
-                        .child("Subagent"),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(if known { p.accent_text } else { p.text })
-                        .child(display_title(row, index)),
-                )
-                .child(div().flex_shrink_0().text_color(p.text_muted).child(verb))
-                .when_some(profile, |this, profile| {
-                    this.child(
-                        div()
-                            .flex_shrink_0()
-                            .text_color(p.text_faint)
-                            .child(format!("({})", profile.label())),
-                    )
-                })
-                .child(div().flex_1())
-                .when(known, |this| {
-                    this.child(
-                        Icon::new(IconName::ArrowUpRight)
-                            .with_size(px(12.))
-                            .text_color(p.accent_text),
-                    )
-                })
-                .when_some(status, |this, status| {
-                    this.child(status_glyph(status, 13., p))
-                }),
-        )
-        .into_any_element()
-}
-
 /// "Sent agent message to @thread" / "Received agent message from @thread".
 pub fn agent_message_header(
     ix: usize,
@@ -540,56 +414,6 @@ pub fn agent_message_header(
             p,
             cx,
         ))
-        .into_any_element()
-}
-
-fn message_body(body: &str, p: &Palette) -> AnyElement {
-    div()
-        .w_full()
-        .pl(theme::sp(3.))
-        .border_l_2()
-        .border_color(p.accent.opacity(0.35))
-        .text_size(theme::text_sm())
-        .line_height(relative(1.5))
-        .text_color(p.text_muted)
-        .child(clipped(body))
-        .into_any_element()
-}
-
-/// The author line of a prompt another thread's agent sent: an avatar like
-/// the agent's, then the header.
-pub fn received_author_row(
-    ix: usize,
-    row: &AnnotationRow,
-    index: &ThreadIndex,
-    p: &Palette,
-    cx: &mut Context<ChatPanel>,
-) -> AnyElement {
-    h_flex()
-        .w_full()
-        .gap(theme::sp(2.))
-        .items_center()
-        .child(
-            div()
-                .size(px(20.))
-                .flex_shrink_0()
-                .rounded_full()
-                .bg(p.accent_soft)
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    Icon::new(IconName::Bot)
-                        .with_size(px(12.))
-                        .text_color(p.accent_text),
-                ),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .child(agent_message_header(ix, row, index, p, cx)),
-        )
         .into_any_element()
 }
 

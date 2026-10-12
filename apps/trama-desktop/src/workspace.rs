@@ -183,7 +183,7 @@ impl Workspace {
                 &chat,
                 window,
                 |this, _, event: &ChatEvent, window, cx| match event {
-                    ChatEvent::OpenThread(thread) => {
+                    ChatEvent::OpenThread(thread) | ChatEvent::OpenInPane(thread) => {
                         let thread = thread.clone();
                         this.sidebar
                             .update(cx, |sidebar, cx| sidebar.select_thread(thread, cx));

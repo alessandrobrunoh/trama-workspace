@@ -1,11 +1,17 @@
-//! Tool call views in the transcript.
+//! Tool call views in the transcript, drawn as document lines.
 //!
-//! File edits (Edit, MultiEdit, Write, NotebookEdit) render as inline
-//! diffs built from the tool input, Bash calls as command blocks with
-//! their output's tail, Trama subagent calls as links to the subthread,
-//! and runs of the remaining calls plus thinking fold into one summary row
-//! ("Thought 2 times, read 3 files"). The pure helpers come first and are
-//! tested; the renderers below them only lay out what they compute.
+//! Runs of thinking and tool calls fold into one muted summary line
+//! ("Thought 3 times, ran 2 commands, read 3 files ›") that opens to a
+//! line per step ("Thinking: <first line> ›", "Ran <command> ›", "Read
+//! <path> ›"); a step opens to the thought, the command and the tail of
+//! its output ("Show N more lines"), or the call's input and output. File
+//! edits (Edit, MultiEdit, Write, NotebookEdit) are "Apply patch <path> ⌄"
+//! lines over the diff built from the tool input, whose lines can be picked
+//! and commented on. Trama subagent calls are "Agent spawned: <title>"
+//! lines that open the subagent next to the transcript. All their text is
+//! selectable and commentable ([`crate::doc_text`]). The pure helpers come
+//! first and are tested; the renderers below them only lay out what they
+//! compute.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -20,7 +26,9 @@ use serde_json::Value;
 use trama_domain::ids::ThreadId;
 
 use crate::chat::{ChatEntry, ChatPanel};
+use crate::comments;
 use crate::diff::{DiffLine, Hunk, LineKind};
+use crate::doc_text::{BlockTexts, Mark, code_block, escape_markdown};
 use crate::theme::{self, Palette};
 
 // -- classification -------------------------------------------------------
@@ -39,6 +47,7 @@ pub enum ToolKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Activity {
     Thought,
+    Command,
     Read,
     Search,
     Web,
@@ -94,6 +103,7 @@ fn activity(entry: &ChatEntry) -> Option<Activity> {
         ChatEntry::Thinking { .. } => Some(Activity::Thought),
         ChatEntry::ToolCall { name, .. } => match tool_kind(name) {
             ToolKind::Minor(activity) => Some(activity),
+            ToolKind::Command => Some(Activity::Command),
             _ => None,
         },
         _ => None,
@@ -104,13 +114,13 @@ fn is_edit(entry: &ChatEntry) -> bool {
     matches!(entry, ChatEntry::ToolCall { name, .. } if tool_kind(name) == ToolKind::Edit)
 }
 
-/// One transcript row's worth of entries.
+/// One transcript block's worth of entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
     Single(usize),
-    /// Thinking and minor tool calls folded into a summary row.
+    /// Thinking, commands and minor tool calls folded into a summary line.
     Group(Range<usize>),
-    /// Consecutive file edits under one "Applied N edits" header.
+    /// Consecutive file edits, an "Apply patch" line each.
     Edits(Range<usize>),
 }
 
@@ -123,7 +133,8 @@ impl Item {
     }
 }
 
-/// Fold entries into rows. A lone minor tool call keeps its own row.
+/// Fold entries into blocks. A lone step (a thought, a command, a call)
+/// keeps its own line.
 pub fn layout_items(entries: &[ChatEntry]) -> Vec<Item> {
     let mut items = Vec::new();
     let mut index = 0;
@@ -138,9 +149,7 @@ pub fn layout_items(entries: &[ChatEntry]) -> Vec<Item> {
             while index < entries.len() && activity(&entries[index]).is_some() {
                 index += 1;
             }
-            let single_call =
-                index - start == 1 && matches!(entries[start], ChatEntry::ToolCall { .. });
-            items.push(if single_call {
+            items.push(if index - start == 1 {
                 Item::Single(start)
             } else {
                 Item::Group(start..index)
@@ -153,7 +162,7 @@ pub fn layout_items(entries: &[ChatEntry]) -> Vec<Item> {
     items
 }
 
-/// "Thought 2 times, loaded a skill, ran 3 searches, read 6 files", in the
+/// "Thought 2 times, loaded a skill, ran 3 commands, read 6 files", in the
 /// order each kind first appears.
 pub fn group_summary(entries: &[ChatEntry]) -> String {
     let mut order: Vec<Activity> = Vec::new();
@@ -167,6 +176,7 @@ pub fn group_summary(entries: &[ChatEntry]) -> String {
     let phrase = |activity: Activity, n: usize| -> String {
         let (one, many): (&str, String) = match activity {
             Activity::Thought => ("thought once", format!("thought {n} times")),
+            Activity::Command => ("ran a command", format!("ran {n} commands")),
             Activity::Read => ("read a file", format!("read {n} files")),
             Activity::Search => ("ran a search", format!("ran {n} searches")),
             Activity::Web => ("browsed the web", format!("browsed the web {n} times")),
@@ -543,23 +553,6 @@ pub fn build_hunks(lines: &[DiffLine], context: usize) -> Vec<Hunk> {
         .collect()
 }
 
-/// "Applied 3 edits across 2 files".
-pub fn edits_header<'a>(edits: impl IntoIterator<Item = &'a FileEdit>) -> String {
-    let mut count = 0;
-    let mut files: Vec<&str> = Vec::new();
-    for edit in edits {
-        count += edit.edits.max(1);
-        files.push(edit.path.as_str());
-    }
-    files.sort_unstable();
-    files.dedup();
-    format!(
-        "Applied {} across {}",
-        crate::comments::plural(count, "edit", "edits"),
-        crate::comments::plural(files.len(), "file", "files")
-    )
-}
-
 /// `/Users/me/src/app/main.rs` → `~/src/app/main.rs`.
 pub fn display_path(path: &str) -> String {
     match std::env::var("HOME") {
@@ -854,8 +847,10 @@ pub fn subthread_link(
 /// Expansion state the tool views read, owned by the chat panel.
 #[derive(Default)]
 pub struct ToolViewState {
-    /// Summary rows opened, by their first entry index.
+    /// Summary lines opened, by their first entry index.
     pub open_groups: HashSet<usize>,
+    /// Thoughts opened, by entry index.
+    pub open_thoughts: HashSet<usize>,
     /// Edit rows opened or closed by hand, by tool use id.
     pub edit_open: HashMap<String, bool>,
     /// Commands whose whole output is shown, by tool use id.
@@ -872,6 +867,7 @@ type EditCache = RefCell<HashMap<String, (bool, Option<Rc<FileEdit>>)>>;
 impl ToolViewState {
     pub fn clear(&mut self) {
         self.open_groups.clear();
+        self.open_thoughts.clear();
         self.edit_open.clear();
         self.full_output.clear();
         self.timings.clear();
@@ -879,7 +875,7 @@ impl ToolViewState {
     }
 
     /// The call's diff, built once per state of the call.
-    fn file_edit(&self, entry: &ChatEntry) -> Option<Rc<FileEdit>> {
+    pub fn file_edit(&self, entry: &ChatEntry) -> Option<Rc<FileEdit>> {
         let ChatEntry::ToolCall {
             tool_use_id,
             name,
@@ -908,7 +904,7 @@ const OPEN_EDIT_LINES: usize = 24;
 /// Lines drawn for one expanded diff or output.
 const MAX_RENDERED_LINES: usize = 600;
 
-fn status_icon(finished: bool, is_error: bool, p: &Palette) -> AnyElement {
+pub fn status_icon(finished: bool, is_error: bool, p: &Palette) -> AnyElement {
     if is_error {
         Icon::new(IconName::CircleX)
             .with_size(px(13.))
@@ -934,30 +930,6 @@ fn chevron(open: bool, p: &Palette) -> Icon {
     .text_color(p.text_faint)
 }
 
-/// A path as a faint directory and a stronger file name.
-fn path_label(path: &str, p: &Palette) -> Div {
-    let path = display_path(path);
-    let (dir, name) = match path.rsplit_once('/') {
-        Some((dir, name)) => (format!("{dir}/"), name.to_string()),
-        None => (String::new(), path),
-    };
-    h_flex()
-        .flex_1()
-        .min_w_0()
-        .overflow_hidden()
-        .font_family(theme::MONO_FONT)
-        .text_size(theme::text_xs())
-        .child(
-            div()
-                .flex_shrink(1.)
-                .min_w_0()
-                .truncate()
-                .text_color(p.text_faint)
-                .child(dir),
-        )
-        .child(div().flex_shrink_0().text_color(p.text).child(name))
-}
-
 fn counts(additions: u32, deletions: u32, p: &Palette) -> Div {
     h_flex()
         .flex_shrink_0()
@@ -980,14 +952,203 @@ fn counts(additions: u32, deletions: u32, p: &Palette) -> Div {
         })
 }
 
-/// "Thought 2 times, read 3 files", opening to the individual rows.
-pub fn render_group(
-    range: Range<usize>,
-    entries: &[ChatEntry],
-    open: bool,
+// -- document lines ---------------------------------------------------------
+
+/// What the tool views need from the transcript while drawing.
+pub struct DocCtx<'a> {
+    pub p: &'a Palette,
+    pub state: &'a ToolViewState,
+    pub texts: &'a mut BlockTexts,
+    /// Comments on this turn's blocks, to highlight and place.
+    pub marks: &'a [Mark],
+    pub turn: usize,
+}
+
+impl DocCtx<'_> {
+    /// Selectable plain text.
+    fn text(
+        &mut self,
+        key: &str,
+        plain: &str,
+        kind: &'static str,
+        cx: &mut Context<ChatPanel>,
+    ) -> AnyElement {
+        self.texts.view(
+            key,
+            &escape_markdown(plain),
+            plain,
+            kind,
+            self.turn,
+            self.marks,
+            cx,
+        )
+    }
+
+    /// Selectable Markdown.
+    fn markdown(
+        &mut self,
+        key: &str,
+        markdown: &str,
+        kind: &'static str,
+        cx: &mut Context<ChatPanel>,
+    ) -> AnyElement {
+        self.texts
+            .view(key, markdown, markdown, kind, self.turn, self.marks, cx)
+    }
+}
+
+/// What a click on a document line does.
+pub type LineClick = Rc<dyn Fn(&mut ChatPanel, &ClickEvent, &mut Window, &mut Context<ChatPanel>)>;
+
+/// A muted document line: a label, its selectable text, what trails it,
+/// and a chevron when it opens. A click acts unless it ended a selection
+/// in the line's text (`text_key`).
+#[allow(clippy::too_many_arguments)]
+fn line(
+    id: impl Into<ElementId>,
+    label: Option<String>,
+    text: AnyElement,
+    text_key: String,
+    trailing: Vec<AnyElement>,
+    open: Option<bool>,
+    click: Option<LineClick>,
     p: &Palette,
     cx: &mut Context<ChatPanel>,
 ) -> AnyElement {
+    let row = h_flex()
+        .id(id.into())
+        .w_full()
+        .min_h(px(24.))
+        .gap(theme::sp(1.5))
+        .items_start()
+        .text_size(theme::text_ui())
+        .line_height(px(22.))
+        .text_color(p.text_faint)
+        .children(label.map(|label| div().flex_shrink_0().text_color(p.text_muted).child(label)))
+        .child(div().min_w_0().flex_shrink(1.).child(text))
+        .children(
+            trailing
+                .into_iter()
+                .map(|element| div().flex_shrink_0().pt(px(4.)).child(element)),
+        )
+        .children(open.map(|open| div().flex_shrink_0().pt(px(5.)).child(chevron(open, p))));
+    match click {
+        Some(click) => row
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                if this.text_selected(&text_key, cx) {
+                    return;
+                }
+                click(this, event, window, cx);
+            }))
+            .into_any_element(),
+        None => row.into_any_element(),
+    }
+}
+
+/// The first line of a thought, as plain text ("Thinking: <line>").
+pub fn thinking_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .trim_matches(|c: char| matches!(c, '*' | '_' | '#' | '`') || c.is_whitespace())
+        .trim_end_matches(':');
+    let mut out: String = line.chars().take(120).collect();
+    if line.chars().count() > 120 {
+        out.push('…');
+    }
+    out
+}
+
+/// A tool call as one line: what it did and on what ("Read src/a.rs",
+/// "Ran cargo test", "Apply patch src/a.rs", "Called get_issue").
+pub fn call_line(name: &str, input: &Value) -> (String, String) {
+    let field = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| input.get(*key).and_then(Value::as_str))
+            .map(|text| text.lines().next().unwrap_or_default().trim().to_string())
+    };
+    let summary = || crate::chat::tool_summary(name, input);
+    let (label, detail) = match base_name(name) {
+        "Bash" => ("Ran", field(&["command"]).unwrap_or_else(summary)),
+        "Read" | "NotebookRead" => (
+            "Read",
+            field(&["file_path", "notebook_path", "path"])
+                .map(|path| display_path(&path))
+                .unwrap_or_else(summary),
+        ),
+        "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => (
+            "Apply patch",
+            field(&["file_path", "notebook_path"])
+                .map(|path| display_path(&path))
+                .unwrap_or_else(summary),
+        ),
+        "Grep" | "Glob" => ("Searched", summary()),
+        "LS" => ("Listed", field(&["path"]).unwrap_or_else(summary)),
+        "ToolSearch" => ("Searched tools for", summary()),
+        "WebFetch" => ("Fetched", field(&["url"]).unwrap_or_else(summary)),
+        "WebSearch" => (
+            "Searched the web for",
+            field(&["query"]).unwrap_or_else(summary),
+        ),
+        "Skill" => (
+            "Loaded skill",
+            field(&["skill", "name", "command"]).unwrap_or_else(summary),
+        ),
+        "Task" | "Agent" => (
+            "Ran subagent",
+            field(&["description"]).unwrap_or_else(summary),
+        ),
+        "TodoWrite" => ("Updated the plan", summary()),
+        other => ("Called", other.to_string()),
+    };
+    (label.to_string(), detail)
+}
+
+/// "<title> (scout · Opus 4.1)": what an "Agent spawned:" line names.
+pub fn agent_detail(title: &str, profile: Option<&str>, model: Option<&str>) -> String {
+    let title = if title.trim().is_empty() {
+        "Untitled"
+    } else {
+        title.trim()
+    };
+    let model = model.map(crate::turns::model_label);
+    match (profile, model) {
+        (Some(profile), Some(model)) => format!("{title} ({profile} \u{b7} {model})"),
+        (Some(profile), None) => format!("{title} ({profile})"),
+        (None, Some(model)) => format!("{title} ({model})"),
+        (None, None) => title.to_string(),
+    }
+}
+
+/// The label of a subagent's lifecycle line.
+pub fn agent_label(
+    status: Option<trama_domain::subagent::SubagentStatus>,
+    spawned: bool,
+) -> &'static str {
+    use trama_domain::subagent::SubagentStatus;
+    match (spawned, status) {
+        (true, _) => "Agent spawned:",
+        (false, Some(SubagentStatus::Failed)) => "Agent failed:",
+        (false, _) => "Agent completed:",
+    }
+}
+
+/// Thinking and tool calls: one line, or a folded run as one summary line
+/// ("Thought 3 times, ran 2 commands, read 3 files ›") opening to a line
+/// per step.
+pub fn render_activity(
+    range: Range<usize>,
+    entries: &[ChatEntry],
+    ctx: &mut DocCtx,
+    cx: &mut Context<ChatPanel>,
+) -> AnyElement {
+    if range.len() == 1 {
+        return render_step(range.start, &entries[range.start], ctx, cx);
+    }
+    let p = ctx.p;
     let slice = &entries[range.clone()];
     let running = slice.iter().any(|entry| {
         matches!(
@@ -1002,308 +1163,659 @@ pub fn render_group(
         .iter()
         .filter(|entry| matches!(entry, ChatEntry::ToolCall { is_error: true, .. }))
         .count();
-    let thinking_only = slice
-        .iter()
-        .all(|entry| matches!(entry, ChatEntry::Thinking { .. }));
     let start = range.start;
-    let header = h_flex()
-        .id(("tool-group", start))
-        .w_full()
-        .h(px(26.))
-        .px(theme::sp(2.))
-        .gap(theme::sp(2.))
-        .items_center()
-        .rounded(theme::radius())
-        .cursor_pointer()
-        .text_size(theme::text_sm())
-        .hover(|style| style.bg(p.hover))
-        .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(start, cx)))
-        .child(
-            Icon::new(if thinking_only {
-                IconName::Brain
-            } else {
-                IconName::Sparkles
-            })
-            .with_size(px(13.))
-            .text_color(p.text_muted),
-        )
-        .child(
+    let open = ctx.state.open_groups.contains(&start);
+    let key = format!("group-{start}");
+    let summary = group_summary(slice);
+    let text = ctx.text(&key, &summary, comments::KIND_ACTIVITY, cx);
+    let mut trailing = Vec::new();
+    if failed > 0 {
+        trailing.push(
             div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_color(p.text_muted)
-                .child(group_summary(slice)),
-        )
-        .when(failed > 0, |this| {
-            this.child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(theme::text_xs())
-                    .text_color(p.danger)
-                    .child(format!("{failed} failed")),
-            )
-        })
-        .when(running, |this| {
-            this.child(Spinner::new().xsmall().color(p.accent))
-        })
-        .child(chevron(open, p));
+                .text_size(theme::text_xs())
+                .text_color(p.danger)
+                .child(format!("{failed} failed"))
+                .into_any_element(),
+        );
+    }
+    if running {
+        trailing.push(Spinner::new().xsmall().color(p.accent).into_any_element());
+    }
+    let header = line(
+        ("activity-group", start),
+        None,
+        text,
+        key,
+        trailing,
+        Some(open),
+        Some(Rc::new(move |this, _, _, cx| this.toggle_group(start, cx))),
+        p,
+        cx,
+    );
     let body = open.then(|| {
         let mut list = v_flex()
             .w_full()
-            .pl(theme::sp(4.))
+            .pl(theme::sp(3.))
+            .ml(theme::sp(1.))
             .gap(theme::sp(0.5))
             .border_l_1()
-            .border_color(p.border)
-            .ml(theme::sp(3.5));
+            .border_color(p.border);
         for (offset, entry) in slice.iter().enumerate() {
-            let ix = start + offset;
-            list = list.child(match entry {
-                ChatEntry::Thinking { text } => render_thought(text, p),
-                _ => crate::chat::tool_row(ix, entry, p, cx),
-            });
+            list = list.child(render_step(start + offset, entry, ctx, cx));
         }
         list
     });
-    div()
+    v_flex()
         .w_full()
-        .pl(theme::sp(7.))
-        .child(
-            v_flex()
-                .w_full()
-                .gap(theme::sp(1.))
-                .child(header)
-                .children(body),
-        )
+        .gap(theme::sp(0.5))
+        .child(header)
+        .children(body)
         .into_any_element()
 }
 
-fn render_thought(text: &str, p: &Palette) -> AnyElement {
+/// One step: "Thinking: <first line> ›", "Ran <command> ›", "Read <path> ›";
+/// opening shows the thought, the command and its output, or the call's
+/// input and output.
+fn render_step(
+    ix: usize,
+    entry: &ChatEntry,
+    ctx: &mut DocCtx,
+    cx: &mut Context<ChatPanel>,
+) -> AnyElement {
+    let p = ctx.p;
+    match entry {
+        ChatEntry::Thinking { text } => {
+            let open = ctx.state.open_thoughts.contains(&ix);
+            let key = format!("thinking-line-{ix}");
+            let first = thinking_line(text);
+            let detail = ctx.text(&key, &first, comments::KIND_THINKING, cx);
+            let header = line(
+                ("thinking", ix),
+                Some("Thinking:".into()),
+                detail,
+                key,
+                Vec::new(),
+                Some(open),
+                Some(Rc::new(move |this, _, _, cx| this.toggle_thought(ix, cx))),
+                p,
+                cx,
+            );
+            let body = open.then(|| {
+                let text = ctx.markdown(
+                    &format!("thinking-{ix}"),
+                    text.trim(),
+                    comments::KIND_THINKING,
+                    cx,
+                );
+                div()
+                    .w_full()
+                    .pl(theme::sp(3.))
+                    .pb(theme::sp(1.))
+                    .text_size(theme::text_ui())
+                    .line_height(relative(1.55))
+                    .text_color(p.text_muted)
+                    .child(text)
+            });
+            v_flex()
+                .w_full()
+                .child(header)
+                .children(body)
+                .into_any_element()
+        }
+        ChatEntry::ToolCall {
+            tool_use_id,
+            name,
+            input_json,
+            finished,
+            is_error,
+            expanded,
+            ..
+        } => {
+            let command = tool_kind(name) == ToolKind::Command;
+            let (label, detail) = call_line(name, input_json);
+            let key = format!("step-{tool_use_id}");
+            let text = ctx.text(
+                &key,
+                &detail,
+                if command {
+                    comments::KIND_COMMAND
+                } else {
+                    comments::KIND_ACTIVITY
+                },
+                cx,
+            );
+            let mut trailing = Vec::new();
+            if !*finished || *is_error {
+                trailing.push(status_icon(*finished, *is_error, p));
+            }
+            let header = line(
+                ("step", ix),
+                Some(label),
+                text,
+                key,
+                trailing,
+                Some(*expanded),
+                Some(Rc::new(move |this, _, _, cx| this.toggle_tool(ix, cx))),
+                p,
+                cx,
+            );
+            let body = expanded.then(|| {
+                if command {
+                    render_command_body(ix, entry, ctx, cx)
+                } else {
+                    render_call_body(entry, ctx, cx)
+                }
+            });
+            v_flex()
+                .w_full()
+                .child(header)
+                .children(body)
+                .into_any_element()
+        }
+        _ => div().into_any_element(),
+    }
+}
+
+/// An opened command: the command and the tail of its output as one
+/// selectable block, with "Show N more lines" above it.
+fn render_command_body(
+    ix: usize,
+    entry: &ChatEntry,
+    ctx: &mut DocCtx,
+    cx: &mut Context<ChatPanel>,
+) -> AnyElement {
+    let ChatEntry::ToolCall {
+        tool_use_id,
+        input_json,
+        finished,
+        is_error,
+        output,
+        ..
+    } = entry
+    else {
+        return div().into_any_element();
+    };
+    let p = ctx.p;
+    let command = input_json
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let text = output.as_ref().map(output_text).unwrap_or_default();
+    let (status, body) = command_result(*finished, *is_error, &text);
+    let lines: Vec<String> = parse_ansi(&body).iter().map(line_text).collect();
+    let show_all = ctx.state.full_output.contains(tool_use_id);
+    let (first, hidden) = visible_tail(lines.len(), OUTPUT_TAIL, show_all);
+    let end = lines.len().min(first + MAX_RENDERED_LINES);
+    let mut block = format!("$ {command}");
+    for line in &lines[first..end] {
+        block.push('\n');
+        block.push_str(line);
+    }
+    if end < lines.len() {
+        block.push_str(&format!("\n… {} more lines not shown", lines.len() - end));
+    }
+    let duration = ctx
+        .state
+        .timings
+        .get(tool_use_id)
+        .and_then(ToolTiming::duration_ms)
+        .map(format_duration);
+    let status_text = match status {
+        ExitStatus::Running => Some(("Running…".to_string(), p.accent_text)),
+        ExitStatus::Success => None,
+        ExitStatus::Code(code) => Some((format!("Exit code {code}"), p.danger)),
+        ExitStatus::Failed => Some(("Failed".to_string(), p.danger)),
+        ExitStatus::Interrupted => Some(("Interrupted".to_string(), p.warning)),
+    };
+    let id = tool_use_id.clone();
+    let toggle = (hidden > 0 || show_all && lines.len() > OUTPUT_TAIL).then(|| {
+        h_flex()
+            .id(("command-more", ix))
+            .gap(theme::sp(1.))
+            .items_center()
+            .cursor_pointer()
+            .text_size(theme::text_xs())
+            .text_color(p.text_muted)
+            .hover(|style| style.text_color(p.text))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_output(&id, cx)))
+            .child(
+                Icon::new(if show_all {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronsUpDown
+                })
+                .with_size(px(11.)),
+            )
+            .child(if show_all {
+                "Show less".to_string()
+            } else {
+                format!(
+                    "Show {}",
+                    comments::plural(hidden, "more line", "more lines")
+                )
+            })
+    });
+    let code = ctx.markdown(
+        &format!("command-{tool_use_id}"),
+        &code_block(&block, ""),
+        comments::KIND_COMMAND,
+        cx,
+    );
     v_flex()
         .w_full()
-        .px(theme::sp(2.))
+        .pl(theme::sp(3.))
         .py(theme::sp(1.))
         .gap(theme::sp(1.))
-        .child(
-            h_flex()
-                .gap(theme::sp(2.))
-                .items_center()
-                .text_size(theme::text_sm())
-                .text_color(p.text_muted)
-                .child(
-                    Icon::new(IconName::Brain)
-                        .with_size(px(13.))
-                        .text_color(p.text_faint),
-                )
-                .child("Thought"),
-        )
-        .when(!text.trim().is_empty(), |this| {
+        .children(toggle)
+        .child(div().w_full().text_size(theme::text_xs()).child(code))
+        .when(status_text.is_some() || duration.is_some(), |this| {
+            let (label, color) = status_text.unwrap_or_else(|| ("Done".into(), p.text_faint));
             this.child(
-                div()
-                    .pl(theme::sp(5.))
-                    .text_size(theme::text_sm())
-                    .line_height(relative(1.5))
-                    .italic()
-                    .text_color(p.text_faint)
-                    .child(text.trim().to_string()),
+                h_flex()
+                    .gap(theme::sp(2.))
+                    .text_size(theme::text_xs())
+                    .child(div().text_color(color).child(label))
+                    .children(duration.map(|d| div().text_color(p.text_faint).child(d))),
             )
         })
         .into_any_element()
 }
 
-/// "Applied N edits across M files" with one expandable diff per call.
-pub fn render_edits(
-    range: Range<usize>,
-    entries: &[ChatEntry],
-    state: &ToolViewState,
-    p: &Palette,
+/// An opened call: its input and output as one selectable block.
+fn render_call_body(
+    entry: &ChatEntry,
+    ctx: &mut DocCtx,
     cx: &mut Context<ChatPanel>,
 ) -> AnyElement {
-    struct Row<'a> {
-        id: &'a str,
-        edit: Rc<FileEdit>,
-        finished: bool,
-        is_error: bool,
-        error: Option<String>,
-    }
-    let rows: Vec<Row> = entries[range.clone()]
-        .iter()
-        .filter_map(|entry| match entry {
-            ChatEntry::ToolCall {
-                tool_use_id,
-                finished,
-                is_error,
-                output,
-                ..
-            } => {
-                let edit = state.file_edit(entry)?;
-                let error = is_error
-                    .then(|| output.as_ref().map(output_text))
-                    .flatten()
-                    .map(|text| crate::comments::one_line(&strip_tags(&text), 160));
-                Some(Row {
-                    id: tool_use_id,
-                    edit,
-                    finished: *finished,
-                    is_error: *is_error,
-                    error,
-                })
+    let ChatEntry::ToolCall {
+        tool_use_id,
+        input_json,
+        is_error,
+        output,
+        ..
+    } = entry
+    else {
+        return div().into_any_element();
+    };
+    let mut markdown = format!("Input\n\n{}", code_block(&pretty_json(input_json), "json"));
+    if let Some(output) = output {
+        let label = if *is_error { "Error" } else { "Output" };
+        let text = output_text(output);
+        let text = if text.len() > OUTPUT_LIMIT {
+            let mut end = OUTPUT_LIMIT;
+            while !text.is_char_boundary(end) {
+                end -= 1;
             }
-            _ => None,
-        })
-        .collect();
-    if rows.is_empty() {
-        // Inputs this view cannot read: plain tool rows.
-        let list = v_flex().w_full().children(
-            range
-                .clone()
-                .map(|ix| crate::chat::tool_row(ix, &entries[ix], p, cx)),
-        );
-        return div()
-            .w_full()
-            .pl(theme::sp(7.))
-            .child(list)
-            .into_any_element();
+            format!("{}\n… ({} more bytes)", &text[..end], text.len() - end)
+        } else {
+            text
+        };
+        markdown.push_str(&format!("\n\n{label}\n\n{}", code_block(&text, "")));
     }
-    let any_failed = rows.iter().any(|row| row.is_error);
-    let running = rows.iter().any(|row| !row.finished);
-    let header = h_flex()
-        .h(px(24.))
-        .px(theme::sp(2.))
-        .gap(theme::sp(2.))
-        .items_center()
-        .text_size(theme::text_sm())
+    let view = ctx.markdown(
+        &format!("call-{tool_use_id}"),
+        &markdown,
+        comments::KIND_TOOL,
+        cx,
+    );
+    div()
+        .w_full()
+        .pl(theme::sp(3.))
+        .py(theme::sp(1.))
+        .text_size(theme::text_xs())
+        .text_color(ctx.p.text_muted)
+        .child(view)
+        .into_any_element()
+}
+
+/// Bytes of a call's input or output shown when opened.
+const OUTPUT_LIMIT: usize = 4000;
+
+/// A tool input or result as readable text: strings as they are, other
+/// JSON pretty-printed, capped.
+pub fn pretty_json(value: &Value) -> String {
+    let text = match value {
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    };
+    if text.len() > OUTPUT_LIMIT {
+        let mut end = OUTPUT_LIMIT;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\n… ({} more bytes)", &text[..end], text.len() - end)
+    } else {
+        text
+    }
+}
+
+/// Diff lines picked with the mouse in one hunk of an edit shown in the
+/// transcript. Typing while lines are picked starts a comment on them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchPick {
+    pub tool_use_id: String,
+    pub hunk: usize,
+    pub anchor: usize,
+    pub cursor: usize,
+}
+
+impl PatchPick {
+    pub fn lines(&self) -> std::ops::RangeInclusive<usize> {
+        self.anchor.min(self.cursor)..=self.anchor.max(self.cursor)
+    }
+
+    pub fn contains(&self, tool_use_id: &str, hunk: usize, line: usize) -> bool {
+        self.tool_use_id == tool_use_id && self.hunk == hunk && self.lines().contains(&line)
+    }
+}
+
+/// One diff line as the comment quotes it: `+ text`, `- text`, `  text`.
+pub fn quoted_line(line: &DiffLine) -> String {
+    let sign = match line.kind {
+        LineKind::Added => '+',
+        LineKind::Removed => '-',
+        _ => ' ',
+    };
+    format!("{sign} {}", line.text)
+}
+
+/// "Apply patch <path> ⌄" and, open, the edit's diff. Lines can be picked
+/// (click, drag, shift-click) and commented on; `marked` holds the
+/// (hunk, line) of lines with comments. `None` when the input is not an
+/// edit this view can read.
+pub fn render_patch(
+    ix: usize,
+    entry: &ChatEntry,
+    ctx: &mut DocCtx,
+    pick: Option<&PatchPick>,
+    marked: &HashSet<(usize, usize)>,
+    cx: &mut Context<ChatPanel>,
+) -> Option<AnyElement> {
+    let ChatEntry::ToolCall {
+        tool_use_id,
+        finished,
+        is_error,
+        output,
+        ..
+    } = entry
+    else {
+        return None;
+    };
+    let edit = ctx.state.file_edit(entry)?;
+    let p = ctx.p;
+    let lines = edit.line_count();
+    let open = ctx
+        .state
+        .edit_open
+        .get(tool_use_id)
+        .copied()
+        .unwrap_or(lines <= OPEN_EDIT_LINES && !is_error);
+    let key = format!("patch-{tool_use_id}");
+    let path = display_path(&edit.path);
+    let text = ctx.text(&key, &path, comments::KIND_PATCH, cx);
+    let mut trailing = vec![counts(edit.additions, edit.deletions, p).into_any_element()];
+    if !*finished || *is_error {
+        trailing.push(status_icon(*finished, *is_error, p));
+    }
+    let id = tool_use_id.clone();
+    let header = line(
+        ("patch", ix),
+        Some("Apply patch".into()),
+        text,
+        key,
+        trailing,
+        (lines > 0).then_some(open),
+        Some(Rc::new(move |this, _, _, cx| {
+            this.toggle_edit(&id, open, cx)
+        })),
+        p,
+        cx,
+    );
+    let error = is_error
+        .then(|| output.as_ref().map(output_text))
+        .flatten()
+        .map(|text| comments::one_line(&strip_tags(&text), 160));
+    let body = (open && lines > 0).then(|| {
+        let mut column = v_flex()
+            .flex_shrink_0()
+            .min_w_full()
+            .py(theme::sp(1.5))
+            .font_family(theme::MONO_FONT)
+            .text_size(theme::text_xs())
+            .line_height(relative(1.6));
+        let mut drawn = 0;
+        for (hunk_ix, hunk) in edit.hunks.iter().enumerate() {
+            if hunk_ix > 0 {
+                column = column.child(div().w_full().h(theme::sp(3.)));
+            }
+            for (line_ix, diff_line) in hunk.lines.iter().enumerate() {
+                if drawn == MAX_RENDERED_LINES {
+                    break;
+                }
+                drawn += 1;
+                let picked = pick.is_some_and(|pick| pick.contains(tool_use_id, hunk_ix, line_ix));
+                let commented = marked.contains(&(hunk_ix, line_ix));
+                let at = PatchLine {
+                    tool_use_id: tool_use_id.clone(),
+                    hunk: hunk_ix,
+                    line: line_ix,
+                };
+                let drag_at = at.clone();
+                column = column.child(
+                    diff_row(diff_line, picked, commented, p)
+                        .id(SharedString::from(format!(
+                            "patch-line-{tool_use_id}-{hunk_ix}-{line_ix}"
+                        )))
+                        .cursor_text()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                this.press_patch_line(
+                                    at.clone(),
+                                    event.modifiers.shift,
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                            if event.pressed_button == Some(MouseButton::Left) {
+                                this.drag_patch_line(drag_at.clone(), cx);
+                            }
+                        })),
+                );
+            }
+        }
+        if lines > drawn {
+            column = column.child(
+                div()
+                    .px(theme::sp(3.))
+                    .py(theme::sp(1.))
+                    .font_family(theme::UI_FONT)
+                    .text_color(p.text_faint)
+                    .child(format!("{} more lines not shown", lines - drawn)),
+            );
+        }
+        h_flex()
+            .id(("patch-body", ix))
+            .w_full()
+            .rounded(theme::radius())
+            .border_1()
+            .border_color(if *is_error {
+                p.danger.opacity(0.4)
+            } else {
+                p.border
+            })
+            .bg(p.panel)
+            .overflow_x_scroll()
+            .child(column)
+    });
+    Some(
+        v_flex()
+            .w_full()
+            .gap(theme::sp(1.))
+            .child(header)
+            .when_some(error, |this, error| {
+                this.child(
+                    div()
+                        .pl(theme::sp(3.))
+                        .text_size(theme::text_xs())
+                        .text_color(p.danger)
+                        .child(error),
+                )
+            })
+            .children(body)
+            .into_any_element(),
+    )
+}
+
+/// New-side line numbers an edit's diff shows.
+pub fn new_lines(edit: &FileEdit) -> Vec<u32> {
+    edit.hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .filter_map(|line| line.new_line)
+        .collect()
+}
+
+/// (hunk, line) of the diff lines showing new-side lines `range`.
+pub fn patch_lines_in(
+    edit: &FileEdit,
+    range: std::ops::RangeInclusive<u32>,
+) -> HashSet<(usize, usize)> {
+    let mut out = HashSet::new();
+    for (hunk_ix, hunk) in edit.hunks.iter().enumerate() {
+        for (line_ix, line) in hunk.lines.iter().enumerate() {
+            if line.new_line.is_some_and(|number| range.contains(&number)) {
+                out.insert((hunk_ix, line_ix));
+            }
+        }
+    }
+    out
+}
+
+/// (hunk, line) of the diff lines a comment quoted (`+ text`, `- text`),
+/// when every quoted line is in one hunk of the edit; empty otherwise.
+pub fn patch_lines_matching(edit: &FileEdit, quoted: &[&str]) -> HashSet<(usize, usize)> {
+    if quoted.is_empty() {
+        return HashSet::new();
+    }
+    for (hunk_ix, hunk) in edit.hunks.iter().enumerate() {
+        let shown: Vec<String> = hunk.lines.iter().map(quoted_line).collect();
+        let found: Option<HashSet<(usize, usize)>> = quoted
+            .iter()
+            .map(|wanted| {
+                shown
+                    .iter()
+                    .position(|line| line.trim_end() == wanted.trim_end())
+                    .map(|line_ix| (hunk_ix, line_ix))
+            })
+            .collect();
+        if let Some(found) = found {
+            return found;
+        }
+    }
+    HashSet::new()
+}
+
+/// Where a pressed diff line is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchLine {
+    pub tool_use_id: String,
+    pub hunk: usize,
+    pub line: usize,
+}
+
+fn diff_row(line: &DiffLine, picked: bool, commented: bool, p: &Palette) -> Div {
+    let (bg, sign, sign_color, text_color) = match line.kind {
+        LineKind::Added => (Some(p.diff_add_bg), "+", p.diff_add_text, p.text),
+        LineKind::Removed => (Some(p.diff_del_bg), "-", p.diff_del_text, p.text),
+        LineKind::Context => (None, " ", p.text_faint, p.text_muted),
+        LineKind::NoNewline => (None, " ", p.text_faint, p.text_faint),
+    };
+    let bg = if picked {
+        Some(p.accent.opacity(0.24))
+    } else if commented {
+        Some(comments::mark_color(p).opacity(0.2))
+    } else {
+        bg
+    };
+    h_flex()
+        .w_full()
+        .px(theme::sp(3.))
+        .when_some(bg, |this, bg| this.bg(bg))
         .child(
-            Icon::new(IconName::FilePen)
-                .with_size(px(13.))
-                .text_color(p.text_muted),
+            div()
+                .w(px(16.))
+                .flex_shrink_0()
+                .text_color(sign_color)
+                .child(sign),
         )
         .child(
             div()
-                .text_color(p.text_muted)
-                .child(edits_header(rows.iter().map(|row| row.edit.as_ref()))),
-        )
-        .when(any_failed, |this| {
-            this.child(div().text_color(p.danger).child("\u{2014} Failed"))
-        })
-        .when(running, |this| {
-            this.child(Spinner::new().xsmall().color(p.accent))
-        });
-
-    let mut list = v_flex().w_full().gap(theme::sp(1.5));
-    for (n, row) in rows.iter().enumerate() {
-        let lines = row.edit.line_count();
-        let open = state
-            .edit_open
-            .get(row.id)
-            .copied()
-            .unwrap_or(lines <= OPEN_EDIT_LINES && !row.is_error);
-        let id = row.id.to_string();
-        let ix = range.start + n;
-        let title = h_flex()
-            .id(("edit-row", ix))
-            .w_full()
-            .h(px(28.))
-            .px(theme::sp(2.))
-            .gap(theme::sp(2.))
-            .items_center()
-            .cursor_pointer()
-            .hover(|style| style.bg(p.hover))
-            .when(open && lines > 0, |this| {
-                this.border_b_1().border_color(p.border)
-            })
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_edit(&id, open, cx)))
-            .child(chevron(open, p))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(theme::text_sm())
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(p.text)
-                    .child(row.edit.verb),
-            )
-            .child(path_label(&row.edit.path, p))
-            .child(counts(row.edit.additions, row.edit.deletions, p))
-            .child(status_icon(row.finished, row.is_error, p));
-        let body = (open && lines > 0).then(|| {
-            let mut column = v_flex()
                 .flex_shrink_0()
-                .min_w_full()
-                .py(theme::sp(1.))
-                .font_family(theme::MONO_FONT)
-                .text_size(theme::text_xs());
-            let mut drawn = 0;
-            for (hunk_ix, hunk) in row.edit.hunks.iter().enumerate() {
-                if hunk_ix > 0 {
-                    column = column.child(
-                        div()
-                            .w_full()
-                            .px(theme::sp(2.))
-                            .bg(p.diff_hunk_bg)
-                            .text_color(p.text_faint)
-                            .child("\u{22ef}"),
-                    );
-                }
-                for line in &hunk.lines {
-                    if drawn == MAX_RENDERED_LINES {
-                        break;
-                    }
-                    column = column.child(crate::changes::render_line(line, false, p));
-                    drawn += 1;
-                }
-            }
-            if lines > drawn {
-                column = column.child(
-                    div()
-                        .px(theme::sp(2.))
-                        .py(theme::sp(1.))
-                        .font_family(theme::UI_FONT)
-                        .text_color(p.text_faint)
-                        .child(format!("{} more lines not shown", lines - drawn)),
-                );
-            }
-            h_flex()
-                .id(("edit-body", ix))
-                .w_full()
-                .overflow_x_scroll()
-                .child(column)
-        });
-        list = list.child(
-            v_flex()
-                .w_full()
-                .rounded(theme::radius())
-                .border_1()
-                .border_color(if row.is_error {
-                    p.danger.opacity(0.4)
-                } else {
-                    p.border
-                })
-                .bg(p.bg)
-                .overflow_hidden()
-                .child(title)
-                .when_some(row.error.clone(), |this, error| {
-                    this.child(
-                        div()
-                            .px(theme::sp(3.))
-                            .py(theme::sp(1.5))
-                            .text_size(theme::text_xs())
-                            .text_color(p.danger)
-                            .child(error),
-                    )
-                })
-                .children(body),
-        );
-    }
-    div()
-        .w_full()
-        .pl(theme::sp(7.))
-        .child(
-            v_flex()
-                .w_full()
-                .gap(theme::sp(1.5))
-                .child(header)
-                .child(list),
+                .pr(theme::sp(3.))
+                .whitespace_nowrap()
+                .text_color(text_color)
+                .child(line.text.replace('\t', "    ")),
         )
+}
+
+/// A subagent line: "Agent spawned: <title> (scout · model) ›", "Agent
+/// completed: <title> ›", "Message to agent: <title> ›". A click opens the
+/// subagent next to this transcript (⌘-click: as the selected thread).
+#[allow(clippy::too_many_arguments)]
+pub fn render_agent(
+    id: impl Into<ElementId>,
+    label: &str,
+    detail: &str,
+    key: String,
+    thread: Option<ThreadId>,
+    trailing: Vec<AnyElement>,
+    tooltip: Option<String>,
+    ctx: &mut DocCtx,
+    cx: &mut Context<ChatPanel>,
+) -> AnyElement {
+    let p = ctx.p;
+    let text = ctx.text(&key, detail, comments::KIND_SUBAGENT, cx);
+    let known = thread.is_some();
+    let click: Option<LineClick> = thread.map(|thread| {
+        Rc::new(
+            move |this: &mut ChatPanel,
+                  event: &ClickEvent,
+                  _: &mut Window,
+                  cx: &mut Context<ChatPanel>| {
+                this.open_agent(thread.clone(), event.modifiers().platform, cx);
+            },
+        ) as LineClick
+    });
+    let tooltip: Option<SharedString> = tooltip.map(Into::into);
+    div()
+        .id(SharedString::from(format!("{key}-box")))
+        .w_full()
+        .px(theme::sp(2.))
+        .rounded(theme::radius())
+        .border_1()
+        .border_color(p.border)
+        .when(known, |this| this.hover(|style| style.bg(p.hover)))
+        .when_some(tooltip, |this, tooltip| {
+            this.tooltip(move |window, cx| {
+                gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+            })
+        })
+        .child(line(
+            id,
+            Some(label.to_string()),
+            text,
+            key,
+            trailing,
+            known.then_some(false),
+            click,
+            p,
+            cx,
+        ))
         .into_any_element()
 }
 
@@ -1329,338 +1841,6 @@ fn strip_tags(text: &str) -> String {
     }
     out.push_str(rest);
     out
-}
-
-fn ansi_color(color: AnsiColor, p: &Palette) -> Hsla {
-    match color {
-        AnsiColor::Rgb(r, g, b) => rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into(),
-        AnsiColor::Basic(n) => match n % 8 {
-            0 => p.text_faint,
-            1 => p.danger,
-            2 => p.success,
-            3 => p.warning,
-            4 => p.accent_text,
-            5 => hsla(300. / 360., 0.45, 0.65, 1.),
-            6 => hsla(187. / 360., 0.45, 0.55, 1.),
-            _ => p.text,
-        },
-    }
-}
-
-fn styled_line(line: &AnsiLine, p: &Palette) -> StyledText {
-    let mut text = String::new();
-    let mut highlights = Vec::new();
-    for span in line {
-        let start = text.len();
-        text.push_str(&span.text);
-        let style = span.style;
-        if style.fg.is_some() || style.bold || style.dim {
-            let color = style.fg.map(|color| ansi_color(color, p));
-            highlights.push((
-                start..text.len(),
-                HighlightStyle {
-                    color: color.or(style.dim.then_some(p.text_faint)),
-                    font_weight: style.bold.then_some(FontWeight::BOLD),
-                    ..Default::default()
-                },
-            ));
-        }
-    }
-    StyledText::new(text).with_highlights(highlights)
-}
-
-/// A Bash call: description, command, duration, exit status and the tail
-/// of its output.
-pub fn render_command(
-    ix: usize,
-    entry: &ChatEntry,
-    state: &ToolViewState,
-    p: &Palette,
-    cx: &mut Context<ChatPanel>,
-) -> AnyElement {
-    let ChatEntry::ToolCall {
-        tool_use_id,
-        input_json,
-        finished,
-        is_error,
-        output,
-        ..
-    } = entry
-    else {
-        return div().into_any_element();
-    };
-    let field = |key: &str| input_json.get(key).and_then(Value::as_str);
-    let command = field("command").unwrap_or_default().trim().to_string();
-    let description = field("description").map(str::to_string);
-    let text = output.as_ref().map(output_text).unwrap_or_default();
-    let (status, body) = command_result(*finished, *is_error, &text);
-    let lines = parse_ansi(&body);
-    let show_all = state.full_output.contains(tool_use_id);
-    let (first, hidden) = visible_tail(lines.len(), OUTPUT_TAIL, show_all);
-    let duration = state
-        .timings
-        .get(tool_use_id)
-        .and_then(ToolTiming::duration_ms)
-        .map(format_duration);
-
-    let (status_label, status_color): (String, Hsla) = match status {
-        ExitStatus::Running => ("Running".into(), p.accent_text),
-        ExitStatus::Success => ("exit 0".into(), p.success),
-        ExitStatus::Code(code) => (format!("exit {code}"), p.danger),
-        ExitStatus::Failed => ("failed".into(), p.danger),
-        ExitStatus::Interrupted => ("interrupted".into(), p.warning),
-    };
-    let header = h_flex()
-        .w_full()
-        .px(theme::sp(2.5))
-        .py(theme::sp(1.5))
-        .gap(theme::sp(2.))
-        .items_center()
-        .text_size(theme::text_sm())
-        .child(
-            Icon::new(IconName::SquareTerminal)
-                .with_size(px(13.))
-                .text_color(p.text_muted),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(p.text)
-                .child(description.unwrap_or_else(|| "Ran a command".into())),
-        )
-        .when_some(duration, |this, duration| {
-            this.child(
-                div()
-                    .flex_shrink_0()
-                    .font_family(theme::MONO_FONT)
-                    .text_size(theme::text_xs())
-                    .text_color(p.text_faint)
-                    .child(duration),
-            )
-        })
-        .child(
-            h_flex()
-                .flex_shrink_0()
-                .h(px(18.))
-                .px(theme::sp(1.5))
-                .gap(theme::sp(1.))
-                .items_center()
-                .rounded(theme::radius_sm())
-                .bg(status_color.opacity(0.12))
-                .font_family(theme::MONO_FONT)
-                .text_size(theme::text_xs())
-                .text_color(status_color)
-                .when(status == ExitStatus::Running, |this| {
-                    this.child(Spinner::new().xsmall().color(p.accent))
-                })
-                .child(status_label),
-        );
-
-    let command_lines: Vec<&str> = command.lines().collect();
-    let shown_command = command_lines.iter().take(6).copied().collect::<Vec<_>>();
-    let mut command_block = v_flex()
-        .w_full()
-        .px(theme::sp(2.5))
-        .py(theme::sp(1.5))
-        .border_t_1()
-        .border_color(p.border)
-        .bg(p.bg)
-        .font_family(theme::MONO_FONT)
-        .text_size(theme::text_xs())
-        .line_height(relative(1.5))
-        .text_color(p.text);
-    for (n, line) in shown_command.iter().enumerate() {
-        command_block = command_block.child(
-            h_flex()
-                .w_full()
-                .child(
-                    div()
-                        .w(px(14.))
-                        .flex_shrink_0()
-                        .text_color(p.text_faint)
-                        .child(if n == 0 { "$" } else { " " }),
-                )
-                .child(div().flex_1().min_w_0().child(line.to_string())),
-        );
-    }
-    if command_lines.len() > shown_command.len() {
-        command_block = command_block.child(div().pl(px(14.)).text_color(p.text_faint).child(
-            format!("… {} more lines", command_lines.len() - shown_command.len()),
-        ));
-    }
-
-    let output_block = (!lines.is_empty() || (*finished && status != ExitStatus::Interrupted))
-        .then(|| {
-            let id = tool_use_id.clone();
-            let toggle = (hidden > 0 || show_all && lines.len() > OUTPUT_TAIL).then(|| {
-                h_flex()
-                    .id(("command-more", ix))
-                    .w_full()
-                    .px(theme::sp(2.5))
-                    .py(theme::sp(1.))
-                    .gap(theme::sp(1.5))
-                    .items_center()
-                    .cursor_pointer()
-                    .font_family(theme::UI_FONT)
-                    .text_size(theme::text_xs())
-                    .text_color(p.accent_text)
-                    .hover(|style| style.bg(p.hover))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_output(&id, cx)))
-                    .child(
-                        Icon::new(if show_all {
-                            IconName::ChevronUp
-                        } else {
-                            IconName::ChevronsUpDown
-                        })
-                        .with_size(px(11.)),
-                    )
-                    .child(if show_all {
-                        "Show less".to_string()
-                    } else {
-                        format!(
-                            "Show {}",
-                            crate::comments::plural(hidden, "more line", "more lines")
-                        )
-                    })
-            });
-            let mut column = v_flex()
-                .flex_shrink_0()
-                .min_w_full()
-                .px(theme::sp(2.5))
-                .py(theme::sp(1.5))
-                .font_family(theme::MONO_FONT)
-                .text_size(theme::text_xs())
-                .line_height(relative(1.5))
-                .text_color(p.text_muted);
-            if lines.is_empty() {
-                column = column.child(div().text_color(p.text_faint).child("(no output)"));
-            }
-            let end = lines.len().min(first + MAX_RENDERED_LINES);
-            for line in &lines[first..end] {
-                column = column.child(div().whitespace_nowrap().child(styled_line(line, p)));
-            }
-            if end < lines.len() {
-                column = column.child(
-                    div()
-                        .text_color(p.text_faint)
-                        .child(format!("… {} more lines not shown", lines.len() - end)),
-                );
-            }
-            v_flex()
-                .w_full()
-                .border_t_1()
-                .border_color(p.border)
-                .bg(p.bg)
-                .children(toggle)
-                .child(
-                    h_flex()
-                        .id(("command-output", ix))
-                        .w_full()
-                        .overflow_x_scroll()
-                        .child(column),
-                )
-        });
-
-    div()
-        .w_full()
-        .pl(theme::sp(7.))
-        .child(
-            v_flex()
-                .w_full()
-                .rounded(theme::radius())
-                .border_1()
-                .border_color(match status {
-                    ExitStatus::Code(_) | ExitStatus::Failed => p.danger.opacity(0.4),
-                    _ => p.border,
-                })
-                .bg(p.elevated)
-                .overflow_hidden()
-                .child(header)
-                .child(command_block)
-                .children(output_block),
-        )
-        .into_any_element()
-}
-
-/// "Subagent: <title>", selecting the subthread when the sidebar knows it.
-pub fn render_subthread(
-    ix: usize,
-    entry: &ChatEntry,
-    link: SubthreadLink,
-    p: &Palette,
-    cx: &mut Context<ChatPanel>,
-) -> AnyElement {
-    let ChatEntry::ToolCall {
-        finished, is_error, ..
-    } = entry
-    else {
-        return div().into_any_element();
-    };
-    let linked = link.thread.clone();
-    div()
-        .w_full()
-        .pl(theme::sp(7.))
-        .child(
-            h_flex()
-                .id(("subthread-row", ix))
-                .w_full()
-                .h(px(28.))
-                .px(theme::sp(2.))
-                .gap(theme::sp(2.))
-                .items_center()
-                .rounded(theme::radius())
-                .border_1()
-                .border_color(p.border)
-                .bg(p.elevated)
-                .text_size(theme::text_sm())
-                .when_some(linked, |this, thread| {
-                    this.cursor_pointer()
-                        .hover(|style| style.bg(p.hover))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_thread(thread.clone(), cx);
-                        }))
-                })
-                .child(
-                    Icon::new(IconName::Bot)
-                        .with_size(px(13.))
-                        .text_color(p.accent_text),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_color(p.text_muted)
-                        .child(if link.message {
-                            "Message to subagent:"
-                        } else {
-                            "Subagent:"
-                        }),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(if link.thread.is_some() {
-                            p.accent_text
-                        } else {
-                            p.text
-                        })
-                        .child(link.title.clone()),
-                )
-                .when(link.thread.is_some(), |this| {
-                    this.child(
-                        Icon::new(IconName::ArrowUpRight)
-                            .with_size(px(12.))
-                            .text_color(p.accent_text),
-                    )
-                })
-                .child(status_icon(*finished, *is_error, p)),
-        )
-        .into_any_element()
 }
 
 #[cfg(test)]
@@ -1755,11 +1935,115 @@ mod tests {
                 Item::Single(3),
                 Item::Single(4),
                 Item::Edits(5..7),
-                Item::Single(7),
-                Item::Group(8..9),
+                // A command folds with the thought after it.
+                Item::Group(7..9),
                 Item::Single(9),
             ]
         );
+        // A lone thought keeps its own line ("Thinking: …").
+        assert_eq!(
+            layout_items(&[text("a"), thought(), text("b")]),
+            vec![Item::Single(0), Item::Single(1), Item::Single(2)]
+        );
+    }
+
+    #[test]
+    fn activity_lines_read_like_delta() {
+        assert_eq!(
+            group_summary(&[
+                thought(),
+                call("Bash", json!({"command": "ls"})),
+                call("Bash", json!({"command": "pwd"})),
+                call("Read", json!({"file_path": "a.rs"})),
+                thought(),
+            ]),
+            "Thought 2 times, ran 2 commands, read a file"
+        );
+        assert_eq!(
+            thinking_line("\n**Patching approved plan**\n\nThen more."),
+            "Patching approved plan"
+        );
+        assert_eq!(thinking_line("## Plan:\nx"), "Plan");
+        assert!(thinking_line(&"word ".repeat(40)).ends_with('…'));
+        assert_eq!(
+            call_line("Bash", &json!({"command": "cargo test\n--all"})),
+            ("Ran".to_string(), "cargo test".to_string())
+        );
+        assert_eq!(
+            call_line("Read", &json!({"file_path": "src/main.rs"})),
+            ("Read".to_string(), "src/main.rs".to_string())
+        );
+        assert_eq!(
+            call_line("Edit", &json!({"file_path": "plans/user.md"})),
+            ("Apply patch".to_string(), "plans/user.md".to_string())
+        );
+        assert_eq!(
+            call_line("Skill", &json!({"skill": "trama"})),
+            ("Loaded skill".to_string(), "trama".to_string())
+        );
+        assert_eq!(
+            call_line("mcp__github__get_issue", &json!({"number": 3})),
+            ("Called".to_string(), "get_issue".to_string())
+        );
+        assert_eq!(
+            agent_detail(
+                "Validate target identity",
+                Some("scout"),
+                Some("claude-opus-4-1")
+            ),
+            "Validate target identity (scout \u{b7} Opus 4.1)"
+        );
+        assert_eq!(agent_detail(" ", None, None), "Untitled");
+        assert_eq!(agent_detail("T", Some("worker"), None), "T (worker)");
+        use trama_domain::subagent::SubagentStatus;
+        assert_eq!(agent_label(None, true), "Agent spawned:");
+        assert_eq!(
+            agent_label(Some(SubagentStatus::Completed), false),
+            "Agent completed:"
+        );
+        assert_eq!(
+            agent_label(Some(SubagentStatus::Failed), false),
+            "Agent failed:"
+        );
+    }
+
+    #[test]
+    fn comments_find_their_lines_in_an_edit() {
+        let edit = file_edit(
+            "Edit",
+            &json!({"file_path": "/repo/a.rs", "old_string": "a\nb\nc", "new_string": "a\nB\nc"}),
+            None,
+        )
+        .unwrap();
+        // " a", "-b", "+B", " c"
+        assert_eq!(new_lines(&edit), vec![1, 2, 3]);
+        let on_b: HashSet<(usize, usize)> = patch_lines_in(&edit, 2..=2);
+        assert_eq!(on_b, HashSet::from([(0, 2)]));
+        let quoted = patch_lines_matching(&edit, &["- b", "+ B"]);
+        assert_eq!(quoted, HashSet::from([(0, 1), (0, 2)]));
+        assert!(patch_lines_matching(&edit, &["- b", "+ nope"]).is_empty());
+        assert!(patch_lines_matching(&edit, &[]).is_empty());
+    }
+
+    #[test]
+    fn patch_picks_span_lines_of_one_hunk() {
+        let pick = PatchPick {
+            tool_use_id: "e1".into(),
+            hunk: 0,
+            anchor: 4,
+            cursor: 2,
+        };
+        assert_eq!(pick.lines(), 2..=4);
+        assert!(pick.contains("e1", 0, 3));
+        assert!(!pick.contains("e1", 1, 3));
+        assert!(!pick.contains("e2", 0, 3));
+        let line = DiffLine {
+            kind: LineKind::Removed,
+            old_line: Some(3),
+            new_line: None,
+            text: "old".into(),
+        };
+        assert_eq!(quoted_line(&line), "- old");
     }
 
     #[test]
@@ -1849,11 +2133,7 @@ mod tests {
         assert_eq!(notebook.verb, "Edit notebook");
         assert_eq!(notebook.additions, 1);
         assert!(file_edit("Edit", &json!({}), None).is_none());
-
-        assert_eq!(
-            edits_header(&[multi.clone(), write, multi]),
-            "Applied 5 edits across 2 files"
-        );
+        assert_eq!(multi.path, "a.rs");
     }
 
     #[test]

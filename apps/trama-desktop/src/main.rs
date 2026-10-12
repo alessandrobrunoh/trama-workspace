@@ -11,6 +11,8 @@ mod copies;
 mod devhooks;
 mod dialog;
 mod diff;
+mod doc_text;
+mod document;
 mod editor;
 mod forks;
 mod keymap;

@@ -12,6 +12,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -26,13 +27,15 @@ use crate::comments::{
 };
 use crate::composer::{BillingBadge, Composer, ComposerFooter};
 use crate::composer_popup::ComposerPopup;
+use crate::doc_text::{BlockSelection, BlockTexts, Mark};
+use crate::document::{self, AuthorKey, BlockItem};
 use crate::model_picker::ModelPicker;
 use crate::net::{DaemonClient, SendStatus};
 use crate::sidebar::ThreadStatus;
 use crate::snapshot;
 use crate::terminal_view::{self, TerminalEvent, TerminalPanel};
 use crate::theme::{self, Palette};
-use crate::tools::{self, Item, ToolKind, ToolTiming, ToolViewState};
+use crate::tools::{self, DocCtx, Item, PatchLine, PatchPick, ToolKind, ToolTiming, ToolViewState};
 use crate::turns::{self, Bookmarks, Span};
 use gpui_kit::component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp};
 
@@ -127,8 +130,11 @@ pub enum ChatEntry {
 /// Requests the chat panel makes of the workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatEvent {
-    /// Select this thread (a subagent link was clicked).
+    /// Select this thread (⌘-click on a subagent line).
     OpenThread(ThreadId),
+    /// Show this subagent's transcript next to this one (a click on an
+    /// "Agent spawned" line).
+    OpenInPane(ThreadId),
     /// Fork the selected thread at a message (hover action, ⌘K).
     Fork(crate::forks::ForkTarget),
 }
@@ -175,10 +181,14 @@ struct MessageView {
 
 /// The commentable selection seen in the last render.
 #[derive(Debug, Clone)]
-struct SelectionHit {
-    message_id: MessageId,
-    /// Byte range of `Message::text()`.
-    range: Range<usize>,
+enum SelectionHit {
+    /// Text of a stored message: a byte range of `Message::text()`.
+    Message {
+        message_id: MessageId,
+        range: Range<usize>,
+    },
+    /// Text of another block (activity, thinking, output, a subagent line).
+    Block(BlockSelection),
 }
 
 /// Where the open comment composer sits in the transcript.
@@ -190,7 +200,49 @@ enum DraftAnchor {
         message_id: MessageId,
         range: Range<usize>,
     },
+    /// A new comment on a passage of a block that is not a message, under
+    /// the block drawing text `key`.
+    Block {
+        key: String,
+        kind: &'static str,
+        excerpt: String,
+        turn: usize,
+    },
+    /// A new comment on picked lines of an edit's diff.
+    Patch {
+        tool_use_id: String,
+    },
     Reply(CommentId),
+}
+
+/// What the comment cards of one frame read.
+struct CardCtx {
+    groups: Vec<CommentGroup>,
+    handlers: CardHandlers,
+    /// First sentence of each stored answer, for "↩ answer" lines.
+    answers: HashMap<MessageId, String>,
+    /// This machine's user, for their avatar.
+    me: Option<String>,
+    /// A reply composer is drawn once, under the first card of its thread.
+    reply_drawn: Cell<bool>,
+}
+
+/// Where the comment threads of one frame go.
+#[derive(Default)]
+struct Placement {
+    /// Threads on each turn's blocks, in creation order.
+    by_turn: HashMap<usize, Vec<usize>>,
+    /// Passages of block comments (and of the open draft) to find in each
+    /// turn's block texts.
+    marks: HashMap<usize, Vec<Mark>>,
+    /// Commented lines and threads under each edit, by tool use id.
+    patches: HashMap<String, PatchComments>,
+}
+
+#[derive(Default)]
+struct PatchComments {
+    lines: HashSet<(usize, usize)>,
+    groups: Vec<usize>,
 }
 
 struct ChatDraft {
@@ -265,6 +317,20 @@ pub struct ChatPanel {
     terminals: Entity<TerminalPanel>,
     /// Expanded terminal snapshots in sent prompts (message, block index).
     open_snapshots: HashSet<(MessageId, usize)>,
+    /// Selectable text of the blocks that are not stored messages.
+    block_texts: BlockTexts,
+    /// Diff lines picked in an edit, and whether the mouse still drags.
+    patch_pick: Option<PatchPick>,
+    patch_dragging: bool,
+    /// Takes keys while diff lines are picked (type to comment).
+    doc_focus: FocusHandle,
+    /// Turn comment groups opened or closed by hand.
+    turn_comments_open: HashMap<usize, bool>,
+    /// The selected thread's checkouts (repository id, root), to anchor
+    /// comments on diff lines to code.
+    checkouts: Vec<(String, std::path::PathBuf)>,
+    /// Drawn in the side pane: no terminals, a subagent's transcript.
+    pane_mode: bool,
     _composer_extras: Vec<Subscription>,
     _enter: Subscription,
     _event_task: Option<Task<()>>,
@@ -351,6 +417,13 @@ impl ChatPanel {
             model_picker,
             terminals,
             open_snapshots: HashSet::new(),
+            block_texts: BlockTexts::default(),
+            patch_pick: None,
+            patch_dragging: false,
+            doc_focus: cx.focus_handle(),
+            turn_comments_open: HashMap::new(),
+            checkouts: Vec::new(),
+            pane_mode: false,
             _composer_extras: composer_extras,
             _enter: enter,
             _event_task: None,
@@ -546,6 +619,10 @@ impl ChatPanel {
         self.remote_authors.clear();
         self.fork_index.clear();
         self.received.clear();
+        self.block_texts.clear();
+        self.patch_pick = None;
+        self.patch_dragging = false;
+        self.turn_comments_open.clear();
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -1123,7 +1200,7 @@ impl ChatPanel {
         }
     }
 
-    fn toggle_tool(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_tool(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(ChatEntry::ToolCall { expanded, .. }) = self.entries.get_mut(index) {
             *expanded = !*expanded;
             cx.notify();
@@ -1435,32 +1512,39 @@ fn push_thinking(entries: &mut Vec<ChatEntry>, text: &str) {
 // -- comments -------------------------------------------------------------
 
 impl ChatPanel {
-    /// Comment on the selected transcript text (⌘⌥M and the floating button).
+    /// Comment on the selected transcript text or the picked diff lines
+    /// (⌘⌥M and the floating button).
     pub fn comment_on_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.selection.clone() {
-            Some(hit) => self.open_passage_draft(hit, None, window, cx),
-            None if self.uses_daemon() => {
-                self.connection_error = Some(
-                    "Select text in a message, then type your comment (or press \u{2318}\u{2325}M)."
-                        .into(),
-                );
-                cx.notify();
-            }
-            None => {}
+        if let Some(hit) = self.selection.clone() {
+            self.open_selection_draft(hit, None, window, cx);
+        } else if let Some(pick) = self.patch_pick.clone() {
+            self.open_patch_draft(pick, None, window, cx);
+        } else if self.uses_daemon() {
+            self.connection_error = Some(
+                "Select text anywhere in the transcript, then type your comment (or press \u{2318}\u{2325}M)."
+                    .into(),
+            );
+            cx.notify();
         }
     }
 
+    /// Whether a selection or a diff pick waits for a comment.
+    pub fn has_comment_target(&self) -> bool {
+        self.selection.is_some() || self.patch_pick.is_some()
+    }
+
     /// Type to comment: a printable key while transcript text is selected
-    /// opens the composer under the passage with that text already in it.
+    /// (or diff lines are picked) opens the composer under the passage with
+    /// that text already in it.
     fn type_to_comment(
         &mut self,
         event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(hit) = self.selection.clone() else {
+        if self.selection.is_none() && self.patch_pick.is_none() {
             return;
-        };
+        }
         if self
             .composer
             .input
@@ -1473,12 +1557,25 @@ impl ChatPanel {
         {
             return;
         }
+        if event.keystroke.key == "escape" && self.patch_pick.is_some() && self.selection.is_none()
+        {
+            self.patch_pick = None;
+            cx.notify();
+            return;
+        }
         let Some(text) = comments::typed_text(&event.keystroke) else {
             return;
         };
         cx.stop_propagation();
         window.prevent_default();
-        self.open_passage_draft(hit, Some(text), window, cx);
+        match self.selection.clone() {
+            Some(hit) => self.open_selection_draft(hit, Some(text), window, cx),
+            None => {
+                if let Some(pick) = self.patch_pick.clone() {
+                    self.open_patch_draft(pick, Some(text), window, cx);
+                }
+            }
+        }
     }
 
     /// The hover action on a message: the selection inside it, else the
@@ -1490,11 +1587,13 @@ impl ChatPanel {
         cx: &mut Context<Self>,
     ) {
         let hit = match &self.selection {
-            Some(hit) if hit.message_id == message_id => Some(hit.clone()),
+            Some(hit @ SelectionHit::Message { message_id: id, .. }) if id == &message_id => {
+                Some(hit.clone())
+            }
             _ => self.whole_message_hit(&message_id),
         };
         if let Some(hit) = hit {
-            self.open_passage_draft(hit, None, window, cx);
+            self.open_selection_draft(hit, None, window, cx);
         }
     }
 
@@ -1512,13 +1611,30 @@ impl ChatPanel {
             _ => None,
         })?;
         let range = comments::selection_to_message_range(&view.source, base, 0..view.source.len())?;
-        Some(SelectionHit {
+        Some(SelectionHit::Message {
             message_id: message_id.clone(),
             range,
         })
     }
 
-    fn open_passage_draft(
+    /// Forget the selection the composer is about to take over.
+    fn drop_selection(&mut self, cx: &mut Context<Self>) {
+        for view in self.message_views.values() {
+            for segment in &view.segments {
+                segment
+                    .state
+                    .update(cx, |state, cx| state.clear_selection(cx));
+            }
+        }
+        if let Some(SelectionHit::Block(selection)) = &self.selection {
+            self.block_texts.clear_selection(&selection.block.key, cx);
+        }
+        self.selection = None;
+        self.selection_point = None;
+        self.connection_error = None;
+    }
+
+    fn open_selection_draft(
         &mut self,
         hit: SelectionHit,
         initial: Option<String>,
@@ -1528,21 +1644,40 @@ impl ChatPanel {
         if !self.uses_daemon() {
             return;
         }
-        if let Some(view) = self.message_views.get(&hit.message_id) {
-            for segment in &view.segments {
-                segment
-                    .state
-                    .update(cx, |state, cx| state.clear_selection(cx));
+        let (target, anchor, quote) = match &hit {
+            SelectionHit::Message { message_id, range } => (
+                CommentTarget::MessageRange {
+                    message_id: message_id.clone(),
+                    start_byte: range.start,
+                    end_byte: range.end,
+                },
+                DraftAnchor::Passage {
+                    message_id: message_id.clone(),
+                    range: range.clone(),
+                },
+                None,
+            ),
+            SelectionHit::Block(selection) => {
+                let Some(target) = self.block_target(selection.block.turn) else {
+                    self.connection_error =
+                        Some("This turn is not saved yet; comment once it has an answer.".into());
+                    cx.notify();
+                    return;
+                };
+                (
+                    target,
+                    DraftAnchor::Block {
+                        key: selection.block.key.clone(),
+                        kind: selection.block.kind,
+                        excerpt: selection.text.clone(),
+                        turn: selection.block.turn,
+                    },
+                    Some((selection.block.kind, selection.text.clone())),
+                )
             }
-        }
-        self.selection = None;
-        self.selection_point = None;
-        self.connection_error = None;
-        let target = CommentTarget::MessageRange {
-            message_id: hit.message_id.clone(),
-            start_byte: hit.range.start,
-            end_byte: hit.range.end,
         };
+        self.drop_selection(cx);
+        self.patch_pick = None;
         let draft = CommentDraft::new(
             target,
             None,
@@ -1551,15 +1686,171 @@ impl ChatPanel {
             cx,
             |this: &mut Self, window, cx| this.submit_draft(window, cx),
         );
+        let draft = match quote {
+            Some((kind, excerpt)) => draft.with_quote(kind, excerpt),
+            None => draft,
+        };
+        self.draft = Some(ChatDraft { anchor, draft });
+        cx.notify();
+    }
+
+    /// Where a comment on a block of `turn` is stored: the first line of
+    /// the turn's stored answer, else of its stored prompt. The block's
+    /// passage goes in the comment's body ([`comments::proxy_body`]).
+    fn block_target(&self, turn: usize) -> Option<CommentTarget> {
+        let turn_list = turns::segment_turns(&self.entries);
+        let range = turn_list.get(turn)?.entries.clone();
+        let entries = &self.entries[range];
+        let answer = entries.iter().rev().find_map(|entry| match entry {
+            ChatEntry::Assistant {
+                markdown,
+                streaming: false,
+                message_id: Some(id),
+            } if self.stored_len.get(id) == Some(&markdown.len()) => {
+                comments::proxy_anchor(markdown).map(|range| (id.clone(), range))
+            }
+            _ => None,
+        });
+        let prompt = || {
+            entries.iter().find_map(|entry| match entry {
+                ChatEntry::User {
+                    text,
+                    message_id: Some(id),
+                } => {
+                    let base = user_body_start(text);
+                    comments::proxy_anchor(&text[base..])
+                        .map(|range| (id.clone(), range.start + base..range.end + base))
+                }
+                _ => None,
+            })
+        };
+        let (message_id, range) = answer.or_else(prompt)?;
+        Some(CommentTarget::MessageRange {
+            message_id,
+            start_byte: range.start,
+            end_byte: range.end,
+        })
+    }
+
+    /// A comment on picked diff lines: on the code they wrote when the file
+    /// is in a known checkout, else a block comment quoting the lines.
+    fn open_patch_draft(
+        &mut self,
+        pick: PatchPick,
+        initial: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.uses_daemon() {
+            return;
+        }
+        let found = self
+            .entries
+            .iter()
+            .enumerate()
+            .find_map(|(ix, entry)| match entry {
+                ChatEntry::ToolCall { tool_use_id, .. } if tool_use_id == &pick.tool_use_id => {
+                    Some((ix, self.tool_views.file_edit(entry)?))
+                }
+                _ => None,
+            });
+        let Some((ix, edit)) = found else {
+            return;
+        };
+        let Some(hunk) = edit.hunks.get(pick.hunk) else {
+            return;
+        };
+        let quoted: Vec<String> = hunk
+            .lines
+            .get(pick.lines())
+            .unwrap_or_default()
+            .iter()
+            .map(tools::quoted_line)
+            .collect();
+        let (target, quote) =
+            match comments::patch_target(&self.checkouts, &edit.path, hunk, pick.lines()) {
+                Some(target) => (target, None),
+                None => {
+                    let turn = turns::segment_turns(&self.entries)
+                        .iter()
+                        .position(|turn| turn.entries.contains(&ix))
+                        .unwrap_or(0);
+                    let Some(target) = self.block_target(turn) else {
+                        self.connection_error = Some(
+                            "This turn is not saved yet; comment once it has an answer.".into(),
+                        );
+                        cx.notify();
+                        return;
+                    };
+                    (target, Some((comments::KIND_PATCH, quoted.join("\n"))))
+                }
+            };
+        self.drop_selection(cx);
+        let draft = CommentDraft::new(
+            target,
+            None,
+            initial,
+            window,
+            cx,
+            |this: &mut Self, window, cx| this.submit_draft(window, cx),
+        );
+        let draft = match quote {
+            Some((kind, excerpt)) => draft.with_quote(kind, excerpt),
+            None => draft,
+        };
         self.draft = Some(ChatDraft {
-            anchor: DraftAnchor::Passage {
-                message_id: hit.message_id,
-                range: hit.range,
+            anchor: DraftAnchor::Patch {
+                tool_use_id: pick.tool_use_id.clone(),
             },
             draft,
         });
         cx.notify();
     }
+
+    /// Pick a diff line (shift extends within the hunk) and take the keys,
+    /// so typing comments on the pick.
+    pub(crate) fn press_patch_line(
+        &mut self,
+        at: PatchLine,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        if !self.uses_daemon() {
+            return;
+        }
+        self.doc_focus.focus(window, cx);
+        self.patch_pick = match self.patch_pick.take() {
+            Some(mut pick)
+                if extend && pick.tool_use_id == at.tool_use_id && pick.hunk == at.hunk =>
+            {
+                pick.cursor = at.line;
+                Some(pick)
+            }
+            _ => Some(PatchPick {
+                tool_use_id: at.tool_use_id,
+                hunk: at.hunk,
+                anchor: at.line,
+                cursor: at.line,
+            }),
+        };
+        self.patch_dragging = true;
+        cx.notify();
+    }
+
+    pub(crate) fn drag_patch_line(&mut self, at: PatchLine, cx: &mut Context<Self>) {
+        if let Some(pick) = self.patch_pick.as_mut()
+            && self.patch_dragging
+            && pick.tool_use_id == at.tool_use_id
+            && pick.hunk == at.hunk
+            && pick.cursor != at.line
+        {
+            pick.cursor = at.line;
+            cx.notify();
+        }
+    }
+
     fn open_reply(&mut self, root: CommentId, window: &mut Window, cx: &mut Context<Self>) {
         let target = self
             .comments
@@ -1592,6 +1883,9 @@ impl ChatPanel {
             return;
         };
         if open.draft.submit(&self.comments, cx) {
+            if matches!(open.anchor, DraftAnchor::Patch { .. }) {
+                self.patch_pick = None;
+            }
             self.draft = None;
             self.focus_composer(window, cx);
         }
@@ -1599,6 +1893,12 @@ impl ChatPanel {
     }
 
     fn cancel_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.draft.as_ref().map(|open| &open.anchor),
+            Some(DraftAnchor::Patch { .. })
+        ) {
+            self.patch_pick = None;
+        }
         self.draft = None;
         self.focus_composer(window, cx);
         cx.notify();
@@ -1615,13 +1915,6 @@ impl ChatPanel {
         let open = self.thread_open.get(&id).copied().unwrap_or(default);
         self.thread_open.insert(id, !open);
         cx.notify();
-    }
-
-    fn is_thread_open(&self, group: &CommentGroup) -> bool {
-        self.thread_open
-            .get(group.id())
-            .copied()
-            .unwrap_or_else(|| group.open_by_default())
     }
 
     /// Scroll the transcript to a message and tint it briefly.
@@ -1689,13 +1982,13 @@ impl ChatPanel {
         message_id: &MessageId,
         source: &str,
         base: usize,
-        groups: &[CommentGroup],
+        strong: bool,
+        ctx: &CardCtx,
         hits: &mut Vec<SelectionHit>,
-        handlers: &CardHandlers,
-        now: i64,
         p: &Palette,
         cx: &mut Context<Self>,
-    ) -> (AnyElement, Vec<usize>) {
+    ) -> AnyElement {
+        let groups = &ctx.groups;
         let (threads, anchors) = comments::message_anchors(groups, message_id, base, source);
 
         // Threads go under the block their passage ends in; threads whose
@@ -1770,7 +2063,7 @@ impl ChatPanel {
         let mut marks: Vec<(Range<usize>, Hsla)> = anchors
             .iter()
             .filter_map(|anchor| {
-                comments::highlight_color(&groups[anchor.group].phase(), p)
+                comments::passage_color(&groups[anchor.group].phase(), p)
                     .map(|color| (anchor.range.clone(), color))
             })
             .chain(draft_range.map(|range| (range, p.accent.opacity(0.3))))
@@ -1833,7 +2126,7 @@ impl ChatPanel {
         if let Some(selected) = selected
             && let Some(range) = comments::selection_to_message_range(source, base, selected)
         {
-            hits.push(SelectionHit {
+            hits.push(SelectionHit::Message {
                 message_id: message_id.clone(),
                 range,
             });
@@ -1854,6 +2147,7 @@ impl ChatPanel {
                     .text_size(theme::text_prose())
                     .line_height(relative(1.6))
                     .text_color(p.text)
+                    .when(strong, |this| this.font_weight(FontWeight::MEDIUM))
                     .child(TextView::new(&state).selectable(true)),
             );
             let ends_here = |cut: usize| cut == range.end || (range.end == last && cut >= last);
@@ -1866,7 +2160,7 @@ impl ChatPanel {
                 under.extend(trailing.iter().copied());
             }
             for group in under {
-                body = body.child(self.thread_element(&groups[group], handlers, now, p, cx));
+                body = body.child(self.inline_card(ctx, group, "inline", p, cx));
             }
             if draft_cut.is_some_and(ends_here)
                 && let Some(open) = &self.draft
@@ -1874,130 +2168,46 @@ impl ChatPanel {
                 body = body.child(self.render_open_draft("chat-draft", open, p, cx));
             }
         }
-        (body.into_any_element(), threads)
+        body.into_any_element()
     }
 
-    /// An open thread card (with its reply composer) or a collapsed row.
-    fn thread_element(
+    /// A thread as a card in the document, with the reply composer when
+    /// it is open on this thread (drawn under the first card only).
+    fn inline_card(
         &self,
-        group: &CommentGroup,
-        handlers: &CardHandlers,
-        now: i64,
+        ctx: &CardCtx,
+        index: usize,
+        place: &str,
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if !self.is_thread_open(group) {
-            return comments::render_collapsed(
-                format!("chat-thread-row-{}", group.id()),
-                group,
-                None,
-                handlers,
-                p,
-            );
-        }
-        let reply = self
-            .draft
-            .as_ref()
-            .filter(|open| open.anchor == DraftAnchor::Reply(group.id().clone()))
-            .map(|open| self.render_open_draft("chat-reply", open, p, cx));
-        comments::render_card(
-            format!("chat-thread-{}", group.id()),
+        let group = &ctx.groups[index];
+        let answer = match group.phase() {
+            Phase::Delivered(delivery) | Phase::Resolved(Some(delivery)) => delivery
+                .answer_message_id
+                .and_then(|id| ctx.answers.get(&id).map(|text| (id.clone(), text.clone()))),
+            _ => None,
+        };
+        let reply = if ctx.reply_drawn.get() {
+            None
+        } else {
+            self.draft
+                .as_ref()
+                .filter(|open| open.anchor == DraftAnchor::Reply(group.id().clone()))
+                .map(|open| {
+                    ctx.reply_drawn.set(true);
+                    self.render_open_draft("chat-reply", open, p, cx)
+                })
+        };
+        comments::render_inline(
+            format!("chat-{place}-{}", group.id()),
             group,
-            false,
-            None,
+            answer,
             reply,
-            handlers,
-            now,
+            ctx.me.as_deref(),
+            &ctx.handlers,
             p,
         )
-    }
-
-    /// Left gutter of a commentable message: a marker for its collapsed
-    /// threads and, on hover, the add-comment button.
-    fn gutter(
-        &self,
-        message_id: &MessageId,
-        threads: &[usize],
-        groups: &[CommentGroup],
-        p: &Palette,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let collapsed: Vec<&CommentGroup> = threads
-            .iter()
-            .map(|&index| &groups[index])
-            .filter(|group| !self.is_thread_open(group))
-            .collect();
-        let marker = (!collapsed.is_empty()).then(|| {
-            let color = match comments::marker_phase(&collapsed) {
-                Phase::Pending => p.accent,
-                Phase::Delivered(_) => p.success,
-                Phase::Resolved(_) => p.text_faint,
-            };
-            let tooltip: SharedString = comments::marker_summary(&collapsed).into();
-            let ids: Vec<CommentId> = collapsed.iter().map(|group| group.id().clone()).collect();
-            h_flex()
-                .id(SharedString::from(format!("comment-marker-{message_id}")))
-                .h(px(18.))
-                .px(theme::sp(1.))
-                .gap(theme::sp(0.5))
-                .items_center()
-                .rounded(theme::radius_sm())
-                .bg(color.opacity(0.14))
-                .text_size(theme::text_xs())
-                .text_color(color)
-                .cursor_pointer()
-                .hover(|style| style.bg(color.opacity(0.24)))
-                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    for id in &ids {
-                        this.thread_open.insert(id.clone(), true);
-                    }
-                    cx.notify();
-                }))
-                .child(Icon::new(IconName::MessageSquare).with_size(px(11.)))
-                .child(collapsed.len().to_string())
-        });
-        let id = message_id.clone();
-        let add = div()
-            .id(SharedString::from(format!("comment-add-{message_id}")))
-            .size(px(20.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(theme::radius_sm())
-            .cursor_pointer()
-            .opacity(0.)
-            .group_hover(SharedString::from(format!("msg-{message_id}")), |style| {
-                style.opacity(1.)
-            })
-            .hover(|style| style.bg(p.hover))
-            .tooltip(|window, cx| {
-                Tooltip::new(
-                    "Comment on the selection or the whole message. Tip: select text and start typing.",
-                )
-                .build(window, cx)
-            })
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.comment_on_message(id.clone(), window, cx);
-            }))
-            .child(
-                Icon::new(IconName::MessageSquarePlus)
-                    .with_size(px(13.))
-                    .text_color(p.text_faint),
-            );
-        v_flex()
-            .w(theme::sp(7.))
-            .flex_shrink_0()
-            .pt(px(2.))
-            .gap(theme::sp(1.))
-            .items_start()
-            .children(marker)
-            .when(self.uses_daemon(), |this| {
-                let fork =
-                    crate::forks::fork_button(message_id, self.fork_index.state(message_id), p, cx);
-                this.child(add).child(fork)
-            })
-            .into_any_element()
     }
 
     fn render_open_draft(
@@ -2279,34 +2489,29 @@ impl Render for ChatPanel {
         self.composer.set_disabled(running, cx);
         let uses_daemon = self.uses_daemon();
         let show_composer = uses_daemon || !self.connected;
-        let groups = if uses_daemon {
+        let groups = if self.comments_enabled() {
             self.comments.read(cx).groups()
         } else {
             Vec::new()
         };
         let handlers = self.card_handlers(cx);
-        let now = comments::now_secs();
         let shared = match (&self.collab, &self.selected_thread) {
             (Some(collab), Some(thread)) if uses_daemon => collab.read(cx).thread_view(thread),
             _ => Default::default(),
         };
-
-        // Each row is one child of the scroll container, so a message can be
-        // scrolled to by its row index.
-        let row = |content: AnyElement| {
-            h_flex()
-                .w_full()
-                .flex_shrink_0()
-                .justify_center()
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(theme::transcript_width())
-                        .px(theme::sp(6.))
-                        .child(content),
-                )
-                .into_any_element()
+        let me = self
+            .collab
+            .as_ref()
+            .and_then(|collab| collab.read(cx).username().map(str::to_string));
+        let pad = if self.pane_mode {
+            theme::sp(4.)
+        } else {
+            theme::sp(6.)
         };
+
+        // Each block is one child of the scroll container, so a message can
+        // be scrolled to by its row index.
+        let row = |content: AnyElement| doc_row(None, content, pad);
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut row_of: HashMap<MessageId, usize> = HashMap::new();
         let mut hits: Vec<SelectionHit> = Vec::new();
@@ -2319,7 +2524,7 @@ impl Render for ChatPanel {
         if shared.revoked {
             rows.push(row(crate::presence::revoked_banner(&p)));
         }
-        if !self.connected {
+        if !self.connected && !self.pane_mode {
             rows.push(row(notice(
                 &p,
                 IconName::Info,
@@ -2329,7 +2534,7 @@ impl Render for ChatPanel {
             .into_any_element()));
         }
 
-        // Moved out while rendering so rows can borrow `self` mutably.
+        // Moved out while rendering so blocks can borrow `self` mutably.
         let entries = std::mem::take(&mut self.entries);
         if entries.is_empty() {
             rows.push(row(if uses_daemon || !self.connected {
@@ -2355,204 +2560,81 @@ impl Render for ChatPanel {
             }));
         }
 
-        let items = tools::layout_items(&entries);
         let turn_list = turns::segment_turns(&entries);
+        let hidden = self.hidden_entries(&entries);
+        let items: Vec<Item> = tools::layout_items(&entries)
+            .into_iter()
+            .filter(|item| !matches!(item, Item::Single(ix) if hidden.contains(ix)))
+            .collect();
+        let answers: HashMap<MessageId, String> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::Assistant {
+                    markdown,
+                    message_id: Some(id),
+                    ..
+                } => turns::first_sentence(markdown, 140).map(|line| (id.clone(), line)),
+                _ => None,
+            })
+            .collect();
+        let placement = self.place_comments(&entries, &turn_list, &groups, &p);
+        let card_ctx = CardCtx {
+            groups,
+            handlers,
+            answers,
+            me,
+            reply_drawn: Cell::new(false),
+        };
+        let blocks = document::document(
+            &items,
+            &turn_list,
+            |turn| placement.by_turn.contains_key(&turn),
+            |item| self.entry_author(&entries[item.start()]),
+        );
+
+        self.block_texts.begin_frame();
         let mut turn_rows: Vec<usize> = Vec::with_capacity(turn_list.len());
-        let mut previous_was_agent = false;
-        for item in &items {
-            while turn_rows.len() < turn_list.len()
-                && turn_list[turn_rows.len()].entries.start <= item.start()
-            {
+        let mut last_author: Option<AuthorKey> = None;
+        for block in &blocks {
+            while turn_rows.len() <= block.turn && turn_rows.len() < turn_list.len() {
                 turn_rows.push(rows.len());
             }
-            let ix = match item {
-                Item::Single(ix) => *ix,
-                Item::Group(range) => {
-                    let open = self.tool_views.open_groups.contains(&range.start);
-                    let content = tools::render_group(range.clone(), &entries, open, &p, cx);
-                    rows.push(row(agent_block(&p, !previous_was_agent, content)));
-                    previous_was_agent = true;
-                    continue;
+            let index = rows.len();
+            let content = match &block.item {
+                BlockItem::Comments(turn) => {
+                    let list = placement.by_turn.get(turn).cloned().unwrap_or_default();
+                    self.turn_comments(*turn, &list, &card_ctx, &p, cx)
                 }
-                Item::Edits(range) => {
-                    let content =
-                        tools::render_edits(range.clone(), &entries, &self.tool_views, &p, cx);
-                    rows.push(row(agent_block(&p, !previous_was_agent, content)));
-                    previous_was_agent = true;
-                    continue;
-                }
+                BlockItem::Entries(item) => self.render_item(
+                    item,
+                    &entries,
+                    block.turn,
+                    &placement,
+                    &card_ctx,
+                    &mut hits,
+                    &mut row_of,
+                    index,
+                    &p,
+                    cx,
+                ),
             };
-            let entry = &entries[ix];
-            match entry {
-                ChatEntry::User { text, message_id } => {
-                    let mut block = v_flex().w_full().gap(theme::sp(1.5));
-                    if ix > 0 {
-                        block =
-                            block.child(div().w_full().h(px(1.)).my(theme::sp(2.)).bg(p.border));
-                    }
-                    let received = message_id
-                        .as_ref()
-                        .and_then(|id| self.received.get(id))
-                        .cloned();
-                    block = match (
-                        received,
-                        message_id.as_ref().and_then(|id| self.remote_author(id)),
-                    ) {
-                        (Some(row), _) => block.child(crate::subagents::received_author_row(
-                            ix,
-                            &row,
-                            &self.thread_index,
-                            &p,
-                            cx,
-                        )),
-                        (None, Some(name)) => block.child(crate::presence::person_row(&p, name)),
-                        (None, None) => block.child(author_row(&p, Author::User)),
-                    };
-                    match message_id {
-                        Some(id) if uses_daemon => {
-                            let split = comments::split_prompt_block(text);
-                            let base = split.as_ref().map_or(0, |split| split.body_start);
-                            if let Some(split) = &split {
-                                block = block.child(
-                                    div()
-                                        .pl(theme::sp(7.))
-                                        .child(self.sent_block(id, text, split, &p, cx)),
-                                );
-                            }
-                            let context = snapshot::split_context(&text[base..]);
-                            if !context.is_empty() {
-                                block = block.child(div().pl(theme::sp(7.)).child(
-                                    snapshot::render_context(
-                                        id,
-                                        &context,
-                                        &self.open_snapshots,
-                                        &p,
-                                        cx,
-                                    ),
-                                ));
-                            }
-                            let base = base + context.text.start;
-                            let body = &text[base..base + context.text.len()];
-                            if !body.trim().is_empty() {
-                                let (content, threads) = self.message_body(
-                                    id, body, base, &groups, &mut hits, &handlers, now, &p, cx,
-                                );
-                                block = block.child(
-                                    self.message_row(id, content, &threads, &groups, &p, cx),
-                                );
-                            }
-                            row_of.insert(id.clone(), rows.len());
-                        }
-                        _ => {
-                            block = block.child(
-                                div()
-                                    .pl(theme::sp(7.))
-                                    .font_family(theme::PROSE_FONT)
-                                    .text_size(theme::text_prose())
-                                    .line_height(relative(1.55))
-                                    .text_color(p.text)
-                                    .child(comments::prompt_body(text).to_string()),
-                            );
-                        }
-                    }
-                    rows.push(row(block.into_any_element()));
-                    previous_was_agent = false;
-                }
-                ChatEntry::Approval(card) => {
-                    let content = render_approval(card, &p, cx);
-                    rows.push(row(agent_block(&p, !previous_was_agent, content)));
-                    previous_was_agent = true;
-                }
-                ChatEntry::Assistant {
-                    markdown,
-                    message_id: Some(id),
-                    ..
-                } if self.remote_authors.contains_key(id) => {
-                    let (name, role) = self.remote_authors[id].clone();
-                    if role == Role::Assistant && uses_daemon {
-                        let (content, threads) = self.message_body(
-                            id, markdown, 0, &groups, &mut hits, &handlers, now, &p, cx,
-                        );
-                        let content = self.message_row(id, content, &threads, &groups, &p, cx);
-                        row_of.insert(id.clone(), rows.len());
-                        rows.push(row(v_flex()
-                            .w_full()
-                            .gap(theme::sp(3.))
-                            .child(crate::presence::remote_agent_row(&p, &name))
-                            .child(content)
-                            .into_any_element()));
-                    } else {
-                        rows.push(row(crate::presence::remote_notice(&p, &name, markdown)));
-                    }
-                    previous_was_agent = false;
-                }
-                ChatEntry::Assistant {
-                    markdown,
-                    streaming: false,
-                    message_id: Some(id),
-                } if uses_daemon && self.stored_len.get(id) == Some(&markdown.len()) => {
-                    let (content, threads) = self
-                        .message_body(id, markdown, 0, &groups, &mut hits, &handlers, now, &p, cx);
-                    let content = self.message_row(id, content, &threads, &groups, &p, cx);
-                    row_of.insert(id.clone(), rows.len());
-                    rows.push(row(agent_block(&p, !previous_was_agent, content)));
-                    previous_was_agent = true;
-                }
-                ChatEntry::ToolCall {
-                    tool_use_id,
-                    name,
-                    input_json,
-                    output,
-                    ..
-                } => {
-                    let content = match tools::tool_kind(name) {
-                        ToolKind::Command => {
-                            tools::render_command(ix, entry, &self.tool_views, &p, cx)
-                        }
-                        ToolKind::Subthread => {
-                            let mut link = tools::subthread_link(
-                                name,
-                                input_json,
-                                output.as_ref(),
-                                &self.known_threads,
-                            );
-                            crate::subagents::link_spawned_child(
-                                &mut link,
-                                tool_use_id,
-                                &self.thread_index,
-                            );
-                            tools::render_subthread(ix, entry, link, &p, cx)
-                        }
-                        ToolKind::Edit | ToolKind::Minor(_) => {
-                            render_entry(ix, entry, &p, cx).into_any_element()
-                        }
-                    };
-                    rows.push(row(agent_block(&p, !previous_was_agent, content)));
-                    previous_was_agent = true;
-                }
-                ChatEntry::Annotation(annotation) => {
-                    let content = crate::subagents::render_annotation(
-                        ix,
-                        annotation,
-                        &self.thread_index,
-                        &p,
-                        cx,
-                    );
-                    rows.push(row(agent_block(&p, !previous_was_agent, content)));
-                    previous_was_agent = true;
-                }
-                ChatEntry::Assistant { .. } | ChatEntry::Thinking { .. } => {
-                    let content = render_entry(ix, entry, &p, cx).into_any_element();
-                    rows.push(row(agent_block(&p, !previous_was_agent, content)));
-                    previous_was_agent = true;
-                }
-            }
+            let avatar = block
+                .avatar
+                .then(|| self.avatar(&block.author, card_ctx.me.as_deref(), index, &p));
+            rows.push(doc_row(avatar, content, pad));
+            last_author = Some(block.author.clone());
         }
         self.entries = entries;
         let rows_changed = self.rail.turn_rows != turn_rows;
         self.rail.turn_rows = turn_rows;
 
-        // A selection inside exactly one message can be commented on.
+        // A selection inside exactly one block can be commented on.
+        hits.extend(
+            self.block_texts
+                .selections(cx)
+                .into_iter()
+                .map(SelectionHit::Block),
+        );
         self.selection = if hits.len() == 1 { hits.pop() } else { None };
         if let Some(id) = self.reveal.take() {
             match row_of.get(&id) {
@@ -2575,7 +2657,7 @@ impl Render for ChatPanel {
 
         for turn in &shared.remote_turns {
             rows.push(row(crate::presence::remote_turn(&p, turn)));
-            previous_was_agent = false;
+            last_author = None;
         }
 
         if running {
@@ -2587,21 +2669,21 @@ impl Render for ChatPanel {
                 _ if shared.queued => "Queued · runs when your runner is online…",
                 _ => "Working…",
             };
-            let mut block = v_flex().w_full().gap(theme::sp(3.));
-            if !previous_was_agent {
-                block = block.child(author_row(&p, Author::Agent));
-            }
-            block = block.child(
+            let avatar = (last_author != Some(AuthorKey::Agent))
+                .then(|| self.avatar(&AuthorKey::Agent, None, rows.len(), &p));
+            rows.push(doc_row(
+                avatar,
                 h_flex()
-                    .pl(theme::sp(7.))
+                    .min_h(px(22.))
                     .gap(theme::sp(2.))
                     .items_center()
-                    .text_size(theme::text_sm())
+                    .text_size(theme::text_ui())
                     .text_color(p.text_muted)
                     .child(Spinner::new().small().color(p.accent))
-                    .child(label),
-            );
-            rows.push(row(block.into_any_element()));
+                    .child(label)
+                    .into_any_element(),
+                pad,
+            ));
         }
 
         let row_count = rows.len();
@@ -2611,13 +2693,25 @@ impl Render for ChatPanel {
             .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
+            .track_focus(&self.doc_focus)
             .pt(theme::sp(8.))
             .pb(theme::sp(6.))
-            .gap(theme::sp(3.))
+            .gap(theme::sp(2.))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    // A diff line press stops before this: anything else
+                    // drops the picked lines.
+                    if this.patch_pick.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, _, cx| {
                     this.selection_point = Some(event.position);
+                    this.patch_dragging = false;
                     cx.notify();
                 }),
             )
@@ -2664,9 +2758,9 @@ impl Render for ChatPanel {
         .size_full();
 
         let floating = self
-            .selection
-            .as_ref()
-            .and(self.selection_point)
+            .has_comment_target()
+            .then_some(self.selection_point)
+            .flatten()
             .filter(|_| uses_daemon && self.draft.is_none())
             .map(|at| {
                 deferred(
@@ -2734,7 +2828,7 @@ impl Render for ChatPanel {
         };
         let terminals_open = uses_daemon && self.terminals.read(cx).is_open();
         let strip = if show_composer && uses_daemon {
-            self.pending_strip(&groups, &p, cx)
+            self.pending_strip(&card_ctx.groups, &p, cx)
         } else {
             None
         };
@@ -2790,24 +2884,880 @@ impl Render for ChatPanel {
     }
 }
 
+// -- document blocks ----------------------------------------------------------
+
+/// Width of the avatar gutter left of the text column.
+const GUTTER: f32 = 34.;
+/// Avatar size in the gutter.
+const AVATAR: f32 = 22.;
+
+/// One block of the document: the author's avatar in the gutter (only
+/// where their run starts) and the block in the text column.
+fn doc_row(avatar: Option<AnyElement>, content: AnyElement, pad: Pixels) -> AnyElement {
+    h_flex()
+        .w_full()
+        .flex_shrink_0()
+        .justify_center()
+        .child(
+            h_flex()
+                .w_full()
+                .max_w(theme::transcript_width() + px(GUTTER))
+                .px(pad)
+                .items_start()
+                .child(div().w(px(GUTTER)).flex_shrink_0().children(avatar))
+                .child(div().flex_1().min_w_0().child(content)),
+        )
+        .into_any_element()
+}
+
+/// A round glyph avatar (the agent, a person without a known name).
+fn glyph_avatar(icon: IconName, bg: Hsla, fg: Hsla) -> Div {
+    div()
+        .size(px(AVATAR))
+        .flex_shrink_0()
+        .rounded_full()
+        .bg(bg)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(Icon::new(icon).with_size(px(13.)).text_color(fg))
+}
+
 impl ChatPanel {
-    /// Gutter and body of one commentable message.
+    /// Comments can be read and written here.
+    fn comments_enabled(&self) -> bool {
+        self.uses_daemon()
+    }
+
+    /// Show a subagent's transcript in the side pane (rather than as the
+    /// selected thread).
+    pub fn set_pane_mode(&mut self, pane: bool) {
+        self.pane_mode = pane;
+    }
+
+    pub fn is_pane(&self) -> bool {
+        self.pane_mode
+    }
+
+    /// The selected thread's checkouts, for code comments on diff lines.
+    pub fn set_checkouts(
+        &mut self,
+        thread_id: &ThreadId,
+        checkouts: &[trama_protocol::CheckoutSnapshot],
+        cx: &mut Context<Self>,
+    ) {
+        if !self.thread_matches(thread_id) {
+            return;
+        }
+        self.checkouts = checkouts
+            .iter()
+            .map(|checkout| {
+                (
+                    checkout.repository_id.to_string(),
+                    checkout
+                        .checkout_path
+                        .clone()
+                        .unwrap_or_else(|| checkout.source_path.clone()),
+                )
+            })
+            .collect();
+        cx.notify();
+    }
+
+    /// Whether the text of block `key` is selected (a click on it then
+    /// ends a selection instead of opening the block).
+    pub(crate) fn text_selected(&self, key: &str, cx: &App) -> bool {
+        self.block_texts.has_selection(key, cx)
+    }
+
+    pub(crate) fn toggle_thought(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.tool_views.open_thoughts.remove(&index) {
+            self.tool_views.open_thoughts.insert(index);
+        }
+        cx.notify();
+    }
+
+    /// A subagent line was clicked: show it next to this transcript, or
+    /// select it (`main`, ⌘-click).
+    pub(crate) fn open_agent(&mut self, thread: ThreadId, main: bool, cx: &mut Context<Self>) {
+        cx.emit(if main {
+            ChatEvent::OpenThread(thread)
+        } else {
+            ChatEvent::OpenInPane(thread)
+        });
+    }
+
+    fn entry_author(&self, entry: &ChatEntry) -> AuthorKey {
+        document::entry_author(
+            entry,
+            |id| self.remote_authors.get(id).cloned(),
+            |id| self.received.get(id).map(|row| row.thread_id.clone()),
+        )
+    }
+
+    /// "Subagent started" notes of subagents whose spawning call is shown:
+    /// the call's "Agent spawned" line says it already.
+    fn hidden_entries(&self, entries: &[ChatEntry]) -> HashSet<usize> {
+        let spawned: HashSet<&ThreadId> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::ToolCall {
+                    tool_use_id, name, ..
+                } if tools::tool_kind(name) == ToolKind::Subthread => {
+                    self.thread_index.spawned_by_tool(tool_use_id)
+                }
+                _ => None,
+            })
+            .collect();
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                matches!(
+                    entry,
+                    ChatEntry::Annotation(row)
+                        if matches!(row.kind, crate::subagents::AnnotationKind::SubagentStarted(_))
+                            && spawned.contains(&row.thread_id)
+                )
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Which turn and block each comment thread goes under.
+    fn place_comments(
+        &self,
+        entries: &[ChatEntry],
+        turn_list: &[turns::Turn],
+        groups: &[CommentGroup],
+        p: &Palette,
+    ) -> Placement {
+        let mut placement = Placement::default();
+        let turn_of = |index: usize| {
+            turn_list
+                .iter()
+                .rposition(|turn| turn.entries.start <= index)
+                .unwrap_or(0)
+        };
+        let mut message_turn: HashMap<&MessageId, usize> = HashMap::new();
+        let mut edits: Vec<(usize, &str, Rc<tools::FileEdit>)> = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            match entry {
+                ChatEntry::User {
+                    message_id: Some(id),
+                    ..
+                }
+                | ChatEntry::Assistant {
+                    message_id: Some(id),
+                    ..
+                } => {
+                    message_turn.insert(id, turn_of(index));
+                }
+                ChatEntry::ToolCall {
+                    tool_use_id, name, ..
+                } if tools::tool_kind(name) == ToolKind::Edit => {
+                    if let Some(edit) = self.tool_views.file_edit(entry) {
+                        edits.push((turn_of(index), tool_use_id.as_str(), edit));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (index, group) in groups.iter().enumerate() {
+            let color =
+                comments::passage_color(&group.phase(), p).unwrap_or(gpui_kit::transparent_black());
+            match &group.root.target {
+                CommentTarget::MessageRange { message_id, .. } => {
+                    let Some(&turn) = message_turn.get(message_id) else {
+                        continue;
+                    };
+                    placement.by_turn.entry(turn).or_default().push(index);
+                    let Some(proxy) = comments::parse_proxy(&group.root.body) else {
+                        continue;
+                    };
+                    if proxy.kind == comments::KIND_PATCH {
+                        let wanted: Vec<&str> = proxy
+                            .excerpt
+                            .lines()
+                            .filter(|line| !line.trim().is_empty())
+                            .collect();
+                        for (edit_turn, id, edit) in &edits {
+                            if *edit_turn != turn {
+                                continue;
+                            }
+                            let lines = tools::patch_lines_matching(edit, &wanted);
+                            if !lines.is_empty() {
+                                let slot = placement.patches.entry(id.to_string()).or_default();
+                                slot.lines.extend(lines);
+                                slot.groups.push(index);
+                                break;
+                            }
+                        }
+                    } else {
+                        placement.marks.entry(turn).or_default().push(Mark {
+                            group: Some(index),
+                            kind: proxy.kind,
+                            excerpt: proxy.excerpt,
+                            color,
+                        });
+                    }
+                }
+                CommentTarget::Code { anchor } => {
+                    for (turn, id, edit) in &edits {
+                        if !comments::code_on_edit(anchor, &edit.path, &tools::new_lines(edit)) {
+                            continue;
+                        }
+                        let slot = placement.patches.entry(id.to_string()).or_default();
+                        slot.lines.extend(tools::patch_lines_in(
+                            edit,
+                            anchor.start_line..=anchor.end_line,
+                        ));
+                        slot.groups.push(index);
+                        placement.by_turn.entry(*turn).or_default().push(index);
+                        break;
+                    }
+                }
+                CommentTarget::DiffHunk { .. } => {}
+            }
+        }
+        if let Some(DraftAnchor::Block {
+            kind,
+            excerpt,
+            turn,
+            ..
+        }) = self.draft.as_ref().map(|open| &open.anchor)
+        {
+            placement.marks.entry(*turn).or_default().push(Mark {
+                group: None,
+                kind,
+                excerpt: excerpt.clone(),
+                color: p.accent.opacity(0.3),
+            });
+        }
+        placement
+    }
+
+    /// An author's round avatar for the gutter.
+    fn avatar(&self, author: &AuthorKey, me: Option<&str>, row: usize, p: &Palette) -> AnyElement {
+        let (element, tip): (AnyElement, String) = match author {
+            AuthorKey::Me => (
+                match me {
+                    Some(name) => {
+                        crate::presence::avatar(p, name, AVATAR, false).into_any_element()
+                    }
+                    None => {
+                        glyph_avatar(IconName::User, p.selected, p.text_muted).into_any_element()
+                    }
+                },
+                "You".into(),
+            ),
+            AuthorKey::Person(name) => (
+                crate::presence::avatar(p, name, AVATAR, false).into_any_element(),
+                name.clone(),
+            ),
+            AuthorKey::Agent => (
+                glyph_avatar(IconName::Bot, p.accent_soft, p.accent_text).into_any_element(),
+                "Claude".into(),
+            ),
+            AuthorKey::PersonAgent(name) => (
+                div()
+                    .relative()
+                    .child(crate::presence::avatar(p, name, AVATAR, false))
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom(px(-3.))
+                            .right(px(-3.))
+                            .size(px(12.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(p.accent_soft)
+                            .border_1()
+                            .border_color(p.bg)
+                            .child(
+                                Icon::new(IconName::Bot)
+                                    .with_size(px(8.))
+                                    .text_color(p.accent_text),
+                            ),
+                    )
+                    .into_any_element(),
+                format!("{name}'s Claude"),
+            ),
+            AuthorKey::ThreadAgent(thread) => (
+                glyph_avatar(IconName::Bot, p.selected, p.text_muted).into_any_element(),
+                format!(
+                    "Agent of {}",
+                    self.thread_index.title(thread).unwrap_or("another thread")
+                ),
+            ),
+        };
+        let tip: SharedString = tip.into();
+        div()
+            .id(("doc-avatar", row))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .child(element)
+            .into_any_element()
+    }
+
+    /// One layout item as a block, with the threads on its passages and
+    /// the composer of a new one under it.
+    #[allow(clippy::too_many_arguments)]
+    fn render_item(
+        &mut self,
+        item: &Item,
+        entries: &[ChatEntry],
+        turn: usize,
+        placement: &Placement,
+        ctx: &CardCtx,
+        hits: &mut Vec<SelectionHit>,
+        row_of: &mut HashMap<MessageId, usize>,
+        row: usize,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let drawn_from = self.block_texts.drawn_len();
+        let no_marks = Vec::new();
+        let marks = placement.marks.get(&turn).unwrap_or(&no_marks);
+        let content = match item {
+            Item::Group(range) => {
+                let mut doc = DocCtx {
+                    p,
+                    state: &self.tool_views,
+                    texts: &mut self.block_texts,
+                    marks,
+                    turn,
+                };
+                tools::render_activity(range.clone(), entries, &mut doc, cx)
+            }
+            Item::Edits(range) => {
+                self.render_edits(range.clone(), entries, turn, placement, ctx, marks, p, cx)
+            }
+            Item::Single(ix) => {
+                self.render_single(*ix, entries, turn, ctx, marks, hits, row_of, row, p, cx)
+            }
+        };
+        let claimed = self.block_texts.take_claimed();
+        let draft_here = match self.draft.as_ref().map(|open| &open.anchor) {
+            Some(DraftAnchor::Block { key, .. }) => self.block_texts.drawn_since(drawn_from, key),
+            _ => false,
+        };
+        if claimed.is_empty() && !draft_here {
+            return content;
+        }
+        let mut column = v_flex().w_full().gap(theme::sp(1.5)).child(content);
+        for group in claimed {
+            column = column.child(self.inline_card(ctx, group, "inline", p, cx));
+        }
+        if draft_here && let Some(open) = &self.draft {
+            column = column.child(self.render_open_draft("chat-block-draft", open, p, cx));
+        }
+        column.into_any_element()
+    }
+
+    /// File edits: an "Apply patch" line and diff each, with the threads
+    /// on their lines.
+    #[allow(clippy::too_many_arguments)]
+    fn render_edits(
+        &mut self,
+        range: Range<usize>,
+        entries: &[ChatEntry],
+        turn: usize,
+        placement: &Placement,
+        ctx: &CardCtx,
+        marks: &[Mark],
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let empty = PatchComments::default();
+        let mut column = v_flex().w_full().gap(theme::sp(1.5));
+        for ix in range {
+            let entry = &entries[ix];
+            let ChatEntry::ToolCall { tool_use_id, .. } = entry else {
+                continue;
+            };
+            let on_lines = placement.patches.get(tool_use_id).unwrap_or(&empty);
+            let element = {
+                let mut doc = DocCtx {
+                    p,
+                    state: &self.tool_views,
+                    texts: &mut self.block_texts,
+                    marks,
+                    turn,
+                };
+                match tools::render_patch(
+                    ix,
+                    entry,
+                    &mut doc,
+                    self.patch_pick.as_ref(),
+                    &on_lines.lines,
+                    cx,
+                ) {
+                    Some(element) => element,
+                    None => tools::render_activity(ix..ix + 1, entries, &mut doc, cx),
+                }
+            };
+            column = column.child(element);
+            for &group in &on_lines.groups {
+                column = column.child(self.inline_card(ctx, group, "inline", p, cx));
+            }
+            if let Some(open) = &self.draft
+                && matches!(&open.anchor, DraftAnchor::Patch { tool_use_id: id } if id == tool_use_id)
+            {
+                column = column.child(self.render_open_draft("chat-patch-draft", open, p, cx));
+            }
+        }
+        column.into_any_element()
+    }
+
+    /// One entry as a block.
+    #[allow(clippy::too_many_arguments)]
+    fn render_single(
+        &mut self,
+        ix: usize,
+        entries: &[ChatEntry],
+        turn: usize,
+        ctx: &CardCtx,
+        marks: &[Mark],
+        hits: &mut Vec<SelectionHit>,
+        row_of: &mut HashMap<MessageId, usize>,
+        row: usize,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entry = &entries[ix];
+        match entry {
+            ChatEntry::User { text, message_id } => {
+                self.render_prompt(ix, text, message_id.as_ref(), ctx, hits, row_of, row, p, cx)
+            }
+            ChatEntry::Approval(card) => render_approval(card, p, cx),
+            ChatEntry::Assistant {
+                markdown,
+                message_id: Some(id),
+                ..
+            } if self.remote_authors.contains_key(id) => {
+                let (name, role) = self.remote_authors[id].clone();
+                if role == Role::Assistant && self.comments_enabled() {
+                    let body = self.message_body(id, markdown, 0, false, ctx, hits, p, cx);
+                    row_of.insert(id.clone(), row);
+                    self.message_row(id, body, p, cx)
+                } else {
+                    crate::presence::remote_notice(p, &name, markdown)
+                }
+            }
+            ChatEntry::Assistant {
+                markdown,
+                streaming: false,
+                message_id: Some(id),
+            } if self.comments_enabled() && self.stored_len.get(id) == Some(&markdown.len()) => {
+                let body = self.message_body(id, markdown, 0, false, ctx, hits, p, cx);
+                row_of.insert(id.clone(), row);
+                self.message_row(id, body, p, cx)
+            }
+            ChatEntry::Assistant {
+                markdown,
+                streaming,
+                ..
+            } => div()
+                .w_full()
+                .font_family(theme::PROSE_FONT)
+                .text_size(theme::text_prose())
+                .line_height(relative(1.6))
+                .text_color(p.text)
+                .child(
+                    TextView::markdown(("assistant-md", ix), markdown.clone())
+                        .stream_fade(*streaming),
+                )
+                .into_any_element(),
+            ChatEntry::ToolCall {
+                tool_use_id,
+                name,
+                input_json,
+                output,
+                finished,
+                is_error,
+                ..
+            } if tools::tool_kind(name) == ToolKind::Subthread => {
+                let mut link =
+                    tools::subthread_link(name, input_json, output.as_ref(), &self.known_threads);
+                crate::subagents::link_spawned_child(&mut link, tool_use_id, &self.thread_index);
+                let (label, detail) = if link.message {
+                    ("Message to agent:", link.title.clone())
+                } else {
+                    let child = link.thread.as_ref();
+                    (
+                        "Agent spawned:",
+                        tools::agent_detail(
+                            &link.title,
+                            child
+                                .and_then(|id| self.thread_index.profile(id))
+                                .map(|profile| profile.label()),
+                            child.and_then(|id| self.thread_index.model(id)),
+                        ),
+                    )
+                };
+                let trailing = match link
+                    .thread
+                    .as_ref()
+                    .and_then(|id| self.thread_index.status(id))
+                {
+                    Some(status) => vec![crate::subagents::status_glyph(status, 12., p)],
+                    None if !*finished || *is_error => {
+                        vec![tools::status_icon(*finished, *is_error, p)]
+                    }
+                    None => Vec::new(),
+                };
+                let mut doc = DocCtx {
+                    p,
+                    state: &self.tool_views,
+                    texts: &mut self.block_texts,
+                    marks,
+                    turn,
+                };
+                tools::render_agent(
+                    ("agent-call", ix),
+                    label,
+                    &detail,
+                    format!("agent-{tool_use_id}"),
+                    link.thread,
+                    trailing,
+                    None,
+                    &mut doc,
+                    cx,
+                )
+            }
+            ChatEntry::Annotation(note) => self.render_note(ix, note, turn, marks, p, cx),
+            ChatEntry::ToolCall { name, .. } if tools::tool_kind(name) == ToolKind::Edit => {
+                let mut doc = DocCtx {
+                    p,
+                    state: &self.tool_views,
+                    texts: &mut self.block_texts,
+                    marks,
+                    turn,
+                };
+                let empty = HashSet::new();
+                tools::render_patch(ix, entry, &mut doc, self.patch_pick.as_ref(), &empty, cx)
+                    .unwrap_or_else(|| tools::render_activity(ix..ix + 1, entries, &mut doc, cx))
+            }
+            ChatEntry::ToolCall { .. } | ChatEntry::Thinking { .. } => {
+                let mut doc = DocCtx {
+                    p,
+                    state: &self.tool_views,
+                    texts: &mut self.block_texts,
+                    marks,
+                    turn,
+                };
+                tools::render_activity(ix..ix + 1, entries, &mut doc, cx)
+            }
+        }
+    }
+
+    /// A prompt as plain document text, a little stronger than prose: the
+    /// comments it delivered, attached terminal snapshots, then the text.
+    #[allow(clippy::too_many_arguments)]
+    fn render_prompt(
+        &mut self,
+        ix: usize,
+        text: &str,
+        message_id: Option<&MessageId>,
+        ctx: &CardCtx,
+        hits: &mut Vec<SelectionHit>,
+        row_of: &mut HashMap<MessageId, usize>,
+        row: usize,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut block = v_flex().w_full().gap(theme::sp(1.5));
+        if let Some(note) = message_id.and_then(|id| self.received.get(id)).cloned() {
+            block = block.child(crate::subagents::agent_message_header(
+                ix,
+                &note,
+                &self.thread_index,
+                p,
+                cx,
+            ));
+        }
+        match message_id {
+            Some(id) if self.comments_enabled() => {
+                let split = comments::split_prompt_block(text);
+                let base = split.as_ref().map_or(0, |split| split.body_start);
+                if let Some(split) = &split {
+                    block = block.child(self.sent_block(id, text, split, p, cx));
+                }
+                let context = snapshot::split_context(&text[base..]);
+                if !context.is_empty() {
+                    block = block.child(snapshot::render_context(
+                        id,
+                        &context,
+                        &self.open_snapshots,
+                        p,
+                        cx,
+                    ));
+                }
+                let base = base + context.text.start;
+                let body = &text[base..base + context.text.len()];
+                if !body.trim().is_empty() {
+                    let content = self.message_body(id, body, base, true, ctx, hits, p, cx);
+                    block = block.child(self.message_row(id, content, p, cx));
+                }
+                row_of.insert(id.clone(), row);
+            }
+            _ => {
+                block = block.child(
+                    div()
+                        .font_family(theme::PROSE_FONT)
+                        .text_size(theme::text_prose())
+                        .line_height(relative(1.6))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.text)
+                        .child(comments::prompt_body(text).to_string()),
+                );
+            }
+        }
+        block.into_any_element()
+    }
+
+    /// A stored note linking another thread: "Agent spawned: …", "Agent
+    /// completed: …", or an agent message sent or received.
+    fn render_note(
+        &mut self,
+        ix: usize,
+        note: &crate::subagents::AnnotationRow,
+        turn: usize,
+        marks: &[Mark],
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::subagents::AnnotationKind;
+        let known = self.thread_index.title(&note.thread_id).is_some();
+        let thread = known.then(|| note.thread_id.clone());
+        let title = self
+            .thread_index
+            .title(&note.thread_id)
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or(&note.title)
+            .to_string();
+        let key = format!("note-{}", note.message_id);
+        match &note.kind {
+            AnnotationKind::SubagentStarted(profile) => {
+                let detail = tools::agent_detail(
+                    &title,
+                    Some(profile.label()),
+                    self.thread_index.model(&note.thread_id),
+                );
+                let mut doc = DocCtx {
+                    p,
+                    state: &self.tool_views,
+                    texts: &mut self.block_texts,
+                    marks,
+                    turn,
+                };
+                tools::render_agent(
+                    ("agent-note", ix),
+                    tools::agent_label(None, true),
+                    &detail,
+                    key,
+                    thread,
+                    Vec::new(),
+                    Some(crate::subagents::row_text(note, &self.thread_index)),
+                    &mut doc,
+                    cx,
+                )
+            }
+            AnnotationKind::SubagentFinished(status) => {
+                let detail = match &note.body {
+                    Some(body) => format!("{title} \u{2014} {body}"),
+                    None => title,
+                };
+                let mut doc = DocCtx {
+                    p,
+                    state: &self.tool_views,
+                    texts: &mut self.block_texts,
+                    marks,
+                    turn,
+                };
+                tools::render_agent(
+                    ("agent-note", ix),
+                    tools::agent_label(Some(*status), false),
+                    &detail,
+                    key,
+                    thread,
+                    vec![crate::subagents::status_glyph(*status, 12., p)],
+                    Some(crate::subagents::row_text(note, &self.thread_index)),
+                    &mut doc,
+                    cx,
+                )
+            }
+            AnnotationKind::Sent | AnnotationKind::Received => {
+                let header =
+                    crate::subagents::agent_message_header(ix, note, &self.thread_index, p, cx);
+                let body = note.body.clone().map(|body| {
+                    let view = self.block_texts.view(
+                        &key,
+                        &crate::doc_text::escape_markdown(&body),
+                        &body,
+                        comments::KIND_SUBAGENT,
+                        turn,
+                        marks,
+                        cx,
+                    );
+                    div()
+                        .w_full()
+                        .pl(theme::sp(3.))
+                        .border_l_2()
+                        .border_color(p.border_strong)
+                        .text_size(theme::text_ui())
+                        .line_height(relative(1.5))
+                        .text_color(p.text_muted)
+                        .child(view)
+                });
+                v_flex()
+                    .w_full()
+                    .gap(theme::sp(1.))
+                    .child(header)
+                    .children(body)
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// A stored message with its hover actions (comment, fork) right of
+    /// the text column.
     fn message_row(
         &self,
         message_id: &MessageId,
         content: AnyElement,
-        threads: &[usize],
-        groups: &[CommentGroup],
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        h_flex()
+        let hover: SharedString = format!("msg-{message_id}").into();
+        let id = message_id.clone();
+        let add = div()
+            .id(SharedString::from(format!("comment-add-{message_id}")))
+            .size(px(22.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(theme::radius_sm())
+            .cursor_pointer()
+            .hover(|style| style.bg(p.hover))
+            .tooltip(|window, cx| {
+                Tooltip::new(
+                    "Comment on the selection or the whole message. Tip: select text anywhere and start typing.",
+                )
+                .build(window, cx)
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.comment_on_message(id.clone(), window, cx);
+            }))
+            .child(
+                Icon::new(IconName::MessageSquarePlus)
+                    .with_size(px(13.))
+                    .text_color(p.text_faint),
+            );
+        div()
+            .relative()
             .w_full()
-            .items_start()
-            .group(SharedString::from(format!("msg-{message_id}")))
-            .child(self.gutter(message_id, threads, groups, p, cx))
-            .child(div().flex_1().min_w_0().child(content))
+            .group(hover.clone())
+            .child(content)
+            .when(self.uses_daemon(), |this| {
+                let fork =
+                    crate::forks::fork_button(message_id, self.fork_index.state(message_id), p, cx);
+                this.child(
+                    v_flex()
+                        .absolute()
+                        .top_0()
+                        .right(px(-30.))
+                        .gap(theme::sp(0.5))
+                        .opacity(0.)
+                        .group_hover(hover, |style| style.opacity(1.))
+                        .child(add)
+                        .child(fork),
+                )
+            })
             .into_any_element()
+    }
+
+    /// "N comments ⌄" at the end of a turn: the passage of each thread on
+    /// it, quoted, with the thread's comments and replies.
+    fn turn_comments(
+        &self,
+        turn: usize,
+        list: &[usize],
+        ctx: &CardCtx,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let default_open = list
+            .iter()
+            .any(|&group| ctx.groups[group].phase() == Phase::Pending);
+        let open = self
+            .turn_comments_open
+            .get(&turn)
+            .copied()
+            .unwrap_or(default_open);
+        let total: usize = list.iter().map(|&group| ctx.groups[group].len()).sum();
+        let header = h_flex()
+            .id(("turn-comments", turn))
+            .min_h(px(22.))
+            .gap(theme::sp(1.5))
+            .items_center()
+            .cursor_pointer()
+            .text_size(theme::text_ui())
+            .text_color(p.text_muted)
+            .hover(|style| style.text_color(p.text))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.turn_comments_open.insert(turn, !open);
+                cx.notify();
+            }))
+            .child(comments::plural(total, "comment", "comments"))
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .with_size(px(12.))
+                .text_color(p.text_faint),
+            );
+        let mut column = v_flex().w_full().gap(theme::sp(2.)).child(header);
+        if open {
+            for &index in list {
+                let group = &ctx.groups[index];
+                let quote = match comments::parse_proxy(&group.root.body) {
+                    Some(proxy) => proxy.excerpt,
+                    None => group
+                        .root
+                        .excerpt
+                        .clone()
+                        .unwrap_or_else(|| comments::target_label(&group.root.target)),
+                };
+                column = column.child(
+                    v_flex()
+                        .w_full()
+                        .p(theme::sp(2.))
+                        .gap(theme::sp(2.))
+                        .rounded(theme::radius())
+                        .border_1()
+                        .border_color(p.border)
+                        .child(
+                            div()
+                                .w_full()
+                                .truncate()
+                                .px(theme::sp(1.))
+                                .rounded(theme::radius_sm())
+                                .bg(comments::mark_color(p).opacity(0.14))
+                                .text_size(theme::text_ui())
+                                .line_height(relative(1.6))
+                                .text_color(p.text)
+                                .child(comments::one_line(&quote, 160)),
+                        )
+                        .child(self.inline_card(ctx, index, "turn", p, cx)),
+                );
+            }
+        }
+        column.into_any_element()
     }
 }
 
@@ -3217,68 +4167,6 @@ impl ChatPanel {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Author {
-    User,
-    Agent,
-}
-
-fn author_row(p: &Palette, author: Author) -> impl IntoElement {
-    let (label, avatar) = match author {
-        Author::User => (
-            "You",
-            div()
-                .size(px(20.))
-                .rounded_full()
-                .bg(p.selected)
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    Icon::new(IconName::User)
-                        .with_size(px(12.))
-                        .text_color(p.text_muted),
-                ),
-        ),
-        Author::Agent => (
-            "Claude",
-            div()
-                .size(px(20.))
-                .rounded_full()
-                .bg(p.accent_soft)
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    Icon::new(IconName::Bot)
-                        .with_size(px(12.))
-                        .text_color(p.accent_text),
-                ),
-        ),
-    };
-    h_flex()
-        .gap(theme::sp(2.))
-        .items_center()
-        .child(avatar)
-        .child(
-            div()
-                .text_size(theme::text_sm())
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(p.text)
-                .child(label),
-        )
-}
-
-/// An agent row: the author line unless the previous row was the agent's.
-fn agent_block(p: &Palette, show_author: bool, content: AnyElement) -> AnyElement {
-    v_flex()
-        .w_full()
-        .gap(theme::sp(3.))
-        .when(show_author, |this| this.child(author_row(p, Author::Agent)))
-        .child(content)
-        .into_any_element()
-}
-
 fn notice(p: &Palette, icon: IconName, color: Hsla, text: String) -> impl IntoElement {
     h_flex()
         .w_full()
@@ -3359,19 +4247,6 @@ pub fn empty_state(
         .into_any_element()
 }
 
-fn tool_icon(name: &str) -> IconName {
-    match name {
-        "Read" | "NotebookRead" => IconName::FileText,
-        "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => IconName::Pencil,
-        "Bash" | "BashOutput" | "KillShell" => IconName::SquareTerminal,
-        "Grep" | "Glob" | "LS" | "WebSearch" | "ToolSearch" => IconName::Search,
-        "WebFetch" => IconName::Globe,
-        "Task" | "Agent" => IconName::Bot,
-        "TodoWrite" => IconName::ListChecks,
-        _ => IconName::Wrench,
-    }
-}
-
 /// One line describing what a tool call does, from its input.
 pub fn tool_summary(name: &str, input: &serde_json::Value) -> String {
     let field = |key: &str| input.get(key).and_then(|value| value.as_str());
@@ -3418,201 +4293,6 @@ pub fn tool_summary(name: &str, input: &serde_json::Value) -> String {
         out.push('…');
     }
     out
-}
-
-fn pretty_json(value: &serde_json::Value) -> String {
-    let text = match value {
-        serde_json::Value::String(text) => text.clone(),
-        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
-    };
-    const LIMIT: usize = 4000;
-    if text.len() > LIMIT {
-        let mut end = LIMIT;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}\n… ({} more bytes)", &text[..end], text.len() - end)
-    } else {
-        text
-    }
-}
-
-fn render_entry(
-    ix: usize,
-    entry: &ChatEntry,
-    p: &Palette,
-    cx: &mut Context<ChatPanel>,
-) -> impl IntoElement {
-    match entry {
-        ChatEntry::User { text, .. } => div().child(text.clone()).into_any_element(),
-        ChatEntry::Approval(card) => render_approval(card, p, cx).into_any_element(),
-        ChatEntry::Assistant {
-            markdown,
-            streaming,
-            ..
-        } => div()
-            .w_full()
-            .pl(theme::sp(7.))
-            .font_family(theme::PROSE_FONT)
-            .text_size(theme::text_prose())
-            .line_height(relative(1.6))
-            .text_color(p.text)
-            .child(
-                TextView::markdown(("assistant-md", ix), markdown.clone()).stream_fade(*streaming),
-            )
-            .into_any_element(),
-        ChatEntry::ToolCall { .. } => div()
-            .w_full()
-            .pl(theme::sp(7.))
-            .child(tool_row(ix, entry, p, cx))
-            .into_any_element(),
-        ChatEntry::Thinking { text } => div()
-            .w_full()
-            .pl(theme::sp(7.))
-            .text_size(theme::text_sm())
-            .line_height(relative(1.5))
-            .italic()
-            .text_color(p.text_faint)
-            .child(text.trim().to_string())
-            .into_any_element(),
-        // Rendered with the thread index by the transcript itself.
-        ChatEntry::Annotation(_) => div().into_any_element(),
-    }
-}
-
-/// A compact, expandable row for one tool call (input and output JSON).
-pub fn tool_row(
-    ix: usize,
-    entry: &ChatEntry,
-    p: &Palette,
-    cx: &mut Context<ChatPanel>,
-) -> AnyElement {
-    let ChatEntry::ToolCall {
-        name,
-        input_json,
-        finished,
-        is_error,
-        expanded,
-        output,
-        ..
-    } = entry
-    else {
-        return div().into_any_element();
-    };
-    let summary = tool_summary(name, input_json);
-    let status: AnyElement = if *is_error {
-        Icon::new(IconName::CircleX)
-            .with_size(px(13.))
-            .text_color(p.danger)
-            .into_any_element()
-    } else if *finished {
-        Icon::new(IconName::Check)
-            .with_size(px(13.))
-            .text_color(p.success)
-            .into_any_element()
-    } else {
-        Spinner::new().xsmall().color(p.accent).into_any_element()
-    };
-
-    let body = expanded.then(|| {
-        let block = |label: &'static str, text: String| {
-            v_flex()
-                .gap(theme::sp(1.))
-                .child(
-                    div()
-                        .text_size(theme::text_xs())
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(p.text_faint)
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .px(theme::sp(2.5))
-                        .py(theme::sp(2.))
-                        .rounded(theme::radius())
-                        .bg(p.bg)
-                        .border_1()
-                        .border_color(p.border)
-                        .font_family(theme::MONO_FONT)
-                        .text_size(theme::text_xs())
-                        .line_height(relative(1.5))
-                        .text_color(p.text_muted)
-                        .child(text),
-                )
-        };
-        v_flex()
-            .w_full()
-            .px(theme::sp(2.))
-            .pb(theme::sp(2.))
-            .gap(theme::sp(2.))
-            .child(block("Input", pretty_json(input_json)))
-            .children(output.as_ref().map(|output| {
-                block(
-                    if *is_error { "Error" } else { "Output" },
-                    pretty_json(output),
-                )
-            }))
-    });
-
-    v_flex()
-        .w_full()
-        .rounded(theme::radius())
-        .border_1()
-        .border_color(if *expanded {
-            p.border
-        } else {
-            p.bg.opacity(0.)
-        })
-        .when(*expanded, |this| this.bg(p.elevated))
-        .child(
-            h_flex()
-                .id(("tool-row", ix))
-                .w_full()
-                .h(px(26.))
-                .px(theme::sp(2.))
-                .gap(theme::sp(2.))
-                .items_center()
-                .rounded(theme::radius())
-                .cursor_pointer()
-                .text_size(theme::text_sm())
-                .hover(|style| style.bg(p.hover))
-                .on_click(cx.listener(move |this, _, _, cx| this.toggle_tool(ix, cx)))
-                .child(
-                    Icon::new(tool_icon(name))
-                        .with_size(px(13.))
-                        .text_color(p.text_muted),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(p.text)
-                        .child(name.clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_family(theme::MONO_FONT)
-                        .text_size(theme::text_xs())
-                        .text_color(p.text_faint)
-                        .child(summary),
-                )
-                .child(status)
-                .child(
-                    Icon::new(if *expanded {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .with_size(px(12.))
-                    .text_color(p.text_faint),
-                ),
-        )
-        .children(body)
-        .into_any_element()
 }
 
 impl EventEmitter<PanelEvent> for ChatPanel {}

@@ -357,7 +357,9 @@ pub fn message_anchors(
         else {
             continue;
         };
-        if target != message_id {
+        // A comment on a block that is not a message is stored on the
+        // turn's answer; it is placed under its own block.
+        if target != message_id || parse_proxy(&group.root.body).is_some() {
             continue;
         }
         threads.push(index);
@@ -378,6 +380,163 @@ pub fn message_anchors(
     }
     anchors.sort_by_key(|anchor| (anchor.range.start, anchor.range.end));
     (threads, anchors)
+}
+
+// -- comments on blocks that are not messages -----------------------------
+
+/// Kinds of transcript blocks that are not stored messages. A comment on
+/// one is stored on a message of its turn with the passage quoted in its
+/// body, headed by the kind: `> Thinking: <passage>`.
+pub const KIND_ACTIVITY: &str = "Activity";
+pub const KIND_THINKING: &str = "Thinking";
+pub const KIND_COMMAND: &str = "Command output";
+pub const KIND_TOOL: &str = "Tool output";
+pub const KIND_PATCH: &str = "Patch";
+pub const KIND_SUBAGENT: &str = "Subagent";
+pub const PROXY_KINDS: &[&str] = &[
+    KIND_ACTIVITY,
+    KIND_THINKING,
+    KIND_COMMAND,
+    KIND_TOOL,
+    KIND_PATCH,
+    KIND_SUBAGENT,
+];
+
+/// Longest passage quoted in a comment body, in characters.
+const PROXY_EXCERPT_LIMIT: usize = 600;
+
+/// The body of a comment on a `kind` block: the quoted passage, a blank
+/// line, then what the person wrote. The agent reads the quote with the
+/// comment; the transcript parses it back with [`parse_proxy`].
+pub fn proxy_body(kind: &str, excerpt: &str, comment: &str) -> String {
+    let excerpt = excerpt.trim();
+    let mut quoted: String = excerpt.chars().take(PROXY_EXCERPT_LIMIT).collect();
+    if excerpt.chars().count() > PROXY_EXCERPT_LIMIT {
+        quoted.push('…');
+    }
+    let mut out = format!("> {kind}: ");
+    for (index, line) in quoted.lines().enumerate() {
+        if index > 0 {
+            out.push_str("\n> ");
+        }
+        out.push_str(line.trim_end());
+    }
+    out.push_str("\n\n");
+    out.push_str(comment.trim());
+    out
+}
+
+/// A comment on a block that is not a message, read back from its body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proxy {
+    pub kind: &'static str,
+    pub excerpt: String,
+    pub comment: String,
+}
+
+pub fn parse_proxy(body: &str) -> Option<Proxy> {
+    let (head, comment) = body.split_once("\n\n")?;
+    let mut lines = head.lines();
+    let first = lines.next()?.strip_prefix("> ")?;
+    let kind = PROXY_KINDS.iter().copied().find(|kind| {
+        first
+            .strip_prefix(kind)
+            .is_some_and(|rest| rest.starts_with(": "))
+    })?;
+    let mut excerpt = first[kind.len() + 2..].to_string();
+    for line in lines {
+        let line = line.strip_prefix("> ").or_else(|| line.strip_prefix('>'))?;
+        excerpt.push('\n');
+        excerpt.push_str(line);
+    }
+    Some(Proxy {
+        kind,
+        excerpt,
+        comment: comment.trim().to_string(),
+    })
+}
+
+/// What a comment says, without the quote a block comment carries.
+pub fn display_body(body: &str) -> String {
+    match parse_proxy(body) {
+        Some(proxy) => proxy.comment,
+        None => body.to_string(),
+    }
+}
+
+/// The passage of `text` a block comment is stored on: its first line
+/// with text, capped at a character boundary. `None` for empty text.
+pub fn proxy_anchor(text: &str) -> Option<Range<usize>> {
+    const LIMIT: usize = 200;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let start = offset + (line.len() - line.trim_start().len());
+            let mut end = start + trimmed.len().min(LIMIT);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            return (start < end).then_some(start..end);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// The checkout-relative path of `path` (absolute, or relative to the
+/// only checkout) and its repository. `checkouts` holds each repository's
+/// checkout root.
+pub fn repo_relative(
+    checkouts: &[(String, std::path::PathBuf)],
+    path: &str,
+) -> Option<(String, String)> {
+    let path = std::path::Path::new(path);
+    if path.is_relative() {
+        return match checkouts {
+            [(repo, _)] => Some((repo.clone(), path.to_string_lossy().to_string())),
+            _ => None,
+        };
+    }
+    checkouts
+        .iter()
+        .filter_map(|(repo, root)| {
+            let rest = path.strip_prefix(root).ok()?;
+            let rest = rest.to_string_lossy().to_string();
+            (!rest.is_empty()).then(|| (root.as_os_str().len(), repo.clone(), rest))
+        })
+        // The deepest root wins (a checkout inside another).
+        .max_by_key(|(depth, _, _)| *depth)
+        .map(|(_, repo, rest)| (repo, rest))
+}
+
+/// The target for diff lines `lines` (indices into `hunk.lines`) picked in
+/// an edit of `path` shown in the transcript: the new-side code lines when
+/// the pick has any and the file is in a known checkout. `None` otherwise
+/// (removed lines only, or a file outside the checkouts): such a comment
+/// is stored as a block comment quoting the lines.
+pub fn patch_target(
+    checkouts: &[(String, std::path::PathBuf)],
+    path: &str,
+    hunk: &Hunk,
+    lines: std::ops::RangeInclusive<usize>,
+) -> Option<CommentTarget> {
+    let (repo, relative) = repo_relative(checkouts, path)?;
+    match diff_target(&repo, &relative, "", hunk, lines) {
+        target @ CommentTarget::Code { .. } => Some(target),
+        _ => None,
+    }
+}
+
+/// Whether a code comment is about lines an edit of `path` wrote
+/// (`new_lines`, line numbers of the new side).
+pub fn code_on_edit(anchor: &CodeAnchor, path: &str, new_lines: &[u32]) -> bool {
+    let anchored = anchor.path.to_string_lossy();
+    let same_file = path == anchored || path.ends_with(&format!("/{anchored}"));
+    same_file
+        && new_lines
+            .iter()
+            .any(|line| (anchor.start_line..=anchor.end_line).contains(line))
 }
 
 // -- prompt block ---------------------------------------------------------
@@ -784,6 +943,9 @@ pub struct CommentDraft {
     pub target: CommentTarget,
     pub parent: Option<CommentId>,
     pub input: Entity<TextareaState>,
+    /// A comment on a block that is not a message: its kind and passage,
+    /// quoted in the body on submit ([`proxy_body`]).
+    quote: Option<(&'static str, String)>,
     _enter: Subscription,
 }
 
@@ -822,8 +984,15 @@ impl CommentDraft {
             target,
             parent,
             input,
+            quote: None,
             _enter: enter,
         }
+    }
+
+    /// Quote `excerpt` of a `kind` block in the body on submit.
+    pub fn with_quote(mut self, kind: &'static str, excerpt: String) -> Self {
+        self.quote = Some((kind, excerpt));
+        self
     }
 
     pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
@@ -840,6 +1009,10 @@ impl CommentDraft {
     pub fn submit(&self, store: &Entity<CommentStore>, cx: &mut App) -> bool {
         let Some(body) = self.body(cx) else {
             return false;
+        };
+        let body = match &self.quote {
+            Some((kind, excerpt)) => proxy_body(kind, excerpt, &body),
+            None => body,
         };
         let target = self.target.clone();
         let parent = self.parent.clone();
@@ -979,15 +1152,6 @@ fn phase_color(phase: &Phase, p: &Palette) -> Hsla {
     }
 }
 
-/// Highlight behind an anchored passage.
-pub fn highlight_color(phase: &Phase, p: &Palette) -> Option<Hsla> {
-    match phase {
-        Phase::Pending => Some(p.accent.opacity(0.24)),
-        Phase::Delivered(_) => Some(p.accent.opacity(0.11)),
-        Phase::Resolved(_) => None,
-    }
-}
-
 fn phase_summary(group: &CommentGroup) -> String {
     match group.phase() {
         Phase::Pending => "Sent with your next message".into(),
@@ -999,39 +1163,6 @@ fn phase_summary(group: &CommentGroup) -> String {
         }
         Phase::Resolved(_) => "Resolved".into(),
     }
-}
-
-/// The phase a marker for several collapsed threads shows: pending wins,
-/// then delivered, then resolved.
-pub fn marker_phase(groups: &[&CommentGroup]) -> Phase {
-    let phases: Vec<Phase> = groups.iter().map(|group| group.phase()).collect();
-    if phases.contains(&Phase::Pending) {
-        return Phase::Pending;
-    }
-    phases
-        .iter()
-        .filter_map(|phase| match phase {
-            Phase::Delivered(delivery) => Some(delivery.clone()),
-            _ => None,
-        })
-        .max_by_key(|delivery| delivery.turn)
-        .map(Phase::Delivered)
-        .unwrap_or(Phase::Resolved(None))
-}
-
-/// Tooltip of a gutter marker: one line per thread.
-pub fn marker_summary(groups: &[&CommentGroup]) -> String {
-    groups
-        .iter()
-        .map(|group| {
-            format!(
-                "{} · {}",
-                plural(group.len(), "comment", "comments"),
-                phase_summary(group)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// A collapsed thread: one row that expands on click.
@@ -1283,6 +1414,235 @@ pub fn render_card(
                         .label(if resolved { "Reopen" } else { "Resolve" })
                         .on_click(toggle_resolved),
                 ),
+        )
+        .into_any_element()
+}
+
+/// The color of comment marks: the left bar of a comment, the highlight
+/// behind its passage.
+pub fn mark_color(p: &Palette) -> Hsla {
+    p.danger
+}
+
+/// Highlight behind a passage commented in the document: strong while the
+/// comment waits, faint once delivered, none when resolved.
+pub fn passage_color(phase: &Phase, p: &Palette) -> Option<Hsla> {
+    match phase {
+        Phase::Pending => Some(mark_color(p).opacity(0.22)),
+        Phase::Delivered(_) => Some(mark_color(p).opacity(0.12)),
+        Phase::Resolved(_) => None,
+    }
+}
+
+/// A comment author's round avatar: the person's initials (a collaborator
+/// in a shared thread), a person glyph for you, the agent's icon.
+pub fn author_avatar(actor: &Actor, me: Option<&str>, size: f32, p: &Palette) -> AnyElement {
+    match crate::collab::Speaker::of(actor) {
+        crate::collab::Speaker::Remote(name) => {
+            crate::presence::avatar(p, &name, size, false).into_any_element()
+        }
+        crate::collab::Speaker::Me if me.is_some() => {
+            crate::presence::avatar(p, me.unwrap_or_default(), size, false).into_any_element()
+        }
+        speaker => {
+            let (icon, bg, fg) = match speaker {
+                crate::collab::Speaker::Me => (IconName::User, p.selected, p.text_muted),
+                _ => (IconName::Bot, p.accent_soft, p.accent_text),
+            };
+            div()
+                .size(px(size))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(bg)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(Icon::new(icon).with_size(px(size * 0.6)).text_color(fg))
+                .into_any_element()
+        }
+    }
+}
+
+/// A comment thread right under its passage, as in a document: a card
+/// with a bar on its left, each comment as an avatar and its text, the
+/// agent's answer as a "↩ answer" line, and the reply composer. Reply,
+/// resolve and delete show on hover.
+#[allow(clippy::too_many_arguments)]
+pub fn render_inline(
+    id: impl Into<SharedString>,
+    group: &CommentGroup,
+    answer: Option<(MessageId, String)>,
+    reply: Option<AnyElement>,
+    me: Option<&str>,
+    handlers: &CardHandlers,
+    p: &Palette,
+) -> AnyElement {
+    let id: SharedString = id.into();
+    let phase = group.phase();
+    let resolved = matches!(phase, Phase::Resolved(_));
+    let bar = match phase {
+        Phase::Pending => mark_color(p),
+        Phase::Delivered(_) => mark_color(p).opacity(0.55),
+        Phase::Resolved(_) => p.border_strong,
+    };
+    let hover_group: SharedString = format!("{id}-card").into();
+    let action = |name: &str, icon: IconName, tip: &'static str| {
+        Button::new(SharedString::from(format!("{id}-{name}")))
+            .ghost()
+            .xsmall()
+            .icon(icon)
+            .tooltip(tip)
+    };
+    let actions = {
+        let store = handlers.store.clone();
+        let root_id = group.id().clone();
+        let on_reply = handlers.on_reply.clone();
+        let reply_id = root_id.clone();
+        h_flex()
+            .flex_shrink_0()
+            .gap(theme::sp(0.5))
+            .opacity(0.)
+            .group_hover(hover_group.clone(), |style| style.opacity(1.))
+            .when(!resolved, |this| {
+                this.child(
+                    action("reply", IconName::Undo2, "Reply")
+                        .on_click(move |_, window, cx| on_reply(reply_id.clone(), window, cx)),
+                )
+            })
+            .child(
+                action(
+                    "resolve",
+                    if resolved {
+                        IconName::Undo2
+                    } else {
+                        IconName::Check
+                    },
+                    if resolved { "Reopen" } else { "Resolve" },
+                )
+                .on_click(move |_, _, cx| {
+                    let root_id = root_id.clone();
+                    store.update(cx, |store, cx| {
+                        if resolved {
+                            store.reopen(root_id, cx)
+                        } else {
+                            store.resolve(root_id, cx)
+                        }
+                    });
+                }),
+            )
+    };
+    let comment = |index: usize, comment: &CommentSnapshot| {
+        let delete = can_delete(comment).then(|| {
+            let store = handlers.store.clone();
+            let comment_id = comment.id.clone();
+            action(
+                &format!("delete-{index}"),
+                IconName::Delete,
+                "Delete this pending comment",
+            )
+            .on_click(move |_, _, cx| {
+                store.update(cx, |store, cx| store.delete(comment_id.clone(), cx));
+            })
+        });
+        let state = match &comment.state {
+            CommentState::Pending => Some(("Pending", p.text_muted)),
+            _ => None,
+        };
+        h_flex()
+            .w_full()
+            .gap(theme::sp(2.))
+            .items_start()
+            .child(
+                div()
+                    .pt(px(1.))
+                    .child(author_avatar(&comment.author, me, 18., p)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(theme::text_ui())
+                    .line_height(relative(1.5))
+                    .text_color(if resolved { p.text_muted } else { p.text })
+                    .child(display_body(&comment.body)),
+            )
+            .children(state.map(|(label, color)| {
+                div()
+                    .flex_shrink_0()
+                    .pt(px(2.))
+                    .text_size(theme::text_xs())
+                    .text_color(color)
+                    .child(label)
+            }))
+            .children(delete)
+    };
+    let answer = answer.map(|(message_id, excerpt)| {
+        let on_answer = handlers.on_answer.clone();
+        h_flex()
+            .id(SharedString::from(format!("{id}-answer")))
+            .w_full()
+            .gap(theme::sp(1.5))
+            .items_center()
+            .cursor_pointer()
+            .text_size(theme::text_sm())
+            .text_color(p.text_muted)
+            .hover(|style| style.text_color(p.text))
+            .on_click(move |_, window, cx| on_answer(message_id.clone(), window, cx))
+            .child(
+                Icon::new(IconName::Undo2)
+                    .with_size(px(12.))
+                    .text_color(p.text_faint),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(excerpt))
+    });
+    let status = match &phase {
+        Phase::Delivered(delivery) if delivery.answer_message_id.is_none() => Some(format!(
+            "Sent in turn {} · waiting for the answer",
+            delivery.turn
+        )),
+        Phase::Resolved(_) => Some("Resolved".to_string()),
+        _ => None,
+    };
+    h_flex()
+        .id(id.clone())
+        .group(hover_group)
+        .w_full()
+        .items_stretch()
+        .rounded(theme::radius())
+        .border_1()
+        .border_color(p.border)
+        .bg(p.elevated)
+        .overflow_hidden()
+        .child(div().w(px(2.)).flex_shrink_0().bg(bar))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .px(theme::sp(2.5))
+                .py(theme::sp(2.))
+                .gap(theme::sp(1.5))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_start()
+                        .gap(theme::sp(1.))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap(theme::sp(1.5))
+                                .children(group.all().enumerate().map(|(n, c)| comment(n, c))),
+                        )
+                        .child(actions),
+                )
+                .children(status.map(|status| {
+                    div()
+                        .text_size(theme::text_xs())
+                        .text_color(p.text_faint)
+                        .child(status)
+                }))
+                .children(answer)
+                .children(reply),
         )
         .into_any_element()
 }
@@ -1721,29 +2081,6 @@ diff --git a/src/a.rs b/src/a.rs
     }
 
     #[test]
-    fn markers_summarize_collapsed_threads() {
-        let groups = group_comments(&[
-            snap("a", None, on_message("m", 0, 1), delivered(2, Some("m5"))),
-            snap("b", None, on_message("m", 2, 3), delivered(3, None)),
-            snap("c", None, on_message("m", 4, 5), resolved()),
-        ]);
-        let all: Vec<&CommentGroup> = groups.iter().collect();
-        assert!(matches!(
-            marker_phase(&all),
-            Phase::Delivered(CommentDelivery { turn: 3, .. })
-        ));
-        assert_eq!(
-            marker_summary(&all),
-            "1 comment · Answered in turn 2\n1 comment · Sent in turn 3 · waiting for the answer\n1 comment · Resolved"
-        );
-        assert_eq!(marker_phase(&all[2..]), Phase::Resolved(None));
-        let pending = group_comments(&[snap("p", None, on_message("m", 0, 1), pending())]);
-        let mut mixed = all.clone();
-        mixed.push(&pending[0]);
-        assert_eq!(marker_phase(&mixed), Phase::Pending);
-    }
-
-    #[test]
     fn picked_diff_lines_become_code_or_hunk_targets() {
         let files = parse_unified_diff(DIFF);
         let hunk = &files[0].hunks[0];
@@ -1765,6 +2102,95 @@ diff --git a/src/a.rs b/src/a.rs
             },
             "a removed line has no new-side line: the hunk is the target"
         );
+    }
+
+    #[test]
+    fn block_comments_quote_their_passage_and_read_back() {
+        let body = proxy_body(KIND_THINKING, " line one\n\nline three ", " fix this ");
+        assert_eq!(body, "> Thinking: line one\n> \n> line three\n\nfix this");
+        assert_eq!(
+            parse_proxy(&body),
+            Some(Proxy {
+                kind: KIND_THINKING,
+                excerpt: "line one\n\nline three".into(),
+                comment: "fix this".into(),
+            })
+        );
+        assert_eq!(display_body(&body), "fix this");
+        assert_eq!(display_body("plain comment"), "plain comment");
+        assert_eq!(parse_proxy("plain comment"), None);
+        assert_eq!(parse_proxy("> Unknown: x\n\ny"), None);
+        assert_eq!(parse_proxy("> Thinking: no blank line"), None);
+        let patch = proxy_body(KIND_PATCH, "- old\n+ new", "why?");
+        assert_eq!(parse_proxy(&patch).unwrap().excerpt, "- old\n+ new");
+        let long = proxy_body(KIND_COMMAND, &"x".repeat(700), "c");
+        assert!(parse_proxy(&long).unwrap().excerpt.ends_with('…'));
+    }
+
+    #[test]
+    fn block_comments_anchor_to_the_turn_message_but_not_its_text() {
+        // Stored on the first line of the answer...
+        let text = "\n\n  Hello world\nmore";
+        let range = proxy_anchor(text).unwrap();
+        assert_eq!(&text[range], "Hello world");
+        assert_eq!(proxy_anchor(" \n "), None);
+        let wide = "é".repeat(150);
+        let range = proxy_anchor(&wide).unwrap();
+        assert!(range.end <= 200 && wide.is_char_boundary(range.end));
+        // ...but neither highlighted nor placed there.
+        let mut on_block = snap("b", None, on_message("m", 0, 5), pending());
+        on_block.body = proxy_body(KIND_THINKING, "plan", "hmm");
+        let groups = group_comments(&[on_block, snap("a", None, on_message("m", 6, 9), pending())]);
+        let (threads, anchors) = message_anchors(&groups, &MessageId::from("m"), 0, "Hello world");
+        assert_eq!(threads, vec![1]);
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].group, 1);
+    }
+
+    #[test]
+    fn transcript_diff_lines_anchor_to_code_in_a_known_checkout() {
+        let checkouts = vec![
+            ("r1".to_string(), std::path::PathBuf::from("/w/app")),
+            (
+                "r2".to_string(),
+                std::path::PathBuf::from("/w/app/vendor/lib"),
+            ),
+        ];
+        assert_eq!(
+            repo_relative(&checkouts, "/w/app/vendor/lib/x.rs"),
+            Some(("r2".into(), "x.rs".into()))
+        );
+        assert_eq!(
+            repo_relative(&checkouts, "/w/app/src/y.rs"),
+            Some(("r1".into(), "src/y.rs".into()))
+        );
+        assert_eq!(repo_relative(&checkouts, "/elsewhere/z.rs"), None);
+        assert_eq!(repo_relative(&checkouts, "src/a.rs"), None, "ambiguous");
+        assert_eq!(
+            repo_relative(&checkouts[..1], "src/a.rs"),
+            Some(("r1".into(), "src/a.rs".into()))
+        );
+
+        let files = parse_unified_diff(DIFF);
+        let hunk = &files[0].hunks[0];
+        match patch_target(&checkouts, "/w/app/src/a.rs", hunk, 1..=3) {
+            Some(CommentTarget::Code { anchor }) => {
+                assert_eq!(anchor.repository_id.0, "r1");
+                assert_eq!(anchor.path, std::path::PathBuf::from("src/a.rs"));
+                assert_eq!((anchor.start_line, anchor.end_line), (2, 3));
+                assert!(code_on_edit(&anchor, "/w/app/src/a.rs", &[1, 2]));
+                assert!(!code_on_edit(&anchor, "/w/app/src/a.rs", &[7]));
+                assert!(!code_on_edit(&anchor, "/w/app/src/b.rs", &[2]));
+                assert!(!code_on_edit(&anchor, "/w/app/xsrc/a.rs", &[2]));
+            }
+            other => panic!("expected code, got {other:?}"),
+        }
+        assert_eq!(
+            patch_target(&checkouts, "/w/app/src/a.rs", hunk, 1..=1),
+            None,
+            "removed lines only: a block comment quoting them"
+        );
+        assert_eq!(patch_target(&checkouts, "/tmp/a.rs", hunk, 1..=3), None);
     }
 
     #[test]

@@ -243,21 +243,6 @@ pub fn title_avatars(p: &Palette, people: &[Participant]) -> AnyElement {
         .into_any_element()
 }
 
-/// The author line of another participant's message.
-pub fn person_row(p: &Palette, name: &str) -> impl IntoElement {
-    h_flex()
-        .gap(theme::sp(2.))
-        .items_center()
-        .child(avatar(p, name, 20., false))
-        .child(
-            div()
-                .text_size(theme::text_sm())
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(p.text)
-                .child(name.to_string()),
-        )
-}
-
 /// The author line of another participant's Claude: their avatar with a
 /// small bot badge.
 pub fn remote_agent_row(p: &Palette, name: &str) -> impl IntoElement {
