@@ -10,8 +10,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use trama_domain::agent::{BillingSource, UsageReport};
+use trama_protocol::PromptMention;
 
-use crate::theme;
+use crate::{mentions, theme};
 
 /// Context window used for the meter. Claude models in use today have a
 /// 200k-token window; the daemon does not report it yet.
@@ -34,6 +35,12 @@ pub struct ComposerFooter {
     pub turns: Option<u32>,
     /// From the agent's `SessionInfo`; `None` until a session reports it.
     pub billing: Option<BillingBadge>,
+    /// Replaces the static model pill (the model picker).
+    pub model_picker: Option<AnyElement>,
+    /// Buttons at the start of the footer row (the terminal toggle).
+    pub tools: Vec<AnyElement>,
+    /// Chips above the text (attached terminals).
+    pub header: Vec<AnyElement>,
 }
 
 /// Who pays for the session, plus runtime details for the tooltip.
@@ -103,6 +110,18 @@ impl Composer {
             }
         });
         prompt
+    }
+
+    /// Like [`Self::take_prompt`], plus the structured mentions of the `@`
+    /// chips in the text.
+    pub fn take_content(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<(String, Vec<PromptMention>)> {
+        let mentions = mentions::mentions_from_tokens(self.input.read(cx).tokens());
+        self.take_prompt(window, cx)
+            .map(|prompt| (prompt, mentions))
     }
 
     pub fn value(&self, cx: &App) -> String {
@@ -195,20 +214,25 @@ impl Composer {
             0.
         };
 
-        let footer_row = h_flex()
-            .w_full()
-            .px(theme::sp(1.5))
-            .pb(theme::sp(1.5))
-            .gap(theme::sp(1.))
-            .items_center()
-            .child(pill(
+        let model_pill = footer.model_picker.unwrap_or_else(|| {
+            pill(
                 h_flex()
                     .gap(theme::sp(1.5))
                     .items_center()
                     .child(Icon::new(IconName::Cpu).with_size(px(12.)))
                     .child(footer.model.clone().unwrap_or_else(|| "Model —".into()))
                     .into_any_element(),
-            ))
+            )
+            .into_any_element()
+        });
+        let footer_row = h_flex()
+            .w_full()
+            .px(theme::sp(1.5))
+            .pb(theme::sp(1.5))
+            .gap(theme::sp(1.))
+            .items_center()
+            .children(footer.tools)
+            .child(model_pill)
             .child(pill(
                 h_flex()
                     .gap(theme::sp(1.5))
@@ -331,13 +355,29 @@ impl Composer {
             .border_1()
             .border_color(if focused { p.border_strong } else { p.border })
             .bg(p.elevated)
+            .when(!footer.header.is_empty(), |this| {
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .flex_wrap()
+                        .px(theme::sp(2.5))
+                        .pt(theme::sp(2.))
+                        .gap(theme::sp(1.5))
+                        .children(footer.header),
+                )
+            })
             .child(
                 div()
                     .w_full()
                     .px(theme::sp(1.))
                     .pt(theme::sp(1.))
                     .text_size(theme::text_prose())
-                    .child(Textarea::new(&self.input).appearance(false).h(px(64.))),
+                    .child(
+                        Textarea::new(&self.input)
+                            .appearance(false)
+                            .h(px(64.))
+                            .token(mentions::render_token),
+                    ),
             )
             .child(footer_row)
     }

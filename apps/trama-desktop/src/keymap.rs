@@ -91,6 +91,10 @@ pub const SHORTCUTS: &[Shortcut] = &[
         label: "Share this thread",
     },
     Shortcut {
+        keys: &["ctrl-`"],
+        label: "Show or hide the thread's terminals",
+    },
+    Shortcut {
         keys: &["cmd-k"],
         label: "Jump to a thread or run a command",
     },

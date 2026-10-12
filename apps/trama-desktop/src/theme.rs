@@ -227,3 +227,28 @@ pub fn mode_for(appearance: WindowAppearance) -> ThemeMode {
         WindowAppearance::Dark | WindowAppearance::VibrantDark => ThemeMode::Dark,
     }
 }
+
+/// One of the 16 ANSI terminal colors in this palette (8..16 are the bright
+/// variants). Matches the colors command output uses in the transcript.
+pub fn ansi(n: u8, p: &Palette) -> Hsla {
+    let base = match n % 8 {
+        0 => p.text_faint,
+        1 => p.danger,
+        2 => p.success,
+        3 => p.warning,
+        4 => p.accent_text,
+        5 => hsla(300. / 360., 0.45, 0.65, 1.),
+        6 => hsla(187. / 360., 0.45, 0.55, 1.),
+        _ => p.text_muted,
+    };
+    match n {
+        8 => p.text_muted,
+        15 => p.text,
+        9..=14 => {
+            let mut bright = base;
+            bright.l = (bright.l + 0.08).min(0.92);
+            bright
+        }
+        _ => base,
+    }
+}

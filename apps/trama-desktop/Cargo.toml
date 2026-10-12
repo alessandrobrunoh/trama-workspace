@@ -18,3 +18,5 @@ chrono = { workspace = true }
 async-channel = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
 gpui-kit = "=0.7.1"
+alacritty_terminal = "0.26"
+base64 = "0.22"

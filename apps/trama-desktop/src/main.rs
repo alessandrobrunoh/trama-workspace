@@ -5,23 +5,31 @@ mod collab;
 mod collab_account;
 mod comments;
 mod composer;
+mod composer_popup;
 mod copies;
 mod devhooks;
 mod dialog;
 mod diff;
 mod editor;
 mod keymap;
+mod mentions;
+mod model_picker;
 mod net;
 mod onboarding;
 mod presence;
 mod projects;
 mod share_dialog;
 mod sidebar;
+mod slash;
+mod snapshot;
 mod startup;
 mod subthreads;
+mod terminal_view;
 mod theme;
 mod tools;
+mod trigger;
 mod turns;
+mod vt;
 mod workspace;
 
 use std::borrow::Cow;
@@ -36,6 +44,7 @@ gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
         ArrowUpRight,
+        AtSign,
         Bookmark,
         Brain,
         CircleCheckBig,
@@ -52,10 +61,12 @@ gpui_kit::assets::icon_assets!(
         MessageSquareDiff,
         MessageSquarePlus,
         MessageSquareText,
+        Paperclip,
         Pencil,
         PlaneLanding,
         ShieldAlert,
         ShieldCheck,
+        Slash,
         Sparkles,
         Split,
         SquarePen,
@@ -95,6 +106,7 @@ fn main() {
     application().with_assets(AppAssets).run(|cx| {
         gpui_kit::init(cx);
         keymap::bind(cx);
+        terminal_view::bind(cx);
         let mut mode = theme::mode_for(cx.window_appearance());
         if let Some(forced) = devhooks::appearance() {
             mode = forced;

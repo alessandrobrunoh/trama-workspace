@@ -188,8 +188,17 @@ impl Workspace {
                     .iter()
                     .map(|thread| (thread.id.clone(), thread.title.clone()))
                     .collect();
-                this.chat
-                    .update(cx, |chat, cx| chat.set_known_threads(threads, cx));
+                let models: Vec<_> = sidebar
+                    .read(cx)
+                    .onboarding
+                    .threads
+                    .iter()
+                    .map(|thread| (thread.id.clone(), thread.model.clone()))
+                    .collect();
+                this.chat.update(cx, |chat, cx| {
+                    chat.set_known_threads(threads, cx);
+                    chat.set_thread_models(models, cx);
+                });
                 cx.notify();
             }),
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
@@ -1333,6 +1342,23 @@ impl Workspace {
                     bar.apply_land(land_thread_id, outcome, summary, cx);
                 });
             }
+            DaemonMessage::ThreadModelChanged { thread_id, model } => {
+                // Keep the snapshot current so the picker is not reset.
+                self.sidebar.update(cx, |sidebar, cx| {
+                    if let Some(thread) = sidebar
+                        .onboarding
+                        .threads
+                        .iter_mut()
+                        .find(|thread| thread.id == thread_id)
+                    {
+                        thread.model = model.clone();
+                        cx.notify();
+                    }
+                });
+                self.chat.update(cx, |chat, cx| {
+                    chat.handle_daemon(DaemonMessage::ThreadModelChanged { thread_id, model }, cx);
+                });
+            }
             DaemonMessage::Error { message, .. }
                 if self
                     .changes
@@ -1740,6 +1766,12 @@ impl Render for Workspace {
                     this.comment_on_selection(window, cx);
                 }),
             )
+            .on_action(cx.listener(
+                |this, _: &crate::terminal_view::ToggleTerminal, window, cx| {
+                    this.chat
+                        .update(cx, |chat, cx| chat.toggle_terminal(window, cx));
+                },
+            ))
             // Text inputs (the composer) handle Escape first; close the
             // drawer on the way down so Esc works with the composer focused.
             .capture_action(cx.listener(

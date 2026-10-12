@@ -25,11 +25,16 @@ use crate::comments::{
     self, CardHandlers, CommentDraft, CommentGroup, CommentStore, Phase, PromptBlock,
 };
 use crate::composer::{BillingBadge, Composer, ComposerFooter};
+use crate::composer_popup::ComposerPopup;
+use crate::model_picker::ModelPicker;
 use crate::net::{DaemonClient, SendStatus};
 use crate::sidebar::ThreadStatus;
+use crate::snapshot;
+use crate::terminal_view::{self, TerminalEvent, TerminalPanel};
 use crate::theme::{self, Palette};
 use crate::tools::{self, Item, ToolKind, ToolTiming, ToolViewState};
 use crate::turns::{self, Bookmarks, Span};
+use gpui_kit::component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -247,6 +252,13 @@ pub struct ChatPanel {
     collab: Option<Entity<crate::collab::CollabStore>>,
     /// Mirrored messages of other participants: author and role.
     remote_authors: HashMap<MessageId, (String, Role)>,
+    /// `@` / `/` / `!` popups over the composer.
+    popup: Entity<ComposerPopup>,
+    model_picker: Entity<ModelPicker>,
+    terminals: Entity<TerminalPanel>,
+    /// Expanded terminal snapshots in sent prompts (message, block index).
+    open_snapshots: HashSet<(MessageId, usize)>,
+    _composer_extras: Vec<Subscription>,
     _enter: Subscription,
     _event_task: Option<Task<()>>,
 }
@@ -263,6 +275,25 @@ impl ChatPanel {
             this.submit(window, cx);
         });
         let comments_observer = cx.observe(&comments, |_, _, cx| cx.notify());
+        let popup_input = composer.input.clone();
+        let popup_client = client.clone();
+        let popup = cx.new(|cx| ComposerPopup::new(popup_client, popup_input, cx));
+        let picker_client = client.clone();
+        let model_picker = cx.new(|_| ModelPicker::new(picker_client));
+        let terminal_client = client.clone();
+        let terminals = cx.new(|cx| TerminalPanel::new(terminal_client, cx));
+        let composer_extras = vec![
+            cx.observe(&popup, |_, _, cx| cx.notify()),
+            cx.observe(&model_picker, |_, _, cx| cx.notify()),
+            cx.observe(&terminals, |_, _, cx| cx.notify()),
+            cx.subscribe_in(
+                &terminals,
+                window,
+                |this, _, event, window, cx| match event {
+                    TerminalEvent::Hidden => this.focus_composer(window, cx),
+                },
+            ),
+        ];
 
         Self {
             entries: Vec::new(),
@@ -307,6 +338,11 @@ impl ChatPanel {
             turn_details: HashMap::new(),
             collab: None,
             remote_authors: HashMap::new(),
+            popup,
+            model_picker,
+            terminals,
+            open_snapshots: HashSet::new(),
+            _composer_extras: composer_extras,
             _enter: enter,
             _event_task: None,
         }
@@ -425,6 +461,15 @@ impl ChatPanel {
         if connected {
             self.connection_error = None;
         }
+        if connected && !was_connected {
+            self.popup.update(cx, |popup, _| popup.reconnected());
+            self.model_picker
+                .update(cx, |picker, _| picker.reconnected());
+            self.terminals
+                .update(cx, |terminals, cx| terminals.reconnected(cx));
+        }
+        self.model_picker
+            .update(cx, |picker, _| picker.enabled = connected);
         cx.notify();
     }
 
@@ -450,6 +495,15 @@ impl ChatPanel {
         }
         self.selected_thread = thread;
         self.restore_thread_draft = self.selected_thread.is_some();
+        let (thread, connected) = (self.selected_thread.clone(), self.connected);
+        self.popup
+            .update(cx, |popup, cx| popup.set_thread(thread.clone(), cx));
+        self.model_picker
+            .update(cx, |picker, cx| picker.set_thread(thread.clone(), cx));
+        self.terminals.update(cx, |terminals, cx| {
+            terminals.set_thread(thread, connected, cx)
+        });
+        self.open_snapshots.clear();
         self.clear_transcript();
         self.draft = None;
         self.thread_open.clear();
@@ -542,6 +596,24 @@ impl ChatPanel {
     }
 
     pub fn handle_daemon(&mut self, message: DaemonMessage, cx: &mut Context<Self>) {
+        if self.popup.update(cx, |popup, cx| popup.apply(&message, cx))
+            || self
+                .model_picker
+                .update(cx, |picker, cx| picker.apply(&message, cx))
+            || self
+                .terminals
+                .update(cx, |terminals, cx| terminals.apply(&message, cx))
+        {
+            return;
+        }
+        if let DaemonMessage::AgentEventEnvelope {
+            thread_id,
+            event: AgentEvent::CommandsReported { .. },
+        } = &message
+            && self.thread_matches(thread_id)
+        {
+            self.popup.update(cx, |popup, _| popup.refresh_skills());
+        }
         match message {
             DaemonMessage::MessageAppended { thread_id, message } => {
                 if !self.thread_matches(&thread_id) {
@@ -622,21 +694,33 @@ impl ChatPanel {
         if self.connected && self.selected_thread.is_none() {
             return;
         }
-        let Some(prompt) = self.composer.take_prompt(window, cx) else {
+        if self.run_bang_command(window, cx) {
+            return;
+        }
+        let Some((prompt, mentions)) = self.composer.take_content(window, cx) else {
             return;
         };
 
         if let (true, Some(thread_id)) = (self.connected, self.selected_thread.clone()) {
+            let terminals: Vec<String> = self
+                .terminals
+                .read(cx)
+                .attachments()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
             if self.client.send(ClientMessage::SendPrompt {
                 thread_id: thread_id.clone(),
                 text: prompt.clone(),
-                mentions: Vec::new(),
-                terminals: Vec::new(),
+                mentions,
+                terminals,
             }) == SendStatus::Rejected
             {
                 self.restore_prompt(&thread_id, &prompt, window, cx);
                 return;
             }
+            self.terminals
+                .update(cx, |terminals, cx| terminals.clear_attachments(cx));
             self.pending_prompt = Some(prompt.clone());
             self._event_task = None;
         } else {
@@ -1090,6 +1174,151 @@ impl ChatPanel {
             self.known_threads = threads;
             cx.notify();
         }
+    }
+
+    /// Each thread's model override (`ThreadSnapshot.model`).
+    pub fn set_thread_models(
+        &mut self,
+        models: Vec<(ThreadId, Option<String>)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.model_picker
+            .update(cx, |picker, cx| picker.set_overrides(models, cx));
+    }
+
+    /// ⌃` and the composer's terminal button.
+    pub fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.uses_daemon() {
+            return;
+        }
+        self.terminals
+            .update(cx, |terminals, cx| terminals.toggle(window, cx));
+        if !self.terminals.read(cx).is_open() {
+            self.focus_composer(window, cx);
+        }
+    }
+
+    /// `!command` in the composer: run it in a new terminal instead of
+    /// sending a prompt. `true` when it did.
+    fn run_bang_command(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.uses_daemon() {
+            return false;
+        }
+        let Some(command) = self.popup.read(cx).bang_command() else {
+            return false;
+        };
+        self.composer.set_prompt("", window, cx);
+        let command = (!command.is_empty()).then_some(command);
+        self.terminals
+            .update(cx, |terminals, cx| terminals.open_terminal(command, cx));
+        true
+    }
+
+    /// Keys the composer popups take before the textarea sees them.
+    fn composer_key_handlers(&self, element: Div, cx: &mut Context<Self>) -> Div {
+        element
+            .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
+                if this.popup.read(cx).is_open() {
+                    this.popup
+                        .update(cx, |popup, cx| popup.move_selection(-1, cx));
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
+                if this.popup.read(cx).is_open() {
+                    this.popup
+                        .update(cx, |popup, cx| popup.move_selection(1, cx));
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                if this
+                    .popup
+                    .update(cx, |popup, cx| popup.is_open() && popup.accept(window, cx))
+                {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, action: &Enter, window, cx| {
+                if action.shift {
+                    return;
+                }
+                if this
+                    .popup
+                    .update(cx, |popup, cx| popup.is_open() && popup.accept(window, cx))
+                    || this.run_bang_command(window, cx)
+                {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &Escape, _, cx| {
+                if this.popup.update(cx, |popup, cx| popup.dismiss(cx)) {
+                    cx.stop_propagation();
+                }
+            }))
+    }
+
+    /// The composer's terminal button (footer) and attached-terminal chips
+    /// (above the text).
+    fn composer_extras(
+        &self,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> (Vec<AnyElement>, Vec<AnyElement>) {
+        let terminals = self.terminals.read(cx);
+        let running = terminals.running_count();
+        let open = terminals.is_open();
+        let attachments = terminals.attachments();
+        let mut tools = Vec::new();
+        if self.uses_daemon() {
+            tools.push(
+                h_flex()
+                    .id("composer-terminal")
+                    .h(px(22.))
+                    .px(theme::sp(1.5))
+                    .gap(theme::sp(1.))
+                    .items_center()
+                    .rounded(theme::radius())
+                    .cursor_pointer()
+                    .text_size(theme::text_xs())
+                    .text_color(if open { p.accent_text } else { p.text_muted })
+                    .when(open, |this| this.bg(p.accent_soft))
+                    .hover(|style| style.bg(p.hover))
+                    .tooltip(|window, cx| {
+                        Tooltip::new("Terminal \u{2014} or start a message with ! (\u{2303}`)")
+                            .build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)))
+                    .child(Icon::new(IconName::SquareTerminal).with_size(px(13.)))
+                    .when(running > 0 && !open, |this| {
+                        this.child(format!("{running} running"))
+                    })
+                    .into_any_element(),
+            );
+        }
+        let header = attachments
+            .into_iter()
+            .enumerate()
+            .map(|(ix, (id, label))| {
+                let terminals = self.terminals.clone();
+                terminal_view::attachment_chip(
+                    ("attached-terminal", ix),
+                    &label,
+                    p,
+                    move |_, _, cx| {
+                        terminals.update(cx, |terminals, cx| terminals.detach(&id, cx));
+                    },
+                )
+            })
+            .collect();
+        (tools, header)
+    }
+
+    pub fn toggle_snapshot(&mut self, key: (MessageId, usize), cx: &mut Context<Self>) {
+        if !self.open_snapshots.remove(&key) {
+            self.open_snapshots.insert(key);
+        }
+        cx.notify();
     }
 }
 
@@ -2133,7 +2362,20 @@ impl Render for ChatPanel {
                                         .child(self.sent_block(id, text, split, &p, cx)),
                                 );
                             }
-                            let body = &text[base..];
+                            let context = snapshot::split_context(&text[base..]);
+                            if !context.is_empty() {
+                                block = block.child(div().pl(theme::sp(7.)).child(
+                                    snapshot::render_context(
+                                        id,
+                                        &context,
+                                        &self.open_snapshots,
+                                        &p,
+                                        cx,
+                                    ),
+                                ));
+                            }
+                            let base = base + context.text.start;
+                            let body = &text[base..base + context.text.len()];
                             if !body.trim().is_empty() {
                                 let (content, threads) = self.message_body(
                                     id, body, base, &groups, &mut hits, &handlers, now, &p, cx,
@@ -2400,6 +2642,10 @@ impl Render for ChatPanel {
                 .with_priority(1)
             });
 
+        let session_model = self.model.clone();
+        self.model_picker
+            .update(cx, |picker, _| picker.session_model = session_model);
+        let (composer_tools, composer_header) = self.composer_extras(&p, cx);
         let footer = ComposerFooter {
             model: self.model.clone(),
             status_label: self.status_pill(&p).0,
@@ -2408,7 +2654,11 @@ impl Render for ChatPanel {
             cost_usd_micros: self.cost_usd_micros,
             turns: self.turns,
             billing: self.session_info.as_ref().map(billing_badge),
+            model_picker: uses_daemon.then(|| self.model_picker.clone().into_any_element()),
+            tools: composer_tools,
+            header: composer_header,
         };
+        let terminals_open = uses_daemon && self.terminals.read(cx).is_open();
         let strip = if show_composer && uses_daemon {
             self.pending_strip(&groups, &p, cx)
         } else {
@@ -2446,15 +2696,19 @@ impl Render for ChatPanel {
                             .pb(theme::sp(4.))
                             .children(live_drafts)
                             .children(strip)
-                            .child(self.composer.render(
-                                running,
-                                stoppable,
-                                footer,
-                                cx.listener(|this, _, window, cx| this.submit(window, cx)),
-                                cx.listener(|this, _, _, cx| this.stop(cx)),
-                                window,
-                                cx,
+                            .when(terminals_open, |this| this.child(self.terminals.clone()))
+                            .child(self.composer_key_handlers(div().w_full(), cx).child(
+                                self.composer.render(
+                                    running,
+                                    stoppable,
+                                    footer,
+                                    cx.listener(|this, _, window, cx| this.submit(window, cx)),
+                                    cx.listener(|this, _, _, cx| this.stop(cx)),
+                                    window,
+                                    cx,
+                                ),
                             ))
+                            .child(self.popup.clone())
                             .children(shared_footer),
                     ),
                 )
