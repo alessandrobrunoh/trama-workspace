@@ -244,18 +244,7 @@ async fn client_loop(
         if !collab::is_member(c, &thread, user_id)? {
             return Ok(None);
         }
-        let mut statement = c
-            .prepare(
-                "SELECT u.username FROM collab_members m JOIN auth_users u ON u.id = m.user_id
-                 WHERE m.thread_id = ?1",
-            )
-            .map_err(|_| AuthError::Database)?;
-        let names = statement
-            .query_map([&thread], |row| row.get::<_, String>(0))
-            .map_err(|_| AuthError::Database)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| AuthError::Database)?;
-        Ok(Some(names))
+        Ok(Some(collab::member_names(c, &thread)?))
     })
     .await
     else {

@@ -17,11 +17,13 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use trama_collab_protocol::{
-    AccessLevel, CommandInfo, CommandKind, CommandReceipt, CommandState, CommentRequest,
-    CreateRunnerRequest, CreateThreadRequest, EventEnvelope, EventKind, EventsPage, InviteRequest,
-    JoinRequest, MemberInfo, MemberVia, PendingTurn, ResolveRequest, RunnerCreated, RunnerInfo,
-    RunnerReportKind, SendRequest, SetAccessRequest, SetAccessResponse, ThreadDetail,
-    ThreadSummary, TurnOutcome, VerdictRequest,
+    AccessLevel, ChildCreated, CommandInfo, CommandKind, CommandReceipt, CommandState,
+    CommentRequest, CreateChildRequest, CreateRunnerRequest, CreateThreadRequest, EventEnvelope,
+    EventKind, EventsPage, InviteRequest, JoinRequest, MAX_PUBLISH_EVENTS,
+    MAX_PUBLISH_PAYLOAD_BYTES, MemberInfo, MemberVia, PUBLISH_BODY_LIMIT, PendingTurn,
+    PublishRequest, PublishResponse, ResolveRequest, RunnerCreated, RunnerInfo, RunnerReportKind,
+    SendRequest, SetAccessRequest, SetAccessResponse, ThreadDetail, ThreadSummary, TurnOutcome,
+    VerdictRequest,
 };
 
 use crate::{
@@ -40,6 +42,10 @@ pub(crate) const MAX_RUNNER_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_TITLE_BYTES: usize = 200;
 const MAX_COMMAND_ID_BYTES: usize = 64;
 const MAX_ACTIVE_RUNNERS_PER_USER: i64 = 16;
+/// Child threads (at any depth) under one root.
+const MAX_CHILDREN_PER_ROOT: i64 = 2000;
+const MAX_CHILD_SUBAGENT_BYTES: usize = 1024;
+const MAX_FORK_ORIGIN_BYTES: usize = 128;
 pub(crate) const MAX_PAGE: i64 = 500;
 const DEFAULT_PAGE: i64 = 200;
 /// Runner tokens carry a distinct prefix so they can never be parsed as a
@@ -101,8 +107,28 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), String> {
                  ON collab_commands(author_id, kind, state);
              CREATE INDEX IF NOT EXISTS collab_commands_thread ON collab_commands(thread_id, seq);
              CREATE INDEX IF NOT EXISTS collab_commands_conn
-                 ON collab_commands(runner_conn) WHERE runner_conn IS NOT NULL;
-             PRAGMA user_version=2;",
+                 ON collab_commands(runner_conn) WHERE runner_conn IS NOT NULL;",
+        )
+        .map_err(|e| format!("initialize collaboration schema: {e}"))?;
+    // Version 3: child threads (subthreads, forks, subagents) under a root
+    // whose membership they inherit.
+    if connection
+        .prepare("SELECT root_id FROM collab_threads LIMIT 0")
+        .is_err()
+    {
+        connection
+            .execute_batch(
+                "ALTER TABLE collab_threads ADD COLUMN parent_id TEXT;
+                 ALTER TABLE collab_threads ADD COLUMN root_id TEXT;
+                 ALTER TABLE collab_threads ADD COLUMN kind TEXT;",
+            )
+            .map_err(|e| format!("add child thread columns: {e}"))?;
+    }
+    connection
+        .execute_batch(
+            "CREATE INDEX IF NOT EXISTS collab_threads_root ON collab_threads(root_id)
+                 WHERE root_id IS NOT NULL;
+             PRAGMA user_version=3;",
         )
         .map_err(|e| format!("initialize collaboration schema: {e}"))
 }
@@ -127,6 +153,19 @@ pub(crate) fn routes() -> Router<AppState> {
             post(resolve_comment),
         )
         .route("/threads/{thread_id}/verdicts", post(verdict))
+        .route(
+            "/threads/{thread_id}/comments/{seq}/reopen",
+            post(reopen_comment),
+        )
+        .route(
+            "/threads/{thread_id}/comments/{seq}/delete",
+            post(delete_comment),
+        )
+        .route("/threads/{thread_id}/children", post(create_child))
+        .route(
+            "/threads/{thread_id}/publish",
+            post(publish).layer(DefaultBodyLimit::max(PUBLISH_BODY_LIMIT)),
+        )
         .route(
             "/threads/{thread_id}/ws",
             get(crate::sockets::thread_socket),
@@ -234,14 +273,36 @@ fn json_len(value: &Value) -> usize {
 
 struct ThreadRow {
     title: String,
+    /// Owner and access of the root (a child has no ACL of its own).
     owner_id: i64,
     owner: String,
     access: AccessLevel,
     via: MemberVia,
+    parent_id: Option<String>,
+    root_id: Option<String>,
+    kind: Option<String>,
 }
 
-/// Returns the thread only if `user_id` is a member; otherwise `NotFound`,
-/// whether or not the thread exists.
+impl ThreadRow {
+    fn summary(self, thread_id: String, last_seq: i64) -> ThreadSummary {
+        ThreadSummary {
+            thread_id,
+            title: self.title,
+            owner: self.owner,
+            access: self.access,
+            via: self.via,
+            last_seq,
+            parent_thread_id: self.parent_id,
+            root_thread_id: self.root_id,
+            kind: self.kind,
+        }
+    }
+}
+
+/// Returns the thread only if `user_id` is a member of it, or of the root
+/// a child thread belongs to; otherwise `NotFound`, whether or not the
+/// thread exists. Child threads inherit the root's membership, so revoking
+/// access to the root revokes the whole family at once.
 fn member_thread(
     connection: &Connection,
     thread_id: &str,
@@ -249,11 +310,12 @@ fn member_thread(
 ) -> Result<ThreadRow, AuthError> {
     connection
         .query_row(
-            "SELECT t.title, t.owner_id, o.username, t.access, m.via
-             FROM collab_members m
-             JOIN collab_threads t ON t.id = m.thread_id
-             JOIN auth_users o ON o.id = t.owner_id
-             WHERE m.thread_id = ?1 AND m.user_id = ?2",
+            "SELECT t.title, r.owner_id, o.username, r.access, m.via, t.parent_id, t.root_id, t.kind
+             FROM collab_threads t
+             JOIN collab_threads r ON r.id = COALESCE(t.root_id, t.id)
+             JOIN collab_members m ON m.thread_id = r.id
+             JOIN auth_users o ON o.id = r.owner_id
+             WHERE t.id = ?1 AND m.user_id = ?2",
             params![thread_id, user_id],
             |row| {
                 Ok(ThreadRow {
@@ -262,6 +324,9 @@ fn member_thread(
                     owner: row.get(2)?,
                     access: untag(row.get(3)?)?,
                     via: untag(row.get(4)?)?,
+                    parent_id: row.get(5)?,
+                    root_id: row.get(6)?,
+                    kind: row.get(7)?,
                 })
             },
         )
@@ -270,6 +335,8 @@ fn member_thread(
         .ok_or(AuthError::NotFound)
 }
 
+/// Owner-only actions apply to a root thread; a child's access is its
+/// root's, so managing it there is `400`.
 fn owner_thread(
     connection: &Connection,
     thread_id: &str,
@@ -278,6 +345,9 @@ fn owner_thread(
     let thread = member_thread(connection, thread_id, user_id)?;
     if thread.owner_id != user_id {
         return Err(AuthError::Forbidden);
+    }
+    if thread.root_id.is_some() {
+        return Err(AuthError::InvalidInput);
     }
     Ok(thread)
 }
@@ -289,12 +359,45 @@ pub(crate) fn is_member(
 ) -> Result<bool, AuthError> {
     connection
         .query_row(
-            "SELECT 1 FROM collab_members WHERE thread_id = ?1 AND user_id = ?2",
+            "SELECT 1 FROM collab_threads t
+             JOIN collab_members m ON m.thread_id = COALESCE(t.root_id, t.id)
+             WHERE t.id = ?1 AND m.user_id = ?2",
             params![thread_id, user_id],
             |_| Ok(()),
         )
         .optional()
         .map(|row| row.is_some())
+        .map_err(db)
+}
+
+/// Usernames with access to `thread_id` (the root's members).
+pub(crate) fn member_names(
+    connection: &Connection,
+    thread_id: &str,
+) -> Result<Vec<String>, AuthError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT u.username FROM collab_members m JOIN auth_users u ON u.id = m.user_id
+             WHERE m.thread_id = (SELECT COALESCE(root_id, id) FROM collab_threads WHERE id = ?1)",
+        )
+        .map_err(db)?;
+    statement
+        .query_map([thread_id], |row| row.get::<_, String>(0))
+        .map_err(db)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db)
+}
+
+/// A root and every child under it: the threads whose sockets must
+/// re-check access when the root's membership changes.
+fn family_ids(connection: &Connection, root_id: &str) -> Result<Vec<String>, AuthError> {
+    let mut statement = connection
+        .prepare("SELECT id FROM collab_threads WHERE id = ?1 OR root_id = ?1")
+        .map_err(db)?;
+    statement
+        .query_map([root_id], |row| row.get::<_, String>(0))
+        .map_err(db)?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(db)
 }
 
@@ -577,7 +680,9 @@ pub(crate) fn pending_turns(
             "SELECT c.command_id, c.thread_id, c.seq, e.payload
              FROM collab_commands c
              JOIN collab_events e ON e.thread_id = c.thread_id AND e.seq = c.seq
-             JOIN collab_members m ON m.thread_id = c.thread_id AND m.user_id = c.author_id
+             JOIN collab_threads t ON t.id = c.thread_id
+             JOIN collab_members m
+                 ON m.thread_id = COALESCE(t.root_id, t.id) AND m.user_id = c.author_id
              WHERE c.author_id = ?1 AND c.kind = 'turn' AND c.state = 'pending'
              ORDER BY c.id LIMIT ?2",
         )
@@ -979,6 +1084,9 @@ async fn create_thread(
             access: AccessLevel::Invited,
             via: MemberVia::Owner,
             last_seq: event.seq,
+            parent_thread_id: None,
+            root_thread_id: None,
+            kind: None,
         })
     })
     .await?;
@@ -1010,6 +1118,9 @@ async fn list_threads(
                     access: untag(row.get(3)?)?,
                     via: untag(row.get(4)?)?,
                     last_seq: row.get(5)?,
+                    parent_thread_id: None,
+                    root_thread_id: None,
+                    kind: None,
                 })
             })
             .map_err(db)?
@@ -1032,7 +1143,8 @@ async fn get_thread(
         let mut statement = connection
             .prepare(
                 "SELECT u.username, m.via FROM collab_members m JOIN auth_users u ON u.id = m.user_id
-                 WHERE m.thread_id = ?1 ORDER BY m.added_at, u.username",
+                 WHERE m.thread_id = (SELECT COALESCE(root_id, id) FROM collab_threads WHERE id = ?1)
+                 ORDER BY m.added_at, u.username",
             )
             .map_err(db)?;
         let members = statement
@@ -1045,15 +1157,9 @@ async fn get_thread(
             .map_err(db)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db)?;
+        let last_seq = last_seq(connection, &thread_id)?;
         Ok(ThreadDetail {
-            summary: ThreadSummary {
-                last_seq: last_seq(connection, &thread_id)?,
-                thread_id,
-                title: thread.title,
-                owner: thread.owner,
-                access: thread.access,
-                via: thread.via,
-            },
+            summary: thread.summary(thread_id, last_seq),
             members,
         })
     })
@@ -1116,6 +1222,7 @@ async fn set_access(
                     [&thread_id],
                 )
                 .map_err(db)?;
+            let family = family_ids(connection, &thread_id)?;
             for member in removed {
                 append_event(
                     connection,
@@ -1127,7 +1234,9 @@ async fn set_access(
                     json!({"username": member.username}),
                     now,
                 )?;
-                outbox.removed.push((thread_id.clone(), member.username));
+                for id in &family {
+                    outbox.removed.push((id.clone(), member.username.clone()));
+                }
             }
         }
         if thread.access != input.access {
@@ -1142,7 +1251,7 @@ async fn set_access(
                 now,
             )?;
         }
-        outbox.access_changed.push(thread_id);
+        outbox.access_changed.extend(family_ids(connection, &thread_id)?);
         Ok(())
     })
     .await?;
@@ -1269,8 +1378,11 @@ async fn remove_member(
             json!({"username": member.username}),
             now,
         )?;
-        outbox.removed.push((thread_id.clone(), member.username));
-        outbox.access_changed.push(thread_id);
+        let family = family_ids(connection, &thread_id)?;
+        for id in &family {
+            outbox.removed.push((id.clone(), member.username.clone()));
+        }
+        outbox.access_changed.extend(family);
         Ok(())
     })
     .await?;
@@ -1324,14 +1436,8 @@ async fn join(
             )?;
         }
         let thread = member_thread(connection, &thread_id, identity.user_id)?;
-        Ok(ThreadSummary {
-            last_seq: last_seq(connection, &thread_id)?,
-            thread_id,
-            title: thread.title,
-            owner: thread.owner,
-            access: thread.access,
-            via: thread.via,
-        })
+        let last_seq = last_seq(connection, &thread_id)?;
+        Ok(thread.summary(thread_id, last_seq))
     })
     .await?;
     Ok(Json(summary))
@@ -1640,6 +1746,270 @@ async fn verdict(
     )
     .await?;
     Ok(Json(receipt))
+}
+
+async fn reopen_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((thread_id, seq)): Path<(String, i64)>,
+    Json(input): Json<ResolveRequest>,
+) -> Result<Json<CommandReceipt>, AuthError> {
+    let identity = mutating_session(&state, &headers).await?;
+    let thread = thread_id.clone();
+    let (receipt, _) = run_command(
+        &state,
+        identity,
+        thread_id,
+        input.command_id,
+        CommandKind::Reopen,
+        move |connection, outbox, identity, command_id, now| {
+            require_comment(connection, &thread, seq)?;
+            append_event(
+                connection,
+                outbox,
+                &thread,
+                EventKind::CommentReopened,
+                Some(identity),
+                Some(command_id),
+                json!({"comment_seq": seq}),
+                now,
+            )
+        },
+    )
+    .await?;
+    Ok(Json(receipt))
+}
+
+/// Only the comment's author may delete it (and its replies, implicitly).
+async fn delete_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((thread_id, seq)): Path<(String, i64)>,
+    Json(input): Json<ResolveRequest>,
+) -> Result<Json<CommandReceipt>, AuthError> {
+    let identity = mutating_session(&state, &headers).await?;
+    let thread = thread_id.clone();
+    let (receipt, _) = run_command(
+        &state,
+        identity,
+        thread_id,
+        input.command_id,
+        CommandKind::Delete,
+        move |connection, outbox, identity, command_id, now| {
+            require_comment(connection, &thread, seq)?;
+            let author: Option<i64> = connection
+                .query_row(
+                    "SELECT author_id FROM collab_events WHERE thread_id = ?1 AND seq = ?2",
+                    params![thread, seq],
+                    |row| row.get(0),
+                )
+                .map_err(db)?;
+            if author != Some(identity.user_id) {
+                return Err(AuthError::Forbidden);
+            }
+            append_event(
+                connection,
+                outbox,
+                &thread,
+                EventKind::CommentDeleted,
+                Some(identity),
+                Some(command_id),
+                json!({"comment_seq": seq}),
+                now,
+            )
+        },
+    )
+    .await?;
+    Ok(Json(receipt))
+}
+
+fn valid_label(text: &str, max: usize) -> bool {
+    !text.is_empty()
+        && text.len() <= max
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+}
+
+/// Create a child thread (subthread, fork or subagent) under any thread of
+/// a family. Any member may: the child is how their own agent's work in the
+/// shared thread stays visible. The child inherits the root's membership;
+/// a `child_thread_added` event in the parent's log announces it.
+async fn create_child(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(parent_id): Path<String>,
+    Json(input): Json<CreateChildRequest>,
+) -> Result<(StatusCode, Json<ChildCreated>), AuthError> {
+    let identity = mutating_session(&state, &headers).await?;
+    validate_thread_id(&parent_id)?;
+    validate_command_id(&input.command_id)?;
+    validate_text(&input.title, MAX_TITLE_BYTES, false)?;
+    if !valid_label(&input.kind, 32)
+        || input
+            .subagent
+            .as_ref()
+            .is_some_and(|value| !value.is_object() || json_len(value) > MAX_CHILD_SUBAGENT_BYTES)
+        || input
+            .fork_origin
+            .as_deref()
+            .is_some_and(|origin| !valid_label(origin, MAX_FORK_ORIGIN_BYTES))
+    {
+        return Err(AuthError::InvalidInput);
+    }
+    let now = state.auth.now();
+    let child_id = random_hex(16)?;
+    let created = write(&state, move |connection, outbox| {
+        let parent = member_thread(connection, &parent_id, identity.user_id)?;
+        if let Some(receipt) = existing_command(
+            connection,
+            identity.user_id,
+            &input.command_id,
+            &parent_id,
+            CommandKind::Child,
+        )? {
+            // A retry: the child created the first time.
+            let payload: String = connection
+                .query_row(
+                    "SELECT payload FROM collab_events WHERE thread_id = ?1 AND seq = ?2",
+                    params![parent_id, receipt.seq],
+                    |row| row.get(0),
+                )
+                .map_err(db)?;
+            let child = serde_json::from_str::<Value>(&payload)
+                .ok()
+                .and_then(|v| v["child_thread_id"].as_str().map(str::to_owned))
+                .ok_or(AuthError::Database)?;
+            let row = member_thread(connection, &child, identity.user_id)?;
+            let last = last_seq(connection, &child)?;
+            return Ok(ChildCreated {
+                thread: row.summary(child, last),
+                seq: receipt.seq,
+            });
+        }
+        let root = parent.root_id.clone().unwrap_or_else(|| parent_id.clone());
+        let children: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM collab_threads WHERE root_id = ?1",
+                [&root],
+                |row| row.get(0),
+            )
+            .map_err(db)?;
+        if children >= MAX_CHILDREN_PER_ROOT {
+            return Err(AuthError::RateLimited);
+        }
+        connection
+            .execute(
+                "INSERT INTO collab_threads
+                     (id, owner_id, title, access, created_at, parent_id, root_id, kind)
+                 VALUES (?1, ?2, ?3, 'invited', ?4, ?5, ?6, ?7)",
+                params![
+                    child_id,
+                    identity.user_id,
+                    input.title,
+                    now,
+                    parent_id,
+                    root,
+                    input.kind
+                ],
+            )
+            .map_err(db)?;
+        let event = append_event(
+            connection,
+            outbox,
+            &parent_id,
+            EventKind::ChildThreadAdded,
+            Some(&identity),
+            Some(&input.command_id),
+            json!({
+                "child_thread_id": child_id,
+                "title": input.title,
+                "kind": input.kind,
+                "subagent": input.subagent,
+                "fork_origin": input.fork_origin,
+            }),
+            now,
+        )?;
+        insert_command(
+            connection,
+            identity.user_id,
+            &input.command_id,
+            &parent_id,
+            CommandKind::Child,
+            CommandState::Applied,
+            event.seq,
+            now,
+        )?;
+        let row = member_thread(connection, &child_id, identity.user_id)?;
+        Ok(ChildCreated {
+            thread: row.summary(child_id, 0),
+            seq: event.seq,
+        })
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// Append a batch of history, activity, changes or status events authored
+/// by the caller, in order and in one transaction. Each event is idempotent
+/// by its `command_id`. Counted as one mutation for rate limiting.
+async fn publish(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(thread_id): Path<String>,
+    Json(input): Json<PublishRequest>,
+) -> Result<Json<PublishResponse>, AuthError> {
+    let identity = mutating_session(&state, &headers).await?;
+    validate_thread_id(&thread_id)?;
+    if input.events.is_empty() || input.events.len() > MAX_PUBLISH_EVENTS {
+        return Err(AuthError::InvalidInput);
+    }
+    for event in &input.events {
+        validate_command_id(&event.command_id)?;
+        if !event.payload.is_object() || json_len(&event.payload) > MAX_PUBLISH_PAYLOAD_BYTES {
+            return Err(AuthError::InvalidInput);
+        }
+    }
+    let now = state.auth.now();
+    let receipts = write(&state, move |connection, outbox| {
+        member_thread(connection, &thread_id, identity.user_id)?;
+        let mut receipts = Vec::with_capacity(input.events.len());
+        for event in input.events {
+            if let Some(receipt) = existing_command(
+                connection,
+                identity.user_id,
+                &event.command_id,
+                &thread_id,
+                CommandKind::Publish,
+            )? {
+                receipts.push(receipt);
+                continue;
+            }
+            let appended = append_event(
+                connection,
+                outbox,
+                &thread_id,
+                event.kind.event_kind(),
+                Some(&identity),
+                Some(&event.command_id),
+                event.payload,
+                now,
+            )?;
+            receipts.push(insert_command(
+                connection,
+                identity.user_id,
+                &event.command_id,
+                &thread_id,
+                CommandKind::Publish,
+                CommandState::Applied,
+                appended.seq,
+                now,
+            )?);
+        }
+        Ok(receipts)
+    })
+    .await?;
+    Ok(Json(PublishResponse { receipts }))
 }
 
 async fn create_runner(

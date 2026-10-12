@@ -28,7 +28,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Bumped on any breaking change to the types in this crate.
-pub const COLLAB_PROTOCOL_VERSION: u32 = 1;
+pub const COLLAB_PROTOCOL_VERSION: u32 = 2;
+
+/// Largest payload of one published event (`POST /threads/{id}/publish`).
+pub const MAX_PUBLISH_PAYLOAD_BYTES: usize = 192 * 1024;
+/// Events per publish batch.
+pub const MAX_PUBLISH_EVENTS: usize = 64;
+/// Body limit of the publish route (a whole batch).
+pub const PUBLISH_BODY_LIMIT: usize = 1024 * 1024;
 
 /// Who may open a thread besides its owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +88,48 @@ pub enum EventKind {
     MemberRemoved,
     /// `{"access": ...}`. Never carries the link token.
     AccessChanged,
+    /// A transcript message published by the participant whose daemon holds
+    /// it (history backfill on share, then every new local message):
+    /// `{"origin", "role", "content", "annotation", "created_at",
+    /// "activity_parts"}`. See ADR 0013.
+    HistoryMessage,
+    /// One part of the tool activity of the turn a `history_message` ends,
+    /// published before that message: `{"origin", "part", "parts", "items"}`.
+    HistoryActivity,
+    /// The publisher's diff of its checkouts: `{"captured_at", "base",
+    /// "repos": [RepoChanges]}` (bounded).
+    ChangesSnapshot,
+    /// A subagent child's task state: `{"status", "detail"}`.
+    SubagentStatus,
+    /// `{"comment_seq": <seq of comment_created>}`; only its author deletes.
+    CommentDeleted,
+    /// `{"comment_seq": <seq of comment_created>}`.
+    CommentReopened,
+    /// A child thread (subthread, fork or subagent) was created under this
+    /// thread: `{"child_thread_id", "title", "kind", "subagent",
+    /// "fork_origin"}`. Appended to the parent's log by the service.
+    ChildThreadAdded,
+}
+
+/// Event kinds a member may append through `POST /threads/{id}/publish`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishKind {
+    HistoryMessage,
+    HistoryActivity,
+    ChangesSnapshot,
+    SubagentStatus,
+}
+
+impl PublishKind {
+    pub fn event_kind(self) -> EventKind {
+        match self {
+            Self::HistoryMessage => EventKind::HistoryMessage,
+            Self::HistoryActivity => EventKind::HistoryActivity,
+            Self::ChangesSnapshot => EventKind::ChangesSnapshot,
+            Self::SubagentStatus => EventKind::SubagentStatus,
+        }
+    }
 }
 
 /// One entry of the durable, ordered per-thread log.
@@ -103,6 +152,12 @@ pub enum CommandKind {
     Comment,
     Resolve,
     Verdict,
+    /// One event of a publish batch.
+    Publish,
+    /// Creation of a child thread.
+    Child,
+    Reopen,
+    Delete,
 }
 
 /// Turn commands move `pending -> claimed -> completed|failed`, or
@@ -166,9 +221,18 @@ pub struct ThreadSummary {
     pub title: String,
     pub owner: String,
     pub access: AccessLevel,
-    /// The caller's own membership.
+    /// The caller's own membership (of the root thread, for a child).
     pub via: MemberVia,
     pub last_seq: i64,
+    /// Set for a child thread: its parent, and the root whose membership
+    /// it inherits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_thread_id: Option<String>,
+    /// Child kind label (`sub`, `review`, `land`, `fork`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +309,54 @@ pub struct VerdictRequest {
     pub verdict: Verdict,
     #[serde(default)]
     pub body: Option<String>,
+}
+
+/// One event of a publish batch. `command_id` makes it idempotent: a retry
+/// returns the original receipt and appends nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishEvent {
+    pub command_id: String,
+    pub kind: PublishKind,
+    pub payload: Value,
+}
+
+/// Up to [`MAX_PUBLISH_EVENTS`] events appended in order, in one
+/// transaction, counted as one mutation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishRequest {
+    pub events: Vec<PublishEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublishResponse {
+    pub receipts: Vec<CommandReceipt>,
+}
+
+/// Create a child thread under `/threads/{parent}`. The child inherits the
+/// root's membership; a `child_thread_added` event is appended to the
+/// parent's log in the same transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateChildRequest {
+    pub command_id: String,
+    pub title: String,
+    /// Kind label: `sub`, `review`, `land` or `fork`.
+    pub kind: String,
+    /// Subagent profile and status (opaque, at most 1 KiB).
+    #[serde(default)]
+    pub subagent: Option<Value>,
+    /// Origin key of the parent message a fork continues from.
+    #[serde(default)]
+    pub fork_origin: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChildCreated {
+    pub thread: ThreadSummary,
+    /// Sequence number of the `child_thread_added` event in the parent log.
+    pub seq: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

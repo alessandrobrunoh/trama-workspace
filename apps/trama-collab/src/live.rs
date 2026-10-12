@@ -16,7 +16,9 @@ use crate::AuthError;
 const THREAD_CHANNEL_CAPACITY: usize = 1024;
 const RUNNER_CHANNEL_CAPACITY: usize = 256;
 /// Open WebSocket connections (client + runner) allowed per user.
-pub(crate) const MAX_SOCKETS_PER_USER: usize = 32;
+/// A shared family keeps one client socket per thread (root, subthreads,
+/// subagents), so this is well above a single thread's needs.
+pub(crate) const MAX_SOCKETS_PER_USER: usize = 128;
 /// HTTP mutations allowed per user per window.
 const MAX_MUTATIONS_PER_WINDOW: usize = 240;
 const MUTATION_WINDOW_SECS: i64 = 60;
