@@ -17,6 +17,8 @@ Subthreads (plain, review, land) are children of a top-level thread and cannot n
 
 Comments anchor to a transcript span (byte range of the message text), to code lines in a thread's checkout, or to a diff hunk, and support replies and resolve/reopen. A new comment is pending until the next prompt (or an explicit **send comments**): the agent then receives a `<review-comments>` block quoting each anchored passage, followed by the user's text, and the stored user message is exactly what was sent. Delivered comments record the prompt and turn that carried them and the assistant message that answered. Code anchors are relocated against the current checkout on every listing (resolved line, fuzzy, or orphaned; never reattached silently). A subthread's comments stay in that subthread.
 
+Shared threads (protocol v8) go through a separate, loopback-only collaboration service (`apps/trama-collab`, ADR 0008/0009). `ConnectCollab` signs the daemon in with a username and password and stores the session token and a runner token owner-only in `<app dir>/collab-credentials.json` (the password is not stored; tokens are never logged). A top-level thread can be shared (invite or link access) or a shared thread joined into a new local thread with this machine's own checkouts. Sending in a shared thread submits the turn to the service; the daemon's runner then claims it back and runs it locally through the normal send path (checkout, approvals, billing guard). A turn always runs on the machine of the person who pressed Send with that person's `claude` login: the runner only claims turns this daemon submitted, whose shared-log author is the signed-in user, and refuses a runner token of another user. Other participants' messages, answers, comments, verdicts and change summaries are mirrored into the local transcript (actor `collab:<username>`) from a cursor stored in TramaDB, so reconnects neither skip nor duplicate; live agent output, drafts and presence are relayed but not stored. A claim the daemon cannot confirm (lost connection, restart) is marked ambiguous and never retried.
+
 ## Crate map
 
 ```
@@ -57,11 +59,11 @@ Do not override `HOME` for that: the `claude` child process needs your real
 Starting the binaries directly does not acquire Cargo's build lock. Do not
 start parallel `cargo run`/check/test commands while building. The desktop also
 offers **Start daemon** when the sibling binary is installed and no daemon is
-listening. Stop old app/daemon processes before restarting with protocol v7.
+listening. Stop old app/daemon processes before restarting with protocol v8.
 Build profiles and editor-check settings are described in
 [build and disk usage](docs/build-and-space.md).
 
-The UI and daemon speak newline-delimited JSON (`crates/trama-protocol`). First message on a connection must be `Hello` with `protocol_version = 7`. A mismatch is rejected at the handshake; it does not rewrite stored threads or workspace ids. See [onboarding and legacy migration](docs/onboarding-and-migration.md).
+The UI and daemon speak newline-delimited JSON (`crates/trama-protocol`). First message on a connection must be `Hello` with `protocol_version = 8`. A mismatch is rejected at the handshake; it does not rewrite stored threads or workspace ids. See [onboarding and legacy migration](docs/onboarding-and-migration.md).
 
 ## Roadmap
 

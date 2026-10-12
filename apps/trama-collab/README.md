@@ -17,6 +17,12 @@ runner credential belongs to exactly one user and can only claim turns that
 user authored. Participants without a runner can read, comment and review;
 their sends stay `pending` until their own runner is online.
 
+The TramaWorkspace daemon is the client and runner (protocol v8
+`ConnectCollab`): it signs in with username and password, uses a runner token
+from `create-runner` (or provisions one through `POST /runners`), and stores
+both owner-only in its app dir. Its runner claims only turns that daemon
+submitted for its own user. See `apps/trama-daemon/src/collab`.
+
 ## Local use
 
 Build with the repository's Rust toolchain, then create a user interactively

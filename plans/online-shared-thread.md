@@ -97,8 +97,24 @@ cursor catch-up and live WebSocket delivery, ephemeral drafts and presence,
 idempotent commands, and runner credentials with owner-only conditional
 claims and ambiguous-on-loss. Wire types are in `crates/trama-collab-protocol`.
 
+The daemon side is implemented in `apps/trama-daemon/src/collab` (protocol
+v7): credentials stored owner-only in the app dir, share/join/list/members,
+per-thread mirror sockets resuming from a TramaDB cursor (migration 0006),
+publication of local comments and review verdicts, and the runner loop. The
+runner claims only turns this daemon submitted, after checking that the
+service's hello names the signed-in user and that the durable
+`message_appended` event is authored by that user with the same text; a turn
+it cannot confirm is marked ambiguous and never rerun. Tests run two daemons
+with fake adapters and separate data dirs against the real service in
+process.
+
 ## Verification limits
 
-Desktop and daemon integration are not built: no client renders shared
-threads and the daemon does not act as a runner yet. The service remains
-loopback-only with no public endpoint or production deployment.
+The desktop does not render shared threads or offer the v7 commands yet. A
+turn is run only by the daemon that submitted it, so a user's turn sent from
+another client stays pending. Local comment deletion and reopening, and the
+transcript from before a thread was shared, are not published; local
+comments and verdicts are published best effort (no durable outbox). The
+service remains loopback-only with no public endpoint or production
+deployment, and the daemon has no TLS client, so it only accepts loopback
+`http://` collab URLs.
