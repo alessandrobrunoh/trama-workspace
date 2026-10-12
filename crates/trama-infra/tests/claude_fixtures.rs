@@ -36,6 +36,11 @@ fn simple_text_turn() {
                 "agent_version": "2.1.296",
                 "permission_mode": "default"
             },
+            {
+                "type": "commands_reported",
+                "slash_commands": ["compact"],
+                "skills": []
+            },
             { "type": "text_delta", "text": "Hello from Claude." },
             {
                 "type": "usage_reported",
@@ -203,6 +208,11 @@ fn subscription_init_reports_subscription_billing() {
                 "api_key_source": "none",
                 "agent_version": "2.1.296",
                 "permission_mode": "default"
+            },
+            {
+                "type": "commands_reported",
+                "slash_commands": ["compact"],
+                "skills": []
             }
         ])
     );

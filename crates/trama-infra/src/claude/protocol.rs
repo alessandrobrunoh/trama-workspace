@@ -50,6 +50,12 @@ pub struct SystemLine {
     pub api_key_source: Option<String>,
     #[serde(default)]
     pub claude_code_version: Option<String>,
+    /// Command names usable in this session (strings; shape kept opaque).
+    #[serde(default)]
+    pub slash_commands: Value,
+    /// Skill names usable in this session (strings; shape kept opaque).
+    #[serde(default)]
+    pub skills: Value,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

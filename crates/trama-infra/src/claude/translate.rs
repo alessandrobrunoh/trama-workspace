@@ -94,6 +94,37 @@ fn translate_system(sys: &SystemLine, state: &mut TranslateState, events: &mut V
         agent_version: sys.claude_code_version.clone(),
         permission_mode: sys.permission_mode.clone(),
     });
+    let slash_commands = command_names(&sys.slash_commands);
+    let skills = command_names(&sys.skills);
+    if !slash_commands.is_empty() || !skills.is_empty() {
+        events.push(AgentEvent::CommandsReported {
+            slash_commands,
+            skills,
+        });
+    }
+}
+
+/// Names from an init list. Entries may be strings or objects with a
+/// `name`; a leading `/` is dropped. Bounded so a huge list cannot bloat
+/// the stored state.
+fn command_names(value: &serde_json::Value) -> Vec<String> {
+    const MAX_NAMES: usize = 1_000;
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            serde_json::Value::String(name) => Some(name.as_str()),
+            serde_json::Value::Object(map) => map.get("name").and_then(|name| name.as_str()),
+            _ => None,
+        })
+        .map(|name| name.trim().trim_start_matches('/').to_owned())
+        .filter(|name| !name.is_empty() && name.len() <= 200)
+        .take(MAX_NAMES)
+        .collect();
+    names.dedup();
+    names
 }
 
 /// Map Claude Code's `apiKeySource` to what the session bills against.
@@ -335,6 +366,29 @@ mod tests {
                     "is_error": false
                 }
             ])
+        );
+    }
+
+    #[test]
+    fn init_reports_slash_commands_and_skills_without_slashes() {
+        let ndjson = r#"{"type":"system","subtype":"init","session_id":"s","model":"m","apiKeySource":"none","slash_commands":["compact","/review",{"name":"land"},7,""],"skills":["land"]}"#;
+        let lines = parse_ndjson(ndjson).unwrap();
+        let events = translate_lines(&lines);
+        let reported: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::CommandsReported { .. }))
+            .collect();
+        assert_eq!(
+            serde_json::to_value(reported).unwrap(),
+            serde_json::json!([{"type":"commands_reported",
+                "slash_commands":["compact","review","land"],"skills":["land"]}])
+        );
+        // An init without lists reports nothing extra.
+        let bare = parse_ndjson(r#"{"type":"system","subtype":"init","session_id":"s"}"#).unwrap();
+        assert!(
+            !translate_lines(&bare)
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CommandsReported { .. }))
         );
     }
 }

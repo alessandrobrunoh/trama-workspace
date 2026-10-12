@@ -186,6 +186,15 @@ pub enum AgentEvent {
     Failed {
         message: String,
     },
+    /// Slash commands and skills the agent reported at session start
+    /// (Claude's `system/init` `slash_commands` / `skills`), names without
+    /// the leading `/`.
+    CommandsReported {
+        #[serde(default)]
+        slash_commands: Vec<String>,
+        #[serde(default)]
+        skills: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +328,13 @@ mod tests {
                 label: Some("explore".into()),
             },
             r#"{"type":"subagent_started","parent_tool_use_id":"t1","label":"explore"}"#,
+        );
+        assert_stable(
+            &AgentEvent::CommandsReported {
+                slash_commands: vec!["compact".into()],
+                skills: vec!["land".into()],
+            },
+            r#"{"type":"commands_reported","slash_commands":["compact"],"skills":["land"]}"#,
         );
         assert_stable(
             &AgentEvent::SubagentFinished {

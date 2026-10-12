@@ -813,7 +813,8 @@ impl ChatPanel {
             | AgentEvent::SessionInfo { .. }
             | AgentEvent::ApprovalResolved { .. }
             | AgentEvent::SubagentStarted { .. }
-            | AgentEvent::SubagentFinished { .. } => {}
+            | AgentEvent::SubagentFinished { .. }
+            | AgentEvent::CommandsReported { .. } => {}
         }
     }
 
