@@ -872,6 +872,46 @@ impl SessionManager {
         }
     }
 
+    /// Receive the thread's live broadcasts without the history replay of
+    /// [`Self::subscribe`]. Used by the collab runner to stream a turn.
+    pub(crate) fn watch_thread(
+        &self,
+        thread_id: &ThreadId,
+        tx: mpsc::UnboundedSender<DaemonMessage>,
+    ) -> SubscriptionId {
+        let mut inner = self.lock();
+        let id = SubscriptionId(inner.next_sub);
+        inner.next_sub += 1;
+        let thread = inner.threads.entry(thread_id.clone()).or_default();
+        thread.subscribers.push(Subscriber { id, tx });
+        id
+    }
+
+    /// Any exclusive operation (turn, migration, checkout copy) holds the thread.
+    pub(crate) fn thread_busy(&self, thread_id: &ThreadId) -> bool {
+        self.lock()
+            .threads
+            .get(thread_id)
+            .is_some_and(|thread| thread.reservation.is_some())
+    }
+
+    /// An agent turn is in flight (accepted and not yet terminal).
+    pub(crate) fn turn_running(&self, thread_id: &ThreadId) -> bool {
+        self.lock()
+            .threads
+            .get(thread_id)
+            .is_some_and(|thread| thread.reservation == Some(Reservation::Turn))
+    }
+
+    pub(crate) fn db(&self) -> &TramaDb {
+        &self.db
+    }
+
+    /// Send `message` to the thread's subscribers.
+    pub(crate) fn notify(&self, thread_id: &ThreadId, message: DaemonMessage) {
+        self.broadcast(thread_id, message);
+    }
+
     pub fn unsubscribe_all(&self, subs: &[(ThreadId, SubscriptionId)]) {
         let mut inner = self.lock();
         for (thread_id, sub_id) in subs {
@@ -1446,7 +1486,7 @@ impl SessionManager {
     /// Persist one system message (row plus `MessageAdded` event) and
     /// broadcast it, so the outcome is visible after a restart. A store
     /// failure is logged; it must not lose the in-memory turn state cleanup.
-    async fn append_system_notice(&self, thread_id: &ThreadId, text: String) {
+    pub(crate) async fn append_system_notice(&self, thread_id: &ThreadId, text: String) {
         let message = Message {
             id: MessageId::generate(),
             thread_id: thread_id.clone(),

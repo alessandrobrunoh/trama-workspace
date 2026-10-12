@@ -116,7 +116,8 @@ fn hook(mgr: &SessionManager, token: &str, tool: &str) -> JoinHandle<HookDecisio
     let sessions = mgr.clone();
     let (shutdown, _) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = handle_connection(server, sessions, shutdown).await;
+        let collab = crate::collab::CollabService::disabled(sessions.clone());
+        let _ = handle_connection(server, sessions, collab, shutdown).await;
     });
     let token = token.to_string();
     let tool = tool.to_string();

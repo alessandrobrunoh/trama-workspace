@@ -1,7 +1,8 @@
 //! Per-connection JSON-lines handler.
 
 use crate::approval::HookDecision;
-use crate::error::Result;
+use crate::collab::CollabService;
+use crate::error::{DaemonError, Result};
 use crate::session::{ApprovalWait, SessionManager, SubscriptionId};
 use std::collections::HashMap;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -16,6 +17,7 @@ const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub async fn handle_connection<S>(
     stream: S,
     sessions: SessionManager,
+    collab: CollabService,
     shutdown: watch::Sender<bool>,
 ) -> Result<()>
 where
@@ -76,6 +78,7 @@ where
                         match handle_line(
                             &line,
                             &sessions,
+                            &collab,
                             &out_tx,
                             &mut subscriptions,
                             &shutdown,
@@ -204,6 +207,7 @@ async fn write_msg<W: AsyncWrite + Unpin>(writer: &mut W, msg: &DaemonMessage) -
 async fn handle_line(
     line: &str,
     sessions: &SessionManager,
+    collab: &CollabService,
     out_tx: &mpsc::UnboundedSender<DaemonMessage>,
     subscriptions: &mut HashMap<ThreadId, SubscriptionId>,
     shutdown: &watch::Sender<bool>,
@@ -258,14 +262,29 @@ async fn handle_line(
             mentions,
             terminals,
         } => {
-            let context = crate::session::PromptContext {
-                mentions,
-                terminals,
+            // A shared thread's turn goes through the collab service; this
+            // daemon's runner claims it back and runs it here (ADR 0008).
+            // Mentions and terminal attachments only apply to local turns.
+            let sent = match collab.link(&thread_id).await {
+                Ok(Some(link)) => collab.submit_turn(&link, text).await.map(|command_id| {
+                    let _ = out_tx.send(DaemonMessage::CollabTurnQueued {
+                        thread_id: thread_id.clone(),
+                        command_id,
+                    });
+                }),
+                Ok(None) => {
+                    let context = crate::session::PromptContext {
+                        mentions,
+                        terminals,
+                    };
+                    sessions
+                        .send_prompt_with_context(thread_id.clone(), text, context)
+                        .await
+                        .map(|_| ())
+                }
+                Err(error) => Err(error),
             };
-            if let Err(error) = sessions
-                .send_prompt_with_context(thread_id.clone(), text, context)
-                .await
-            {
+            if let Err(error) = sent {
                 let message = error.to_string();
                 let _ = out_tx.send(DaemonMessage::Error {
                     code: error.code().into(),
@@ -374,6 +393,7 @@ async fn handle_line(
             let parent_thread_id = sessions
                 .submit_review_verdict(&review_thread_id, verdict.clone())
                 .await?;
+            collab.publish_verdict(parent_thread_id.clone(), verdict.clone());
             let _ = out_tx.send(DaemonMessage::ReviewVerdictPosted {
                 review_thread_id,
                 parent_thread_id,
@@ -381,7 +401,14 @@ async fn handle_line(
             });
         }
         ClientMessage::SendComments { thread_id } => {
-            if let Err(error) = sessions.send_comments(thread_id.clone()).await {
+            let sent = match collab.link(&thread_id).await {
+                Ok(Some(_)) => Err(DaemonError::Invalid(
+                    "in a shared thread, pending comments go out with your next message".into(),
+                )),
+                Ok(None) => sessions.send_comments(thread_id.clone()).await.map(|_| ()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = sent {
                 let message = error.to_string();
                 let _ = out_tx.send(DaemonMessage::Error {
                     code: error.code().into(),
@@ -404,6 +431,7 @@ async fn handle_line(
             let snapshot = sessions
                 .create_comment(thread_id.clone(), target, body, parent_comment_id)
                 .await?;
+            collab.publish_comment(snapshot.clone());
             if !subscriptions.contains_key(&thread_id) {
                 let _ = out_tx.send(DaemonMessage::CommentCreated(snapshot));
             }
@@ -417,6 +445,7 @@ async fn handle_line(
         }
         ClientMessage::ResolveComment { comment_id } => {
             let snapshot = sessions.resolve_comment(&comment_id).await?;
+            collab.publish_resolve(comment_id);
             if !subscriptions.contains_key(&snapshot.thread_id) {
                 let _ = out_tx.send(DaemonMessage::CommentUpdated(snapshot));
             }
@@ -506,6 +535,66 @@ async fn handle_line(
         }
         ClientMessage::ReplayTerminal { terminal_id } => {
             let _ = out_tx.send(sessions.replay_terminal(&terminal_id)?);
+        }
+        ClientMessage::ConnectCollab {
+            server_url,
+            username,
+            password,
+            runner_token,
+        } => {
+            let status = collab
+                .connect(server_url, username, password, runner_token)
+                .await?;
+            let _ = out_tx.send(DaemonMessage::CollabStatus(status));
+        }
+        ClientMessage::DisconnectCollab { forget } => {
+            let status = collab.disconnect(forget).await?;
+            let _ = out_tx.send(DaemonMessage::CollabStatus(status));
+        }
+        ClientMessage::GetCollabStatus => {
+            let _ = out_tx.send(DaemonMessage::CollabStatus(collab.status().await?));
+        }
+        ClientMessage::ShareThread {
+            thread_id,
+            access,
+            invite,
+        } => {
+            let shared = collab.share_thread(&thread_id, access, invite).await?;
+            let _ = out_tx.send(DaemonMessage::SharedThread(shared));
+        }
+        ClientMessage::GetSharedThread { thread_id } => {
+            let shared = collab.shared_thread(&thread_id).await?;
+            let _ = out_tx.send(DaemonMessage::SharedThread(shared));
+        }
+        ClientMessage::RemoveSharedThreadMember {
+            thread_id,
+            username,
+        } => {
+            let shared = collab.remove_member(&thread_id, &username).await?;
+            let _ = out_tx.send(DaemonMessage::SharedThread(shared));
+        }
+        ClientMessage::JoinSharedThread {
+            workspace_id,
+            collab_thread_id,
+            link_token,
+        } => {
+            let (thread, shared) = collab
+                .join(workspace_id, collab_thread_id, link_token)
+                .await?;
+            let _ = out_tx.send(DaemonMessage::SharedThreadJoined { thread, shared });
+        }
+        ClientMessage::ListSharedThreads => {
+            let _ = out_tx.send(DaemonMessage::SharedThreads(collab.list_shared().await?));
+        }
+        ClientMessage::UnlinkSharedThread { thread_id } => {
+            collab.unlink(&thread_id).await?;
+            let _ = out_tx.send(DaemonMessage::SharedThreadUnlinked { thread_id });
+        }
+        ClientMessage::SetCollabDraft { thread_id, text } => {
+            collab.set_draft(&thread_id, text)?;
+        }
+        ClientMessage::SetCollabPresence { thread_id, state } => {
+            collab.set_presence(&thread_id, state)?;
         }
         ClientMessage::Shutdown => {
             let _ = shutdown.send(true);
@@ -610,7 +699,16 @@ mod tests {
         .unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (shutdown, _) = watch::channel(false);
-        let result = handle_line(&line, &sessions, &tx, &mut HashMap::new(), &shutdown).await;
+        let collab = CollabService::disabled(sessions.clone());
+        let result = handle_line(
+            &line,
+            &sessions,
+            &collab,
+            &tx,
+            &mut HashMap::new(),
+            &shutdown,
+        )
+        .await;
         assert!(
             result.is_ok(),
             "a rejected prompt must keep the connection usable"
@@ -659,11 +757,19 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (shutdown, _) = watch::channel(false);
         let mut subscriptions = HashMap::new();
+        let collab = CollabService::disabled(sessions.clone());
 
         // Not subscribed: the requester gets the reply directly.
-        handle_line(&create, &sessions, &tx, &mut subscriptions, &shutdown)
-            .await
-            .unwrap();
+        handle_line(
+            &create,
+            &sessions,
+            &collab,
+            &tx,
+            &mut subscriptions,
+            &shutdown,
+        )
+        .await
+        .unwrap();
         let first = match rx.try_recv().unwrap() {
             DaemonMessage::CommentCreated(snapshot) => snapshot,
             other => panic!("expected comment_created, got {other:?}"),
@@ -676,13 +782,27 @@ mod tests {
             thread_id: thread.id.clone(),
         })
         .unwrap();
-        handle_line(&subscribe, &sessions, &tx, &mut subscriptions, &shutdown)
-            .await
-            .unwrap();
+        handle_line(
+            &subscribe,
+            &sessions,
+            &collab,
+            &tx,
+            &mut subscriptions,
+            &shutdown,
+        )
+        .await
+        .unwrap();
         while rx.try_recv().is_ok() {}
-        handle_line(&create, &sessions, &tx, &mut subscriptions, &shutdown)
-            .await
-            .unwrap();
+        handle_line(
+            &create,
+            &sessions,
+            &collab,
+            &tx,
+            &mut subscriptions,
+            &shutdown,
+        )
+        .await
+        .unwrap();
         let second = match rx.try_recv().unwrap() {
             DaemonMessage::CommentCreated(snapshot) => snapshot,
             other => panic!("expected comment_created, got {other:?}"),
@@ -693,9 +813,16 @@ mod tests {
             comment_id: second.id.clone(),
         })
         .unwrap();
-        handle_line(&delete, &sessions, &tx, &mut subscriptions, &shutdown)
-            .await
-            .unwrap();
+        handle_line(
+            &delete,
+            &sessions,
+            &collab,
+            &tx,
+            &mut subscriptions,
+            &shutdown,
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             rx.try_recv().unwrap(),
             DaemonMessage::CommentDeleted { comment_ids, .. } if comment_ids == vec![second.id.clone()]
@@ -706,9 +833,16 @@ mod tests {
             thread_id: thread.id.clone(),
         })
         .unwrap();
-        handle_line(&list, &sessions, &tx, &mut subscriptions, &shutdown)
-            .await
-            .unwrap();
+        handle_line(
+            &list,
+            &sessions,
+            &collab,
+            &tx,
+            &mut subscriptions,
+            &shutdown,
+        )
+        .await
+        .unwrap();
         match rx.try_recv().unwrap() {
             DaemonMessage::Comments { comments, .. } => {
                 assert_eq!(comments.len(), 1);
@@ -722,9 +856,16 @@ mod tests {
             comment_id: first.id.clone(),
         })
         .unwrap();
-        handle_line(&resolve, &sessions, &tx, &mut subscriptions, &shutdown)
-            .await
-            .unwrap();
+        handle_line(
+            &resolve,
+            &sessions,
+            &collab,
+            &tx,
+            &mut subscriptions,
+            &shutdown,
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             rx.try_recv().unwrap(),
             DaemonMessage::CommentUpdated(snapshot) if snapshot.id == first.id
@@ -733,9 +874,16 @@ mod tests {
             thread_id: thread.id.clone(),
         })
         .unwrap();
-        handle_line(&send, &sessions, &tx, &mut subscriptions, &shutdown)
-            .await
-            .unwrap();
+        handle_line(
+            &send,
+            &sessions,
+            &collab,
+            &tx,
+            &mut subscriptions,
+            &shutdown,
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             rx.try_recv().unwrap(),
             DaemonMessage::Error { code, .. } if code == "invalid"
@@ -755,7 +903,8 @@ mod tests {
         let sessions = test_sessions().await;
         let (shutdown, _rx) = watch::channel(false);
         tokio::spawn(async move {
-            let _ = handle_connection(server, sessions, shutdown).await;
+            let collab = CollabService::disabled(sessions.clone());
+            let _ = handle_connection(server, sessions, collab, shutdown).await;
         });
         let (client_read, mut client_write) = tokio::io::split(client);
         let mut reader = BufReader::new(client_read);
@@ -867,7 +1016,8 @@ mod tests {
         let sessions = test_sessions().await;
         let (shutdown, _rx) = watch::channel(false);
         tokio::spawn(async move {
-            let _ = handle_connection(server, sessions, shutdown).await;
+            let collab = CollabService::disabled(sessions.clone());
+            let _ = handle_connection(server, sessions, collab, shutdown).await;
         });
 
         let (client_read, mut client_write) = tokio::io::split(client);
@@ -1002,7 +1152,8 @@ mod tests {
         let sessions = test_sessions().await;
         let (shutdown, _rx) = watch::channel(false);
         tokio::spawn(async move {
-            let _ = handle_connection(server, sessions, shutdown).await;
+            let collab = CollabService::disabled(sessions.clone());
+            let _ = handle_connection(server, sessions, collab, shutdown).await;
         });
         let (client_read, mut client_write) = tokio::io::split(client);
         let mut reader = BufReader::new(client_read);
@@ -1026,7 +1177,8 @@ mod tests {
         let sessions = test_sessions().await;
         let (shutdown, _rx) = watch::channel(false);
         tokio::spawn(async move {
-            let _ = handle_connection(server, sessions, shutdown).await;
+            let collab = CollabService::disabled(sessions.clone());
+            let _ = handle_connection(server, sessions, collab, shutdown).await;
         });
         let (client_read, mut client_write) = tokio::io::split(client);
         let mut reader = BufReader::new(client_read);
@@ -1075,7 +1227,8 @@ mod tests {
         let (client, server) = duplex(64 * 1024);
         let (shutdown, _rx) = watch::channel(false);
         let server = tokio::spawn(async move {
-            let _ = handle_connection(server, sessions, shutdown).await;
+            let collab = CollabService::disabled(sessions.clone());
+            let _ = handle_connection(server, sessions, collab, shutdown).await;
         });
         let (client_read, mut client_write) = tokio::io::split(client);
         let mut reader = BufReader::new(client_read);

@@ -19,6 +19,17 @@ chrono = { workspace = true }
 async-trait = { workspace = true }
 async-channel = { workspace = true }
 base64 = "0.22"
+trama-collab-protocol = { path = "../../crates/trama-collab-protocol" }
+# Collab client: plain HTTP/1.1 and WebSocket to a loopback service only.
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-tungstenite = "0.29"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+trama-collab = { path = "../trama-collab" }
+axum = { version = "0.8", features = ["ws"] }

@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 trama-domain = { path = "../trama-domain" }
+trama-collab-protocol = { path = "../trama-collab-protocol" }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

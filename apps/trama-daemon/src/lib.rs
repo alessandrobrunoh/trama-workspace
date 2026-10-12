@@ -2,6 +2,7 @@
 
 pub mod approval;
 mod claude;
+mod collab;
 mod config;
 mod connection;
 mod error;
@@ -13,6 +14,7 @@ mod approval_tests;
 #[cfg(test)]
 mod testing;
 
+pub use collab::CollabService;
 pub use error::{DaemonError, Result};
 pub use session::{NoCollaborators, PeopleSource, Person, PromptContext, SessionManager};
 
@@ -67,10 +69,23 @@ pub async fn run_on_socket(socket_path: &Path) -> Result<()> {
     let sessions = bootstrap_sessions()
         .await?
         .with_approval_hook(ApprovalHookSettings::for_current_exe(socket_path)?);
-    serve_on_socket(socket_path, sessions).await
+    // Shared threads: credentials and the runner live beside the database.
+    let collab = CollabService::new(sessions.clone(), &default_app_dir()?);
+    collab.start().await?;
+    serve_on_socket_with(socket_path, sessions, collab).await
 }
 
+/// Serve without collaboration (no shared threads, no runner).
 pub async fn serve_on_socket(socket_path: &Path, sessions: SessionManager) -> Result<()> {
+    let collab = CollabService::disabled(sessions.clone());
+    serve_on_socket_with(socket_path, sessions, collab).await
+}
+
+pub async fn serve_on_socket_with(
+    socket_path: &Path,
+    sessions: SessionManager,
+    collab: CollabService,
+) -> Result<()> {
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -101,10 +116,16 @@ pub async fn serve_on_socket(socket_path: &Path, sessions: SessionManager) -> Re
                 match accepted {
                     Ok((stream, _)) => {
                         let sessions = sessions.clone();
+                        let collab = collab.clone();
                         let shutdown_tx = shutdown_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(err) =
-                                connection::handle_connection(stream, sessions, shutdown_tx).await
+                            if let Err(err) = connection::handle_connection(
+                                stream,
+                                sessions,
+                                collab,
+                                shutdown_tx,
+                            )
+                            .await
                             {
                                 crate::log::warn(format!("connection ended: {err}"));
                             }

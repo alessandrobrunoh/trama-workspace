@@ -29,8 +29,10 @@
 //! adds anchored comments (create, list, reply, resolve, reopen, delete, send)
 //! and delivers pending comments with `SendPrompt`. **7** adds the composer
 //! backend: `@` mentionables, `/` skills, per-thread model selection, inline
-//! terminals, and `SendPrompt.mentions` / `SendPrompt.terminals`. Each bump is
-//! transport-only. Persisted domain ids and SQLite rows are not rewritten.
+//! terminals, and `SendPrompt.mentions` / `SendPrompt.terminals`. **8** adds
+//! shared threads through a `trama-collab` service (connect, share, join, list,
+//! drafts, presence, mirrored remote activity). Each bump is transport-only.
+//! Persisted domain ids and SQLite rows are not rewritten.
 //!
 //! A version mismatch fails the handshake (`Welcome.accepted = false`). Extra object
 //! fields inside a known payload are ignored (serde default). Bump [`PROTOCOL_VERSION`]
@@ -50,9 +52,23 @@ pub use trama_domain::subthread::{
 };
 pub use trama_domain::thread::ThreadKind;
 
+/// Shared-thread wire types reused from the collab service.
+pub use trama_collab_protocol::{
+    AccessLevel as CollabAccess, EventEnvelope as CollabEventEnvelope,
+    EventKind as CollabEventKind, MemberInfo as CollabMember, MemberVia as CollabMemberVia,
+    PresenceState as CollabPresenceState,
+};
+
 /// Wire protocol version carried in `Hello` / `Welcome`.
 ///
-/// Version 7 adds the composer backend: `ListMentionables`, `ListSkills`,
+/// Version 8 adds shared threads: `ConnectCollab`, `DisconnectCollab`,
+/// `GetCollabStatus`, `ShareThread`, `GetSharedThread`,
+/// `RemoveSharedThreadMember`, `JoinSharedThread`, `ListSharedThreads`,
+/// `UnlinkSharedThread`, `SetCollabDraft`, `SetCollabPresence`, and the
+/// matching `Collab*` / `SharedThread*` daemon messages. `SendPrompt` on a
+/// linked thread submits the turn to the collab service; this daemon's runner
+/// then runs it locally (ADR 0008).
+/// Version 7 added the composer backend: `ListMentionables`, `ListSkills`,
 /// `SetThreadModel`, `ListModels`, inline terminals (`OpenTerminal`,
 /// `TerminalInput`, `ResizeTerminal`, `CloseTerminal`, `ListTerminals`,
 /// `ReplayTerminal`), `ThreadSnapshot.model`, and `SendPrompt` mentions and
@@ -65,7 +81,7 @@ pub use trama_domain::thread::ThreadKind;
 /// Version 4 added the Claude approval channel and 3 thread checkout
 /// discovery. It does not migrate stored data; peers with a different version
 /// are rejected at handshake time.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Environment variable that relocates the whole app-data directory (socket,
 /// database, config, legacy checkouts). Use it for isolated test instances
@@ -308,7 +324,129 @@ pub enum ClientMessage {
     ReplayTerminal {
         terminal_id: String,
     },
+    /// Sign in to a `trama-collab` service (loopback `http://` only) and
+    /// start this daemon's runner. The session token and the runner token are
+    /// stored owner-only in the app dir and never logged; the password is
+    /// not stored. Without `runner_token` the daemon provisions one for
+    /// `username` (`POST /runners`). Answered with `CollabStatus`.
+    ConnectCollab {
+        server_url: String,
+        username: String,
+        password: String,
+        #[serde(default)]
+        runner_token: Option<String>,
+    },
+    /// Stop the runner and every shared-thread socket. `forget` also logs the
+    /// session out and deletes the stored credentials. Links and mirrored
+    /// history stay. Answered with `CollabStatus`.
+    DisconnectCollab {
+        #[serde(default)]
+        forget: bool,
+    },
+    /// Answered with `CollabStatus`.
+    GetCollabStatus,
+    /// Share a top-level thread: create its collab thread on first use
+    /// (access `invited`), then apply `access` when set and invite the
+    /// `invite` usernames (owner only). Setting `link` (again) returns a fresh
+    /// link token once and revokes the previous one; setting `invited`
+    /// removes members who joined by link. Answered with `SharedThread`.
+    ShareThread {
+        thread_id: ThreadId,
+        #[serde(default)]
+        access: Option<CollabAccess>,
+        #[serde(default)]
+        invite: Vec<String>,
+    },
+    /// Members and access of a linked thread. Answered with `SharedThread`.
+    GetSharedThread {
+        thread_id: ThreadId,
+    },
+    /// Owner only. Answered with `SharedThread`.
+    RemoveSharedThreadMember {
+        thread_id: ThreadId,
+        username: String,
+    },
+    /// Join a shared thread (as an invitee, or with its link token) into a
+    /// new local thread of `workspace_id`, with this workspace's isolated
+    /// checkouts. Answered with `SharedThreadJoined`.
+    JoinSharedThread {
+        workspace_id: WorkspaceId,
+        collab_thread_id: String,
+        #[serde(default)]
+        link_token: Option<String>,
+    },
+    /// Shared threads the signed-in user can open, with their local thread
+    /// when linked. Answered with `SharedThreads`.
+    ListSharedThreads,
+    /// Stop mirroring a thread locally. Its history stays; the collab thread
+    /// and its members are unchanged. Answered with `SharedThreadUnlinked`.
+    UnlinkSharedThread {
+        thread_id: ThreadId,
+    },
+    /// Relay the composer draft to the thread's other participants. Never
+    /// stored; empty clears it.
+    SetCollabDraft {
+        thread_id: ThreadId,
+        text: String,
+    },
+    /// `active` or `idle`.
+    SetCollabPresence {
+        thread_id: ThreadId,
+        state: CollabPresenceState,
+    },
     Shutdown,
+}
+
+/// The local runner's connection to the collab service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollabRunnerState {
+    /// Not configured, or disconnected on request.
+    Off,
+    Connecting,
+    /// Claims and runs this user's own turns.
+    Online,
+    /// Stopped: the credential was revoked or belongs to another user, or
+    /// the session expired. `last_error` says why; reconnect to recover.
+    Failed,
+}
+
+/// Reply to the `*Collab*` commands. Never carries a token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollabStatusSnapshot {
+    pub server_url: Option<String>,
+    pub username: Option<String>,
+    /// A session token is stored and was not rejected yet.
+    pub signed_in: bool,
+    pub runner: CollabRunnerState,
+    pub linked_threads: u32,
+    pub last_error: Option<String>,
+}
+
+/// A local thread's shared state. `link_token` is set only in the reply that
+/// (re)enabled link access; it is shown once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedThreadSnapshot {
+    pub thread_id: ThreadId,
+    pub collab_thread_id: String,
+    pub title: String,
+    pub owner: String,
+    pub access: CollabAccess,
+    pub members: Vec<CollabMember>,
+    pub link_token: Option<String>,
+}
+
+/// One entry of `SharedThreads`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedThreadListing {
+    pub collab_thread_id: String,
+    pub title: String,
+    pub owner: String,
+    pub access: CollabAccess,
+    /// How the signed-in user is a member.
+    pub via: CollabMemberVia,
+    pub last_seq: i64,
+    pub local_thread_id: Option<ThreadId>,
 }
 
 /// What an `@` mention refers to.
@@ -632,6 +770,59 @@ pub enum DaemonMessage {
     Terminals {
         thread_id: ThreadId,
         terminals: Vec<TerminalSnapshot>,
+    },
+    /// Reply to `ConnectCollab`, `DisconnectCollab` and `GetCollabStatus`.
+    CollabStatus(CollabStatusSnapshot),
+    /// Reply to `ShareThread`, `GetSharedThread`, `RemoveSharedThreadMember`.
+    SharedThread(SharedThreadSnapshot),
+    /// Reply to `JoinSharedThread`: the new local thread, already mirroring.
+    SharedThreadJoined {
+        thread: ThreadSnapshot,
+        shared: SharedThreadSnapshot,
+    },
+    SharedThreads(Vec<SharedThreadListing>),
+    SharedThreadUnlinked {
+        thread_id: ThreadId,
+    },
+    /// Reply to `SendPrompt` on a linked thread: the turn was submitted and
+    /// runs when this daemon's runner claims it (immediately while online).
+    /// The user message appears when the turn starts.
+    CollabTurnQueued {
+        thread_id: ThreadId,
+        command_id: String,
+    },
+    /// A durable event from another participant (or another client of this
+    /// user), sent to the thread's subscribers. Remote user and assistant
+    /// messages, comments, verdicts, change summaries and ambiguous turns
+    /// are also persisted as transcript messages (actor `collab:<username>`)
+    /// and replayed on subscribe; this frame carries the structured form.
+    CollabEvent {
+        thread_id: ThreadId,
+        event: CollabEventEnvelope,
+    },
+    /// Live agent output of another participant's turn (that participant's
+    /// runner). Not stored; the final assistant message is.
+    CollabAgentEvent {
+        thread_id: ThreadId,
+        author: String,
+        command_id: String,
+        event: AgentEvent,
+    },
+    /// Another participant's live draft (not stored; empty = cleared).
+    CollabDraft {
+        thread_id: ThreadId,
+        username: String,
+        text: String,
+    },
+    CollabPresence {
+        thread_id: ThreadId,
+        username: String,
+        state: CollabPresenceState,
+    },
+    /// The signed-in user lost access to the shared thread; mirroring
+    /// stopped. Local history stays.
+    CollabAccessRevoked {
+        thread_id: ThreadId,
     },
 }
 
@@ -1067,8 +1258,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_seven() {
-        assert_eq!(PROTOCOL_VERSION, 7);
+    fn protocol_version_is_eight() {
+        assert_eq!(PROTOCOL_VERSION, 8);
     }
 
     #[test]
@@ -1270,6 +1461,163 @@ mod tests {
         let snapshot = serde_json::to_value(&daemon[4]).unwrap();
         assert_eq!(snapshot["payload"]["terminal"]["exit_status"]["code"], 0);
         assert_eq!(snapshot["payload"]["terminal"]["last_seq"], 3);
+    }
+
+    #[test]
+    fn collab_contract_shapes() {
+        let tid = thread_id();
+        let client = [
+            ClientMessage::ConnectCollab {
+                server_url: "http://127.0.0.1:8787".into(),
+                username: "alice".into(),
+                password: "secret-password".into(),
+                runner_token: None,
+            },
+            ClientMessage::DisconnectCollab { forget: true },
+            ClientMessage::GetCollabStatus,
+            ClientMessage::ShareThread {
+                thread_id: tid.clone(),
+                access: Some(CollabAccess::Link),
+                invite: vec!["bob".into()],
+            },
+            ClientMessage::GetSharedThread {
+                thread_id: tid.clone(),
+            },
+            ClientMessage::RemoveSharedThreadMember {
+                thread_id: tid.clone(),
+                username: "bob".into(),
+            },
+            ClientMessage::JoinSharedThread {
+                workspace_id: workspace_id(),
+                collab_thread_id: "ct1".into(),
+                link_token: Some("tok".into()),
+            },
+            ClientMessage::ListSharedThreads,
+            ClientMessage::UnlinkSharedThread {
+                thread_id: tid.clone(),
+            },
+            ClientMessage::SetCollabDraft {
+                thread_id: tid.clone(),
+                text: "typing".into(),
+            },
+            ClientMessage::SetCollabPresence {
+                thread_id: tid.clone(),
+                state: CollabPresenceState::Idle,
+            },
+        ];
+        for msg in &client {
+            roundtrip_eq(msg);
+            roundtrip_json(msg);
+        }
+        assert_eq!(
+            serde_json::to_value(&client[3]).unwrap(),
+            serde_json::json!({"type":"share_thread","payload":{
+                "thread_id": tid.to_string(), "access":"link", "invite":["bob"]}})
+        );
+        // Optional fields may be omitted.
+        let minimal: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type":"connect_collab","payload":{"server_url":"http://127.0.0.1:1",
+            "username":"a","password":"p"}}))
+        .unwrap();
+        assert!(matches!(
+            minimal,
+            ClientMessage::ConnectCollab {
+                runner_token: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::from_value::<ClientMessage>(
+                serde_json::json!({"type":"disconnect_collab","payload":{}})
+            )
+            .unwrap(),
+            ClientMessage::DisconnectCollab { forget: false }
+        );
+
+        let shared = SharedThreadSnapshot {
+            thread_id: tid.clone(),
+            collab_thread_id: "ct1".into(),
+            title: "Shared".into(),
+            owner: "alice".into(),
+            access: CollabAccess::Invited,
+            members: vec![CollabMember {
+                username: "bob".into(),
+                via: CollabMemberVia::Invite,
+            }],
+            link_token: None,
+        };
+        let daemon = [
+            DaemonMessage::CollabStatus(CollabStatusSnapshot {
+                server_url: Some("http://127.0.0.1:8787".into()),
+                username: Some("alice".into()),
+                signed_in: true,
+                runner: CollabRunnerState::Online,
+                linked_threads: 1,
+                last_error: None,
+            }),
+            DaemonMessage::SharedThread(shared.clone()),
+            DaemonMessage::SharedThreadJoined {
+                thread: snapshot_th(),
+                shared,
+            },
+            DaemonMessage::SharedThreads(vec![SharedThreadListing {
+                collab_thread_id: "ct1".into(),
+                title: "Shared".into(),
+                owner: "alice".into(),
+                access: CollabAccess::Link,
+                via: CollabMemberVia::Link,
+                last_seq: 4,
+                local_thread_id: None,
+            }]),
+            DaemonMessage::SharedThreadUnlinked {
+                thread_id: tid.clone(),
+            },
+            DaemonMessage::CollabTurnQueued {
+                thread_id: tid.clone(),
+                command_id: "trd.x.y".into(),
+            },
+            DaemonMessage::CollabEvent {
+                thread_id: tid.clone(),
+                event: CollabEventEnvelope {
+                    thread_id: "ct1".into(),
+                    seq: 3,
+                    kind: CollabEventKind::CommentCreated,
+                    author: Some("bob".into()),
+                    command_id: Some("c".into()),
+                    created_at: 1,
+                    payload: serde_json::json!({"body":"nit"}),
+                },
+            },
+            DaemonMessage::CollabAgentEvent {
+                thread_id: tid.clone(),
+                author: "bob".into(),
+                command_id: "c".into(),
+                event: AgentEvent::TextDelta { text: "hi".into() },
+            },
+            DaemonMessage::CollabDraft {
+                thread_id: tid.clone(),
+                username: "bob".into(),
+                text: "dra".into(),
+            },
+            DaemonMessage::CollabPresence {
+                thread_id: tid.clone(),
+                username: "bob".into(),
+                state: CollabPresenceState::Online,
+            },
+            DaemonMessage::CollabAccessRevoked {
+                thread_id: tid.clone(),
+            },
+        ];
+        for msg in &daemon {
+            roundtrip_json(msg);
+        }
+        let json = serde_json::to_value(&daemon[0]).unwrap();
+        assert_eq!(json["type"], "collab_status");
+        assert_eq!(json["payload"]["runner"], "online");
+        assert_eq!(
+            serde_json::to_value(&daemon[6]).unwrap()["payload"]["event"]["kind"],
+            "comment_created"
+        );
     }
 
     #[test]

@@ -171,7 +171,7 @@ pub struct ThreadSummary {
     pub last_seq: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberInfo {
     pub username: String,
     pub via: MemberVia,

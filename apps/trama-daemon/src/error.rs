@@ -23,6 +23,8 @@ pub enum DaemonError {
     Agent(String),
     #[error("storage error: {0}")]
     Storage(String),
+    #[error("collab: {0}")]
+    Collab(String),
 }
 
 impl DaemonError {
@@ -36,6 +38,7 @@ impl DaemonError {
             Self::Busy | Self::MigrationBusy => "busy",
             Self::Agent(_) => "agent",
             Self::Storage(_) => "storage",
+            Self::Collab(_) => "collab",
         }
     }
 }
