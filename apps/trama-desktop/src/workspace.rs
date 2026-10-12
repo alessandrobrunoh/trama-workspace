@@ -20,6 +20,7 @@ use trama_protocol::{ClientMessage, DaemonMessage, LandOutcome, SubthreadKind, T
 
 use crate::changes::{ChangesEvent, ChangesPanel, DrawerTab, render_drawer};
 use crate::chat::ChatPanel;
+use crate::comments::CommentStore;
 use crate::copies::CopyPanel;
 use crate::keymap::{self, CONTEXT, fuzzy_rank};
 use crate::net::{DaemonClient, NetEvent};
@@ -56,6 +57,7 @@ pub struct Workspace {
     projects: Entity<ProjectsPanel>,
     new_thread: Entity<NewThreadView>,
     changes: Entity<ChangesPanel>,
+    comments: Entity<CommentStore>,
     subthread_bar: Entity<SubthreadBar>,
     palette: Entity<CommandState>,
     palette_query: String,
@@ -78,13 +80,16 @@ impl Workspace {
         window.set_window_title("TramaWorkspace");
 
         let (client, events) = crate::net::start();
+        let comments = cx.new(|_| CommentStore::new(client.clone()));
         let chat_client = client.clone();
-        let chat = cx.new(|cx| ChatPanel::new(window, cx, chat_client));
+        let chat_comments = comments.clone();
+        let chat = cx.new(|cx| ChatPanel::new(window, cx, chat_client, chat_comments));
         let copies = cx.new(|_| CopyPanel::new());
         let sidebar = cx.new(|_| SidebarPanel::new());
         let projects = cx.new(|cx| ProjectsPanel::new(sidebar.clone(), window, cx));
         let new_thread = cx.new(|cx| NewThreadView::new(sidebar.clone(), window, cx));
-        let changes = cx.new(|_| ChangesPanel::new());
+        let changes_comments = comments.clone();
+        let changes = cx.new(|cx| ChangesPanel::new(changes_comments, cx));
         let bar_client = client.clone();
         let bar_sidebar = sidebar.clone();
         let subthread_bar = cx.new(|cx| SubthreadBar::new(bar_client, bar_sidebar, window, cx));
@@ -108,6 +113,11 @@ impl Workspace {
             }),
             cx.subscribe(&changes, |this, _, event, cx| match event {
                 ChangesEvent::Refresh => this.refresh_changes(cx),
+                ChangesEvent::RevealMessage(message_id) => {
+                    let message_id = message_id.clone();
+                    this.chat
+                        .update(cx, |chat, cx| chat.reveal_message(message_id, cx));
+                }
             }),
             cx.observe(&subthread_bar, |_, _, cx| cx.notify()),
             cx.observe(&sidebar, |_, _, cx| cx.notify()),
@@ -159,6 +169,7 @@ impl Workspace {
             projects,
             new_thread,
             changes,
+            comments,
             subthread_bar,
             palette,
             palette_query: String::new(),
@@ -308,6 +319,18 @@ impl Workspace {
         }
     }
 
+    /// ⌘⌥M: the picked diff lines when the drawer has some, else the
+    /// selected transcript text.
+    fn comment_on_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.drawer_open && self.changes.read(cx).has_selection() {
+            self.changes
+                .update(cx, |changes, cx| changes.comment_on_selection(window, cx));
+        } else {
+            self.chat
+                .update(cx, |chat, cx| chat.comment_on_selection(window, cx));
+        }
+    }
+
     fn answer_approval(&mut self, decision: ApprovalDecision, cx: &mut Context<Self>) {
         self.chat
             .update(cx, |chat, cx| chat.answer_oldest_approval(decision, cx));
@@ -354,6 +377,11 @@ impl Workspace {
         self.copies
             .update(cx, |copies, cx| copies.select(thread_id.clone(), cx));
         self.subthread_bar.update(cx, |bar, cx| bar.reset_form(cx));
+        // Reset even for the same thread: selection resends ListComments.
+        self.comments.update(cx, |comments, cx| {
+            comments.set_thread(None, cx);
+            comments.set_thread(thread_id.clone(), cx);
+        });
         self.chat.update(cx, |chat, cx| {
             chat.set_thread(None, cx);
             chat.set_thread(thread_id, cx);
@@ -835,6 +863,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .comments
+            .update(cx, |comments, cx| comments.apply(&message, cx))
+        {
+            return;
+        }
         match message {
             DaemonMessage::ThreadCheckouts {
                 thread_id,
@@ -1393,11 +1427,20 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &keymap::DenyApproval, _, cx| {
                 this.answer_approval(ApprovalDecision::Deny, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &keymap::CommentOnSelection, window, cx| {
+                    this.comment_on_selection(window, cx);
+                }),
+            )
             // Text inputs (the composer) handle Escape first; close the
             // drawer on the way down so Esc works with the composer focused.
             .capture_action(cx.listener(
                 |this, _: &gpui_kit::component::input::Escape, window, cx| {
-                    if this.drawer_open && !window.has_active_dialog(cx) {
+                    // An open diff comment composer takes Escape itself.
+                    if this.drawer_open
+                        && !window.has_active_dialog(cx)
+                        && !this.changes.read(cx).has_draft()
+                    {
                         this.drawer_open = false;
                         cx.notify();
                     }

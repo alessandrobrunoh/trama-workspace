@@ -1,22 +1,29 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    Icon, Sizable as _,
+    Disableable as _, Icon, Sizable as _,
+    button::{Button, ButtonVariants as _},
     dock::{BasePanel, Panel, PanelEvent},
     h_flex,
     kbd::Kbd,
     spinner::Spinner,
-    text::TextView,
+    text::{RangeHighlight, RenderedText, TextView, TextViewState},
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::rc::Rc;
 use trama_domain::agent::{AgentEvent, ApprovalDecision, BillingSource, UsageReport};
-use trama_domain::ids::{MessageId, ThreadId};
+use trama_domain::ids::{CommentId, MessageId, ThreadId};
 use trama_domain::message::{ContentBlock, Message, Role};
-use trama_protocol::{ClientMessage, DaemonMessage};
+use trama_protocol::{ClientMessage, CommentTarget, DaemonMessage};
 
 use crate::agent::{ChatAgent, FakeAgent};
+use crate::comments::{
+    self, CardHandlers, CommentDraft, CommentGroup, CommentStore, Phase, PromptBlock,
+};
 use crate::composer::{BillingBadge, Composer, ComposerFooter};
 use crate::net::{DaemonClient, SendStatus};
 use crate::sidebar::ThreadStatus;
@@ -79,7 +86,13 @@ pub struct SessionInfo {
 }
 
 pub enum ChatEntry {
-    User(String),
+    /// A prompt. `text` is the stored message text once `message_id` is set
+    /// (with any delivered `<review-comments>` block), the typed prompt
+    /// before that.
+    User {
+        text: String,
+        message_id: Option<MessageId>,
+    },
     Approval(ApprovalCard),
     Assistant {
         markdown: String,
@@ -97,8 +110,73 @@ pub enum ChatEntry {
     },
 }
 
+/// One contiguous slice of a persisted message, rendered selectable. A
+/// message is split after each commented Markdown block so its threads can
+/// render right under the passage.
+struct Segment {
+    /// Byte range of the message's rendered source.
+    range: Range<usize>,
+    state: Entity<TextViewState>,
+    /// Highlights last handed to the state, and the parse they indexed.
+    applied: Option<(RenderedText, Highlights)>,
+}
+
+/// Background colors over ranges of a segment's source.
+type Highlights = Vec<(Range<usize>, Hsla)>;
+
+/// A persisted message whose selections map back to `Message::text()`.
+struct MessageView {
+    /// The Markdown rendered (the message text after the comment block).
+    source: String,
+    segments: Vec<Segment>,
+}
+
+/// The commentable selection seen in the last render.
+#[derive(Debug, Clone)]
+struct SelectionHit {
+    message_id: MessageId,
+    /// Byte range of `Message::text()`.
+    range: Range<usize>,
+}
+
+/// Where the open comment composer sits in the transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DraftAnchor {
+    /// A new comment, right under the Markdown block holding `range`
+    /// (bytes of `Message::text()`), which stays highlighted meanwhile.
+    Passage {
+        message_id: MessageId,
+        range: Range<usize>,
+    },
+    Reply(CommentId),
+}
+
+struct ChatDraft {
+    anchor: DraftAnchor,
+    draft: CommentDraft,
+}
+
 pub struct ChatPanel {
     entries: Vec<ChatEntry>,
+    comments: Entity<CommentStore>,
+    message_views: HashMap<MessageId, MessageView>,
+    /// Text length of persisted assistant messages whose entry shows exactly
+    /// `Message::text()`; only those map selections to byte offsets.
+    stored_len: HashMap<MessageId, usize>,
+    selection: Option<SelectionHit>,
+    /// Where the last selection gesture ended, in window coordinates.
+    selection_point: Option<Point<Pixels>>,
+    draft: Option<ChatDraft>,
+    /// Threads the user opened or closed, overriding the default.
+    thread_open: HashMap<CommentId, bool>,
+    /// User messages whose delivered comment block is expanded.
+    open_blocks: HashSet<MessageId>,
+    /// Scroll to this message on the next render.
+    reveal: Option<MessageId>,
+    /// Briefly tinted after a reveal.
+    flash: Option<MessageId>,
+    _flash_task: Option<Task<()>>,
+    _comments_observer: Subscription,
     composer: Composer,
     agent: Box<dyn ChatAgent>,
     client: DaemonClient,
@@ -127,14 +205,32 @@ pub struct ChatPanel {
 }
 
 impl ChatPanel {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>, client: DaemonClient) -> Self {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        client: DaemonClient,
+        comments: Entity<CommentStore>,
+    ) -> Self {
         let composer = Composer::new(window, cx);
         let enter = composer.subscribe_enter(window, cx, |this, window, cx| {
             this.submit(window, cx);
         });
+        let comments_observer = cx.observe(&comments, |_, _, cx| cx.notify());
 
         Self {
             entries: Vec::new(),
+            comments,
+            message_views: HashMap::new(),
+            stored_len: HashMap::new(),
+            selection: None,
+            selection_point: None,
+            draft: None,
+            thread_open: HashMap::new(),
+            open_blocks: HashSet::new(),
+            reveal: None,
+            flash: None,
+            _flash_task: None,
+            _comments_observer: comments_observer,
             composer,
             agent: Box::new(FakeAgent),
             client,
@@ -289,12 +385,21 @@ impl ChatPanel {
         self.selected_thread = thread;
         self.restore_thread_draft = self.selected_thread.is_some();
         self.clear_transcript();
+        self.draft = None;
+        self.thread_open.clear();
+        self.open_blocks.clear();
         self.connection_error = None;
         cx.notify();
     }
 
     fn clear_transcript(&mut self) {
         self.entries.clear();
+        self.message_views.clear();
+        self.stored_len.clear();
+        self.selection = None;
+        self.selection_point = None;
+        self.reveal = None;
+        self.flash = None;
         self.seen_message_ids.clear();
         self.lifecycle = TurnLifecycle::Idle;
         self.final_assistant_persisted = false;
@@ -337,7 +442,10 @@ impl ChatPanel {
         self.restore_thread_draft = false;
         if self.pending_prompt.as_deref() == Some(prompt) {
             self.pending_prompt = None;
-            if let Some(ChatEntry::User(text)) = self.entries.last()
+            if let Some(ChatEntry::User {
+                text,
+                message_id: None,
+            }) = self.entries.last()
                 && text == prompt
             {
                 self.entries.pop();
@@ -390,8 +498,10 @@ impl ChatPanel {
                 }
                 if let Some(prompt) = take_rejected_prompt(&event, &mut self.pending_prompt) {
                     self.stage_prompt(&thread_id, &prompt);
-                    if matches!(self.entries.last(), Some(ChatEntry::User(text)) if text == &prompt)
-                    {
+                    if matches!(
+                        self.entries.last(),
+                        Some(ChatEntry::User { text, message_id: None }) if text == &prompt
+                    ) {
                         self.entries.pop();
                     }
                 }
@@ -465,7 +575,10 @@ impl ChatPanel {
                 }
             }));
         }
-        self.entries.push(ChatEntry::User(prompt));
+        self.entries.push(ChatEntry::User {
+            text: prompt,
+            message_id: None,
+        });
         self.last_failed = false;
         self.scroll.scroll_to_bottom();
         self.connection_error = None;
@@ -479,19 +592,21 @@ impl ChatPanel {
     fn append_stored_message(&mut self, message: Message) {
         match message.role {
             Role::User => {
-                let text = message.text();
-                if self.pending_prompt.as_deref() == Some(text.as_str()) {
-                    self.pending_prompt = None;
-                }
-                if let Some(ChatEntry::User(existing)) = self.entries.last() {
-                    if existing == &text {
-                        return;
-                    }
-                }
-                self.entries.push(ChatEntry::User(text));
+                append_stored_user(&mut self.entries, &mut self.pending_prompt, &message);
             }
             Role::Assistant => {
                 append_stored_assistant(&mut self.entries, self.lifecycle, &message);
+                let text_len = message.text().len();
+                let persisted = self.entries.iter().rev().any(|entry| {
+                    matches!(
+                        entry,
+                        ChatEntry::Assistant { message_id: Some(id), markdown, .. }
+                            if id == &message.id && markdown.len() == text_len
+                    )
+                });
+                if persisted && text_len > 0 {
+                    self.stored_len.insert(message.id.clone(), text_len);
+                }
             }
             Role::Tool | Role::System => {
                 if !self.is_running() {
@@ -747,6 +862,831 @@ impl ChatPanel {
     }
 }
 
+// -- comments -------------------------------------------------------------
+
+impl ChatPanel {
+    /// Comment on the selected transcript text (⌘⌥M and the floating button).
+    pub fn comment_on_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.selection.clone() {
+            Some(hit) => self.open_passage_draft(hit, None, window, cx),
+            None if self.uses_daemon() => {
+                self.connection_error = Some(
+                    "Select text in a message, then type your comment (or press \u{2318}\u{2325}M)."
+                        .into(),
+                );
+                cx.notify();
+            }
+            None => {}
+        }
+    }
+
+    /// Type to comment: a printable key while transcript text is selected
+    /// opens the composer under the passage with that text already in it.
+    fn type_to_comment(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(hit) = self.selection.clone() else {
+            return;
+        };
+        if self
+            .composer
+            .input
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+            || self
+                .draft
+                .as_ref()
+                .is_some_and(|open| open.draft.is_focused(window, cx))
+        {
+            return;
+        }
+        let Some(text) = comments::typed_text(&event.keystroke) else {
+            return;
+        };
+        cx.stop_propagation();
+        window.prevent_default();
+        self.open_passage_draft(hit, Some(text), window, cx);
+    }
+
+    /// The hover action on a message: the selection inside it, else the
+    /// whole message.
+    fn comment_on_message(
+        &mut self,
+        message_id: MessageId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hit = match &self.selection {
+            Some(hit) if hit.message_id == message_id => Some(hit.clone()),
+            _ => self.whole_message_hit(&message_id),
+        };
+        if let Some(hit) = hit {
+            self.open_passage_draft(hit, None, window, cx);
+        }
+    }
+
+    fn whole_message_hit(&self, message_id: &MessageId) -> Option<SelectionHit> {
+        let view = self.message_views.get(message_id)?;
+        let base = self.entries.iter().find_map(|entry| match entry {
+            ChatEntry::User {
+                text,
+                message_id: Some(id),
+            } if id == message_id => Some(user_body_start(text)),
+            ChatEntry::Assistant {
+                message_id: Some(id),
+                ..
+            } if id == message_id => Some(0),
+            _ => None,
+        })?;
+        let range = comments::selection_to_message_range(&view.source, base, 0..view.source.len())?;
+        Some(SelectionHit {
+            message_id: message_id.clone(),
+            range,
+        })
+    }
+
+    fn open_passage_draft(
+        &mut self,
+        hit: SelectionHit,
+        initial: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.uses_daemon() {
+            return;
+        }
+        if let Some(view) = self.message_views.get(&hit.message_id) {
+            for segment in &view.segments {
+                segment
+                    .state
+                    .update(cx, |state, cx| state.clear_selection(cx));
+            }
+        }
+        self.selection = None;
+        self.selection_point = None;
+        self.connection_error = None;
+        let target = CommentTarget::MessageRange {
+            message_id: hit.message_id.clone(),
+            start_byte: hit.range.start,
+            end_byte: hit.range.end,
+        };
+        let draft = CommentDraft::new(
+            target,
+            None,
+            initial,
+            window,
+            cx,
+            |this: &mut Self, window, cx| this.submit_draft(window, cx),
+        );
+        self.draft = Some(ChatDraft {
+            anchor: DraftAnchor::Passage {
+                message_id: hit.message_id,
+                range: hit.range,
+            },
+            draft,
+        });
+        cx.notify();
+    }
+    fn open_reply(&mut self, root: CommentId, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self
+            .comments
+            .read(cx)
+            .groups()
+            .into_iter()
+            .find(|group| group.id() == &root)
+            .map(|group| group.root.target);
+        let Some(target) = target else {
+            return;
+        };
+        self.thread_open.insert(root.clone(), true);
+        let draft = CommentDraft::new(
+            target,
+            Some(root.clone()),
+            None,
+            window,
+            cx,
+            |this: &mut Self, window, cx| this.submit_draft(window, cx),
+        );
+        self.draft = Some(ChatDraft {
+            anchor: DraftAnchor::Reply(root),
+            draft,
+        });
+        cx.notify();
+    }
+
+    fn submit_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = &self.draft else {
+            return;
+        };
+        if open.draft.submit(&self.comments, cx) {
+            self.draft = None;
+            self.focus_composer(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn cancel_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft = None;
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_thread(&mut self, id: CommentId, cx: &mut Context<Self>) {
+        let default = self
+            .comments
+            .read(cx)
+            .groups()
+            .iter()
+            .find(|group| group.id() == &id)
+            .is_some_and(CommentGroup::open_by_default);
+        let open = self.thread_open.get(&id).copied().unwrap_or(default);
+        self.thread_open.insert(id, !open);
+        cx.notify();
+    }
+
+    fn is_thread_open(&self, group: &CommentGroup) -> bool {
+        self.thread_open
+            .get(group.id())
+            .copied()
+            .unwrap_or_else(|| group.open_by_default())
+    }
+
+    /// Scroll the transcript to a message and tint it briefly.
+    pub fn reveal_message(&mut self, message_id: MessageId, cx: &mut Context<Self>) {
+        self.reveal = Some(message_id.clone());
+        self.flash = Some(message_id);
+        self._flash_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1400))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.flash = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Deliver the pending comments as a turn of their own.
+    fn send_comments_only(&mut self, cx: &mut Context<Self>) {
+        if !can_submit(self.lifecycle) || !self.uses_daemon() {
+            return;
+        }
+        if self.comments.update(cx, |store, cx| store.send_pending(cx)) != SendStatus::Enqueued {
+            return;
+        }
+        self.pending_prompt = None;
+        self._event_task = None;
+        self.last_failed = false;
+        self.connection_error = None;
+        self.lifecycle = TurnLifecycle::Running;
+        self.final_assistant_persisted = false;
+        self.status = AgentStatus::Running;
+        self.composer.set_disabled(true, cx);
+        self.scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
+    fn card_handlers(&self, cx: &mut Context<Self>) -> CardHandlers {
+        let toggle = cx.entity().downgrade();
+        let reply = toggle.clone();
+        let answer = toggle.clone();
+        CardHandlers {
+            store: self.comments.clone(),
+            on_toggle: Rc::new(move |id, _, cx| {
+                let _ = toggle.update(cx, |this, cx| this.toggle_thread(id, cx));
+            }),
+            on_reply: Rc::new(move |id, window, cx| {
+                let _ = reply.update(cx, |this, cx| this.open_reply(id, window, cx));
+            }),
+            on_answer: Rc::new(move |id, _, cx| {
+                let _ = answer.update(cx, |this, cx| this.reveal_message(id, cx));
+            }),
+        }
+    }
+
+    /// The selectable body of a persisted message, split after each
+    /// commented block with the block's threads (and the open composer)
+    /// right under it. Also highlights anchored passages and reports a
+    /// selection inside the message. Returns the body and the message's
+    /// threads.
+    #[allow(clippy::too_many_arguments)]
+    fn message_body(
+        &mut self,
+        message_id: &MessageId,
+        source: &str,
+        base: usize,
+        groups: &[CommentGroup],
+        hits: &mut Vec<SelectionHit>,
+        handlers: &CardHandlers,
+        now: i64,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, Vec<usize>) {
+        let (threads, anchors) = comments::message_anchors(groups, message_id, base, source);
+
+        // Threads go under the block their passage ends in; threads whose
+        // range no longer fits go after the message.
+        let mut at_cut: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut trailing = Vec::new();
+        for &group in &threads {
+            match anchors.iter().find(|anchor| anchor.group == group) {
+                Some(anchor) => {
+                    let cut = comments::block_end(source, anchor.range.end);
+                    match at_cut.iter_mut().find(|(at, _)| *at == cut) {
+                        Some((_, list)) => list.push(group),
+                        None => at_cut.push((cut, vec![group])),
+                    }
+                }
+                None => trailing.push(group),
+            }
+        }
+        let draft_range = match self.draft.as_ref().map(|open| &open.anchor) {
+            Some(DraftAnchor::Passage {
+                message_id: id,
+                range,
+            }) if id == message_id && range.start >= base && range.end - base <= source.len() => {
+                Some(range.start - base..range.end - base)
+            }
+            _ => None,
+        };
+        let draft_cut = draft_range
+            .as_ref()
+            .map(|range| comments::block_end(source, range.end));
+        let mut cuts: Vec<usize> = at_cut
+            .iter()
+            .map(|(cut, _)| *cut)
+            .chain(draft_cut)
+            .filter(|cut| *cut > 0 && *cut < source.len())
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut bounds = vec![0];
+        bounds.extend(cuts);
+        bounds.push(source.len());
+        let ranges: Vec<Range<usize>> = bounds.windows(2).map(|w| w[0]..w[1]).collect();
+
+        let view = self
+            .message_views
+            .entry(message_id.clone())
+            .or_insert_with(|| MessageView {
+                source: source.to_string(),
+                segments: Vec::new(),
+            });
+        if view.source != source {
+            view.source = source.to_string();
+            view.segments.clear();
+        }
+        let mut old = std::mem::take(&mut view.segments);
+        for range in &ranges {
+            let segment = match old.iter().position(|segment| &segment.range == range) {
+                Some(index) => old.remove(index),
+                None => Segment {
+                    range: range.clone(),
+                    state: cx.new(|cx| {
+                        TextViewState::markdown(&source[range.clone()], cx).selectable(true)
+                    }),
+                    applied: None,
+                },
+            };
+            view.segments.push(segment);
+        }
+
+        // One highlight per passage (later overlapping ones are skipped);
+        // the passage being commented on stays highlighted too.
+        let mut marks: Vec<(Range<usize>, Hsla)> = anchors
+            .iter()
+            .filter_map(|anchor| {
+                comments::highlight_color(&groups[anchor.group].phase(), p)
+                    .map(|color| (anchor.range.clone(), color))
+            })
+            .chain(draft_range.map(|range| (range, p.accent.opacity(0.3))))
+            .collect();
+        marks.sort_by_key(|(range, _)| (range.start, range.end));
+        let mut desired: Vec<(Range<usize>, Hsla)> = Vec::new();
+        for (range, color) in marks {
+            if desired
+                .last()
+                .is_some_and(|(last, _)| range.start < last.end)
+            {
+                continue;
+            }
+            desired.push((range, color));
+        }
+
+        let mut selected: Option<Range<usize>> = None;
+        for segment in &mut view.segments {
+            let local: Vec<(Range<usize>, Hsla)> = desired
+                .iter()
+                .filter_map(|(range, color)| {
+                    let start = range.start.max(segment.range.start);
+                    let end = range.end.min(segment.range.end);
+                    (start < end).then(|| {
+                        (
+                            start - segment.range.start..end - segment.range.start,
+                            *color,
+                        )
+                    })
+                })
+                .collect();
+            let rendered = segment.state.read(cx).rendered_text();
+            let key = (rendered.clone(), local);
+            if segment.applied.as_ref() != Some(&key) {
+                let highlights: Vec<RangeHighlight> = key
+                    .1
+                    .iter()
+                    .filter_map(|(range, color)| {
+                        rendered
+                            .range_for_source(range.clone())
+                            .map(|range| RangeHighlight::new(range, *color))
+                    })
+                    .collect();
+                segment.state.update(cx, |state, cx| {
+                    let _ = state.set_range_highlights(highlights, cx);
+                });
+                segment.applied = Some(key);
+            }
+            // A drag across blocks selects in several parts: join them.
+            if let Some(range) = segment.state.read(cx).selected_source_range()
+                && range.start < range.end
+            {
+                let range = range.start + segment.range.start..range.end + segment.range.start;
+                selected = Some(match selected {
+                    Some(seen) => seen.start.min(range.start)..seen.end.max(range.end),
+                    None => range,
+                });
+            }
+        }
+        if let Some(selected) = selected
+            && let Some(range) = comments::selection_to_message_range(source, base, selected)
+        {
+            hits.push(SelectionHit {
+                message_id: message_id.clone(),
+                range,
+            });
+        }
+
+        let states: Vec<(Range<usize>, Entity<TextViewState>)> = view
+            .segments
+            .iter()
+            .map(|segment| (segment.range.clone(), segment.state.clone()))
+            .collect();
+        let last = source.len();
+        let mut body = v_flex().w_full().gap(theme::sp(2.));
+        for (range, state) in states {
+            body = body.child(
+                div()
+                    .w_full()
+                    .font_family(theme::PROSE_FONT)
+                    .text_size(theme::text_prose())
+                    .line_height(relative(1.6))
+                    .text_color(p.text)
+                    .child(TextView::new(&state).selectable(true)),
+            );
+            let ends_here = |cut: usize| cut == range.end || (range.end == last && cut >= last);
+            let mut under: Vec<usize> = at_cut
+                .iter()
+                .filter(|(cut, _)| ends_here(*cut))
+                .flat_map(|(_, list)| list.iter().copied())
+                .collect();
+            if range.end == last {
+                under.extend(trailing.iter().copied());
+            }
+            for group in under {
+                body = body.child(self.thread_element(&groups[group], handlers, now, p, cx));
+            }
+            if draft_cut.is_some_and(ends_here)
+                && let Some(open) = &self.draft
+            {
+                body = body.child(self.render_open_draft("chat-draft", open, p, cx));
+            }
+        }
+        (body.into_any_element(), threads)
+    }
+
+    /// An open thread card (with its reply composer) or a collapsed row.
+    fn thread_element(
+        &self,
+        group: &CommentGroup,
+        handlers: &CardHandlers,
+        now: i64,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if !self.is_thread_open(group) {
+            return comments::render_collapsed(
+                format!("chat-thread-row-{}", group.id()),
+                group,
+                None,
+                handlers,
+                p,
+            );
+        }
+        let reply = self
+            .draft
+            .as_ref()
+            .filter(|open| open.anchor == DraftAnchor::Reply(group.id().clone()))
+            .map(|open| self.render_open_draft("chat-reply", open, p, cx));
+        comments::render_card(
+            format!("chat-thread-{}", group.id()),
+            group,
+            false,
+            None,
+            reply,
+            handlers,
+            now,
+            p,
+        )
+    }
+
+    /// Left gutter of a commentable message: a marker for its collapsed
+    /// threads and, on hover, the add-comment button.
+    fn gutter(
+        &self,
+        message_id: &MessageId,
+        threads: &[usize],
+        groups: &[CommentGroup],
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let collapsed: Vec<&CommentGroup> = threads
+            .iter()
+            .map(|&index| &groups[index])
+            .filter(|group| !self.is_thread_open(group))
+            .collect();
+        let marker = (!collapsed.is_empty()).then(|| {
+            let color = match comments::marker_phase(&collapsed) {
+                Phase::Pending => p.accent,
+                Phase::Delivered(_) => p.success,
+                Phase::Resolved(_) => p.text_faint,
+            };
+            let tooltip: SharedString = comments::marker_summary(&collapsed).into();
+            let ids: Vec<CommentId> = collapsed.iter().map(|group| group.id().clone()).collect();
+            h_flex()
+                .id(SharedString::from(format!("comment-marker-{message_id}")))
+                .h(px(18.))
+                .px(theme::sp(1.))
+                .gap(theme::sp(0.5))
+                .items_center()
+                .rounded(theme::radius_sm())
+                .bg(color.opacity(0.14))
+                .text_size(theme::text_xs())
+                .text_color(color)
+                .cursor_pointer()
+                .hover(|style| style.bg(color.opacity(0.24)))
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    for id in &ids {
+                        this.thread_open.insert(id.clone(), true);
+                    }
+                    cx.notify();
+                }))
+                .child(Icon::new(IconName::MessageSquare).with_size(px(11.)))
+                .child(collapsed.len().to_string())
+        });
+        let id = message_id.clone();
+        let add = div()
+            .id(SharedString::from(format!("comment-add-{message_id}")))
+            .size(px(20.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(theme::radius_sm())
+            .cursor_pointer()
+            .opacity(0.)
+            .group_hover(SharedString::from(format!("msg-{message_id}")), |style| {
+                style.opacity(1.)
+            })
+            .hover(|style| style.bg(p.hover))
+            .tooltip(|window, cx| {
+                Tooltip::new(
+                    "Comment on the selection or the whole message. Tip: select text and start typing.",
+                )
+                .build(window, cx)
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.comment_on_message(id.clone(), window, cx);
+            }))
+            .child(
+                Icon::new(IconName::MessageSquarePlus)
+                    .with_size(px(13.))
+                    .text_color(p.text_faint),
+            );
+        v_flex()
+            .w(theme::sp(7.))
+            .flex_shrink_0()
+            .pt(px(2.))
+            .gap(theme::sp(1.))
+            .items_start()
+            .children(marker)
+            .when(self.uses_daemon(), |this| this.child(add))
+            .into_any_element()
+    }
+
+    fn render_open_draft(
+        &self,
+        id: &str,
+        open: &ChatDraft,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let submit = cx.listener(|this, _, window, cx| this.submit_draft(window, cx));
+        let weak = cx.entity().downgrade();
+        let cancel: comments::CancelDraft = Rc::new(move |window, cx| {
+            let _ = weak.update(cx, |this, cx| this.cancel_draft(window, cx));
+        });
+        comments::render_draft(id.to_string(), &open.draft, submit, cancel, p, cx)
+    }
+    /// "Sent N comments" above a delivered prompt; expands to the block.
+    fn sent_block(
+        &self,
+        message_id: &MessageId,
+        text: &str,
+        block: &PromptBlock,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = self.open_blocks.contains(message_id);
+        let id = message_id.clone();
+        let label = if block.entries == 0 {
+            "Sent comments".to_string()
+        } else {
+            format!(
+                "Sent {}",
+                comments::plural(block.entries, "comment", "comments")
+            )
+        };
+        v_flex()
+            .w_full()
+            .gap(theme::sp(1.5))
+            .child(
+                h_flex().child(
+                    h_flex()
+                        .id(SharedString::from(format!("sent-block-{message_id}")))
+                        .h(px(24.))
+                        .px(theme::sp(2.))
+                        .gap(theme::sp(1.5))
+                        .items_center()
+                        .rounded(theme::radius())
+                        .border_1()
+                        .border_color(p.border)
+                        .bg(p.elevated)
+                        .cursor_pointer()
+                        .text_size(theme::text_xs())
+                        .text_color(p.text_muted)
+                        .hover(|style| style.bg(p.hover))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.open_blocks.remove(&id) {
+                                this.open_blocks.insert(id.clone());
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            Icon::new(IconName::MessageSquareText)
+                                .with_size(px(12.))
+                                .text_color(p.accent_text),
+                        )
+                        .child(div().text_color(p.text).child(label))
+                        .child(
+                            Icon::new(if open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .with_size(px(11.))
+                            .text_color(p.text_faint),
+                        ),
+                ),
+            )
+            .when(open, |this| {
+                this.child(
+                    div()
+                        .w_full()
+                        .px(theme::sp(2.5))
+                        .py(theme::sp(2.))
+                        .rounded(theme::radius())
+                        .bg(p.bg)
+                        .border_1()
+                        .border_color(p.border)
+                        .font_family(theme::MONO_FONT)
+                        .text_size(theme::text_xs())
+                        .line_height(relative(1.5))
+                        .text_color(p.text_muted)
+                        .child(text[block.block.clone()].to_string()),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Pending comments above the composer, with "Send comments only".
+    fn pending_strip(
+        &self,
+        groups: &[CommentGroup],
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let pending: Vec<&CommentGroup> = groups
+            .iter()
+            .filter(|group| group.phase() == Phase::Pending)
+            .collect();
+        let notice = self.comments.read(cx).notice.clone();
+        if pending.is_empty() && notice.is_none() {
+            return None;
+        }
+        let total = comments::pending_total(groups);
+        let can_send = can_submit(self.lifecycle) && self.uses_daemon();
+        let store = self.comments.clone();
+        let chip = |group: &CommentGroup| {
+            let root = &group.root;
+            let reveal = match &root.target {
+                CommentTarget::MessageRange { message_id, .. } => Some(message_id.clone()),
+                _ => None,
+            };
+            let icon = match &root.target {
+                CommentTarget::MessageRange { .. } => IconName::MessageSquare,
+                CommentTarget::Code { .. } => IconName::FileText,
+                CommentTarget::DiffHunk { .. } => IconName::FileDiff,
+            };
+            let mut tip = comments::target_label(&root.target);
+            if let Some(excerpt) = &root.excerpt {
+                tip = format!("{tip}\n{}", comments::one_line(excerpt, 120));
+            }
+            let tooltip: SharedString = tip.into();
+            let delete = comments::can_delete(root).then(|| {
+                let store = store.clone();
+                let comment_id = root.id.clone();
+                div()
+                    .id(SharedString::from(format!(
+                        "pending-chip-delete-{}",
+                        root.id
+                    )))
+                    .size(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(theme::radius_sm())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(p.hover))
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        store.update(cx, |store, cx| store.delete(comment_id.clone(), cx));
+                    })
+                    .child(
+                        Icon::new(IconName::Close)
+                            .with_size(px(10.))
+                            .text_color(p.text_faint),
+                    )
+            });
+            h_flex()
+                .id(SharedString::from(format!("pending-chip-{}", root.id)))
+                .h(px(24.))
+                .max_w(px(280.))
+                .pl(theme::sp(2.))
+                .pr(theme::sp(1.))
+                .gap(theme::sp(1.5))
+                .items_center()
+                .rounded(theme::radius())
+                .border_1()
+                .border_color(p.accent.opacity(0.35))
+                .bg(p.accent_soft)
+                .text_size(theme::text_xs())
+                .text_color(p.text)
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .when_some(reveal, |this, message_id| {
+                    this.cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.reveal_message(message_id.clone(), cx);
+                        }))
+                })
+                .child(Icon::new(icon).with_size(px(11.)).text_color(p.accent_text))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(comments::one_line(&root.body, 48)),
+                )
+                .when(
+                    group
+                        .replies
+                        .iter()
+                        .any(|reply| reply.state == trama_protocol::CommentState::Pending),
+                    |this| {
+                        this.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(p.text_faint)
+                                .child("reply"),
+                        )
+                    },
+                )
+                .children(delete)
+        };
+        Some(
+            v_flex()
+                .w_full()
+                .pb(theme::sp(2.))
+                .gap(theme::sp(1.5))
+                .when(!pending.is_empty(), |this| {
+                    this.child(
+                        h_flex()
+                            .w_full()
+                            .gap(theme::sp(1.5))
+                            .items_center()
+                            .text_size(theme::text_xs())
+                            .text_color(p.text_muted)
+                            .child(
+                                Icon::new(IconName::MessageSquare)
+                                    .with_size(px(12.))
+                                    .text_color(p.accent_text),
+                            )
+                            .child(div().flex_1().child(format!(
+                                "{} will be sent with your next message",
+                                comments::plural(total, "comment", "comments")
+                            )))
+                            .child(
+                                Button::new("send-comments-only")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::ArrowUp)
+                                    .label("Send comments only")
+                                    .tooltip("Deliver the comments now, without a message")
+                                    .disabled(!can_send)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.send_comments_only(cx)),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .flex_wrap()
+                            .gap(theme::sp(1.5))
+                            .children(pending.iter().map(|group| chip(group))),
+                    )
+                })
+                .when_some(notice, |this, notice| {
+                    this.child(
+                        div()
+                            .text_size(theme::text_xs())
+                            .text_color(p.warning)
+                            .child(notice),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+}
+
+/// Where the person's own text starts in a stored user message.
+fn user_body_start(text: &str) -> usize {
+    comments::split_prompt_block(text)
+        .map(|block| block.body_start)
+        .unwrap_or(0)
+}
+
 impl Render for ChatPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.restore_thread_draft {
@@ -765,29 +1705,53 @@ impl Render for ChatPanel {
         self.composer.set_disabled(running, cx);
         let uses_daemon = self.uses_daemon();
         let show_composer = uses_daemon || !self.connected;
+        let groups = if uses_daemon {
+            self.comments.read(cx).groups()
+        } else {
+            Vec::new()
+        };
+        let handlers = self.card_handlers(cx);
+        let now = comments::now_secs();
 
-        let mut column = v_flex()
-            .w_full()
-            .max_w(theme::transcript_width())
-            .px(theme::sp(6.))
-            .pt(theme::sp(8.))
-            .pb(theme::sp(6.))
-            .gap(theme::sp(3.));
+        // Each row is one child of the scroll container, so a message can be
+        // scrolled to by its row index.
+        let row = |content: AnyElement| {
+            h_flex()
+                .w_full()
+                .flex_shrink_0()
+                .justify_center()
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(theme::transcript_width())
+                        .px(theme::sp(6.))
+                        .child(content),
+                )
+                .into_any_element()
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut row_of: HashMap<MessageId, usize> = HashMap::new();
+        let mut hits: Vec<SelectionHit> = Vec::new();
 
         if let Some(error) = self.connection_error.clone() {
-            column = column.child(notice(&p, IconName::TriangleAlert, p.warning, error));
+            rows.push(row(
+                notice(&p, IconName::TriangleAlert, p.warning, error).into_any_element()
+            ));
         }
         if !self.connected {
-            column = column.child(notice(
+            rows.push(row(notice(
                 &p,
                 IconName::Info,
                 p.text_muted,
                 "Offline demo: replies are scripted and nothing is sent to an agent.".into(),
-            ));
+            )
+            .into_any_element()));
         }
 
-        if self.entries.is_empty() {
-            column = column.child(if uses_daemon || !self.connected {
+        // Moved out while rendering so rows can borrow `self` mutably.
+        let entries = std::mem::take(&mut self.entries);
+        if entries.is_empty() {
+            rows.push(row(if uses_daemon || !self.connected {
                 empty_state(
                     &p,
                     IconName::MessageSquare,
@@ -807,49 +1771,113 @@ impl Render for ChatPanel {
                         ("cmd-/", "Shortcuts"),
                     ],
                 )
-            });
+            }));
         }
 
         let mut previous_was_agent = false;
-        for (ix, entry) in self.entries.iter().enumerate() {
+        for (ix, entry) in entries.iter().enumerate() {
             match entry {
-                ChatEntry::User(text) => {
+                ChatEntry::User { text, message_id } => {
+                    let mut block = v_flex().w_full().gap(theme::sp(1.5));
                     if ix > 0 {
-                        column =
-                            column.child(div().w_full().h(px(1.)).my(theme::sp(2.)).bg(p.border));
+                        block =
+                            block.child(div().w_full().h(px(1.)).my(theme::sp(2.)).bg(p.border));
                     }
-                    column = column.child(
-                        v_flex()
-                            .w_full()
-                            .gap(theme::sp(1.5))
-                            .child(author_row(&p, Author::User))
-                            .child(
+                    block = block.child(author_row(&p, Author::User));
+                    match message_id {
+                        Some(id) if uses_daemon => {
+                            let split = comments::split_prompt_block(text);
+                            let base = split.as_ref().map_or(0, |split| split.body_start);
+                            if let Some(split) = &split {
+                                block = block.child(
+                                    div()
+                                        .pl(theme::sp(7.))
+                                        .child(self.sent_block(id, text, split, &p, cx)),
+                                );
+                            }
+                            let body = &text[base..];
+                            if !body.trim().is_empty() {
+                                let (content, threads) = self.message_body(
+                                    id, body, base, &groups, &mut hits, &handlers, now, &p, cx,
+                                );
+                                block = block.child(
+                                    self.message_row(id, content, &threads, &groups, &p, cx),
+                                );
+                            }
+                            row_of.insert(id.clone(), rows.len());
+                        }
+                        _ => {
+                            block = block.child(
                                 div()
                                     .pl(theme::sp(7.))
                                     .font_family(theme::PROSE_FONT)
                                     .text_size(theme::text_prose())
                                     .line_height(relative(1.55))
                                     .text_color(p.text)
-                                    .child(text.clone()),
-                            ),
-                    );
+                                    .child(comments::prompt_body(text).to_string()),
+                            );
+                        }
+                    }
+                    rows.push(row(block.into_any_element()));
                     previous_was_agent = false;
                 }
                 ChatEntry::Approval(card) => {
+                    let mut block = v_flex().w_full().gap(theme::sp(3.));
                     if !previous_was_agent {
-                        column = column.child(author_row(&p, Author::Agent));
+                        block = block.child(author_row(&p, Author::Agent));
                     }
-                    column = column.child(render_approval(card, &p, cx).into_any_element());
+                    block = block.child(render_approval(card, &p, cx).into_any_element());
+                    rows.push(row(block.into_any_element()));
+                    previous_was_agent = true;
+                }
+                ChatEntry::Assistant {
+                    markdown,
+                    streaming: false,
+                    message_id: Some(id),
+                } if uses_daemon && self.stored_len.get(id) == Some(&markdown.len()) => {
+                    let mut block = v_flex().w_full().gap(theme::sp(3.));
+                    if !previous_was_agent {
+                        block = block.child(author_row(&p, Author::Agent));
+                    }
+                    let (content, threads) = self
+                        .message_body(id, markdown, 0, &groups, &mut hits, &handlers, now, &p, cx);
+                    block = block.child(self.message_row(id, content, &threads, &groups, &p, cx));
+                    row_of.insert(id.clone(), rows.len());
+                    rows.push(row(block.into_any_element()));
                     previous_was_agent = true;
                 }
                 ChatEntry::Assistant { .. } | ChatEntry::ToolCall { .. } => {
+                    let mut block = v_flex().w_full().gap(theme::sp(3.));
                     if !previous_was_agent {
-                        column = column.child(author_row(&p, Author::Agent));
+                        block = block.child(author_row(&p, Author::Agent));
                     }
-                    column = column.child(render_entry(ix, entry, &p, cx).into_any_element());
+                    block = block.child(render_entry(ix, entry, &p, cx).into_any_element());
+                    rows.push(row(block.into_any_element()));
                     previous_was_agent = true;
                 }
             }
+        }
+        self.entries = entries;
+
+        // A selection inside exactly one message can be commented on.
+        self.selection = if hits.len() == 1 { hits.pop() } else { None };
+        if let Some(id) = self.reveal.take() {
+            match row_of.get(&id) {
+                Some(&index) => self.scroll.scroll_to_top_of_item(index),
+                None => self.flash = None,
+            }
+        }
+        if let Some(flash) = &self.flash
+            && let Some(&index) = row_of.get(flash)
+            && let Some(slot) = rows.get_mut(index)
+        {
+            let element = std::mem::replace(slot, div().into_any_element());
+            *slot = div()
+                .w_full()
+                .flex_shrink_0()
+                .bg(p.accent_soft)
+                .child(element)
+                .into_any_element();
         }
 
         if running {
@@ -859,10 +1887,11 @@ impl Render for ChatPanel {
                 _ if self.has_open_approval() => "Waiting for approval…",
                 _ => "Working…",
             };
+            let mut block = v_flex().w_full().gap(theme::sp(3.));
             if !previous_was_agent {
-                column = column.child(author_row(&p, Author::Agent));
+                block = block.child(author_row(&p, Author::Agent));
             }
-            column = column.child(
+            block = block.child(
                 h_flex()
                     .pl(theme::sp(7.))
                     .gap(theme::sp(2.))
@@ -872,15 +1901,84 @@ impl Render for ChatPanel {
                     .child(Spinner::new().small().color(p.accent))
                     .child(label),
             );
+            rows.push(row(block.into_any_element()));
         }
 
-        let transcript = div()
+        let transcript = v_flex()
             .id("chat-messages")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
-            .child(h_flex().w_full().justify_center().child(column));
+            .pt(theme::sp(8.))
+            .pb(theme::sp(6.))
+            .gap(theme::sp(3.))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                    this.selection_point = Some(event.position);
+                    cx.notify();
+                }),
+            )
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                if this.selection_point.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .children(rows);
+
+        let floating = self
+            .selection
+            .as_ref()
+            .and(self.selection_point)
+            .filter(|_| uses_daemon && self.draft.is_none())
+            .map(|at| {
+                deferred(
+                    anchored()
+                        .position(at)
+                        .offset(point(px(-48.), px(-40.)))
+                        .snap_to_window_with_margin(px(8.))
+                        .child(
+                            h_flex()
+                                .id("selection-comment")
+                                .h(px(28.))
+                                .px(theme::sp(2.5))
+                                .gap(theme::sp(1.5))
+                                .items_center()
+                                .rounded(theme::radius())
+                                .border_1()
+                                .border_color(p.border_strong)
+                                .bg(p.elevated)
+                                .shadow_md()
+                                .cursor_pointer()
+                                .text_size(theme::text_sm())
+                                .text_color(p.text)
+                                .hover(|style| style.bg(p.hover))
+                                // Act on press: the release would clear the
+                                // text selection first.
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.comment_on_selection(window, cx);
+                                    }),
+                                )
+                                .child(
+                                    Icon::new(IconName::MessageSquarePlus)
+                                        .with_size(px(13.))
+                                        .text_color(p.accent_text),
+                                )
+                                .child("Comment")
+                                .child(
+                                    div()
+                                        .text_size(theme::text_xs())
+                                        .text_color(p.text_faint)
+                                        .child("or just type"),
+                                ),
+                        ),
+                )
+                .with_priority(1)
+            });
 
         let footer = ComposerFooter {
             model: self.model.clone(),
@@ -891,12 +1989,21 @@ impl Render for ChatPanel {
             turns: self.turns,
             billing: self.session_info.as_ref().map(billing_badge),
         };
+        let strip = if show_composer && uses_daemon {
+            self.pending_strip(&groups, &p, cx)
+        } else {
+            None
+        };
 
         v_flex()
             .size_full()
             .bg(p.bg)
             .text_color(p.text)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.type_to_comment(event, window, cx);
+            }))
             .child(transcript)
+            .children(floating)
             .when(show_composer, |this| {
                 this.child(
                     h_flex().w_full().justify_center().child(
@@ -905,6 +2012,7 @@ impl Render for ChatPanel {
                             .max_w(theme::transcript_width())
                             .px(theme::sp(6.))
                             .pb(theme::sp(4.))
+                            .children(strip)
                             .child(self.composer.render(
                                 running,
                                 stoppable,
@@ -917,6 +2025,27 @@ impl Render for ChatPanel {
                     ),
                 )
             })
+    }
+}
+
+impl ChatPanel {
+    /// Gutter and body of one commentable message.
+    fn message_row(
+        &self,
+        message_id: &MessageId,
+        content: AnyElement,
+        threads: &[usize],
+        groups: &[CommentGroup],
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .w_full()
+            .items_start()
+            .group(SharedString::from(format!("msg-{message_id}")))
+            .child(self.gutter(message_id, threads, groups, p, cx))
+            .child(div().flex_1().min_w_0().child(content))
+            .into_any_element()
     }
 }
 
@@ -1137,7 +2266,7 @@ fn render_entry(
     cx: &mut Context<ChatPanel>,
 ) -> impl IntoElement {
     match entry {
-        ChatEntry::User(text) => div().child(text.clone()).into_any_element(),
+        ChatEntry::User { text, .. } => div().child(text.clone()).into_any_element(),
         ChatEntry::Approval(card) => render_approval(card, p, cx).into_any_element(),
         ChatEntry::Assistant {
             markdown,
@@ -1374,7 +2503,7 @@ fn record_message_id(seen: &mut HashSet<MessageId>, id: MessageId) -> bool {
 fn last_unpersisted_assistant(entries: &[ChatEntry]) -> Option<usize> {
     let last_user = entries
         .iter()
-        .rposition(|entry| matches!(entry, ChatEntry::User(_)))
+        .rposition(|entry| matches!(entry, ChatEntry::User { .. }))
         .unwrap_or(0);
     entries
         .iter()
@@ -1417,6 +2546,36 @@ fn reconcile_stored_assistant(
         }
     }
     false
+}
+
+/// Add a stored user message, or adopt the optimistic entry the composer
+/// pushed for it. The stored text may start with the `<review-comments>`
+/// block of the comments delivered with the prompt, so the typed prompt is
+/// compared with the text after it.
+fn append_stored_user(
+    entries: &mut Vec<ChatEntry>,
+    pending_prompt: &mut Option<String>,
+    message: &Message,
+) {
+    let text = message.text();
+    let body = comments::prompt_body(&text);
+    if pending_prompt.as_deref() == Some(body) {
+        *pending_prompt = None;
+    }
+    if let Some(ChatEntry::User {
+        text: existing,
+        message_id: message_id @ None,
+    }) = entries.last_mut()
+        && (existing.as_str() == body || existing == &text)
+    {
+        *existing = text;
+        *message_id = Some(message.id.clone());
+        return;
+    }
+    entries.push(ChatEntry::User {
+        text,
+        message_id: Some(message.id.clone()),
+    });
 }
 
 fn append_stored_assistant(
@@ -1813,7 +2972,10 @@ mod tests {
             }],
         );
         let mut entries = vec![
-            ChatEntry::User("prompt".into()),
+            ChatEntry::User {
+                text: "prompt".into(),
+                message_id: None,
+            },
             ChatEntry::Assistant {
                 markdown: "The answer".into(),
                 streaming: true,
@@ -1836,7 +2998,7 @@ mod tests {
         assert!(matches!(
             entries.as_slice(),
             [
-                ChatEntry::User(_),
+                ChatEntry::User { .. },
                 ChatEntry::Assistant {
                     markdown,
                     streaming: false,
@@ -1892,7 +3054,10 @@ mod tests {
                 text: "done".into(),
             }],
         );
-        let mut entries = vec![ChatEntry::User("first".into())];
+        let mut entries = vec![ChatEntry::User {
+            text: "first".into(),
+            message_id: None,
+        }];
         let mut lifecycle = terminal_transition(true, false);
         assert_eq!(lifecycle, TurnLifecycle::AwaitingAssistant);
         assert!(!can_submit(lifecycle));
@@ -1902,7 +3067,10 @@ mod tests {
         assert_eq!(lifecycle, TurnLifecycle::Idle);
         assert!(can_submit(lifecycle));
 
-        entries.push(ChatEntry::User("second".into()));
+        entries.push(ChatEntry::User {
+            text: "second".into(),
+            message_id: None,
+        });
         lifecycle = TurnLifecycle::Running;
         assert!(accepts_agent_events(lifecycle));
         assert_eq!(
@@ -1919,7 +3087,10 @@ mod tests {
         };
         use trama_domain::agent::ApprovalDecision;
 
-        let mut entries = vec![ChatEntry::User("go".into())];
+        let mut entries = vec![ChatEntry::User {
+            text: "go".into(),
+            message_id: None,
+        }];
         let input = serde_json::json!({"command": "rm -rf target"});
         push_approval(&mut entries, "req-1".into(), "Bash".into(), input.clone());
         push_approval(&mut entries, "req-1".into(), "Bash".into(), input);
@@ -2040,6 +3211,41 @@ mod tests {
                 .count(),
             121
         );
+    }
+
+    #[test]
+    fn stored_prompt_with_delivered_comments_adopts_the_optimistic_entry() {
+        use super::append_stored_user;
+        use trama_domain::message::Role;
+
+        let user = |text: &str| {
+            let mut message = Message::new_assistant(
+                thread("thread-1"),
+                AgentSessionId::generate(),
+                vec![ContentBlock::Text { text: text.into() }],
+            );
+            message.role = Role::User;
+            message
+        };
+        let block = "<review-comments>\nintro\n\n[1] On x:\nComment: y\n</review-comments>";
+        let mut entries = vec![ChatEntry::User {
+            text: "continue".into(),
+            message_id: None,
+        }];
+        let mut pending = Some("continue".to_string());
+        let stored = user(&format!("{block}\n\ncontinue"));
+        append_stored_user(&mut entries, &mut pending, &stored);
+        assert_eq!(pending, None);
+        assert!(matches!(
+            entries.as_slice(),
+            [ChatEntry::User { text, message_id: Some(id) }]
+                if text.starts_with("<review-comments>") && id == &stored.id
+        ));
+
+        // Comments sent on their own arrive as a new entry.
+        let only = user(block);
+        append_stored_user(&mut entries, &mut pending, &only);
+        assert_eq!(entries.len(), 2);
     }
 
     #[test]

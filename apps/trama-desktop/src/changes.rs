@@ -5,15 +5,22 @@
 //! complete list (stats), `diff` provides hunks and may be truncated.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
+use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    Icon, Sizable as _, checkbox::Checkbox, h_flex, scroll::ScrollableElement as _, v_flex,
+    Icon, Sizable as _, checkbox::Checkbox, h_flex, scroll::ScrollableElement as _,
+    tooltip::Tooltip, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use trama_domain::ids::{CommentId, MessageId};
 use trama_protocol::{ChangeBase, FileChange, FileChangeStatus, RepoChanges, ThreadId};
 
+use crate::comments::{
+    self, AnchorBadge, CardHandlers, CommentDraft, CommentGroup, CommentStore, Detached, DiffSlot,
+};
 use crate::diff::{DiffFile, DiffLine, FileStatus, LineKind, parse_unified_diff, totals};
 use crate::theme::{self, Palette};
 
@@ -133,6 +140,48 @@ fn base_hint(base: ChangeBase) -> &'static str {
 pub enum ChangesEvent {
     /// The user picked another base or asked for a refresh.
     Refresh,
+    /// Show the transcript message that answered a comment.
+    RevealMessage(MessageId),
+}
+
+/// Diff lines picked with the mouse, inside one hunk. Typing while lines
+/// are picked starts a comment on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LineSelection {
+    repo: usize,
+    file: usize,
+    hunk: usize,
+    anchor: usize,
+    cursor: usize,
+}
+
+impl LineSelection {
+    fn lines(&self) -> RangeInclusive<usize> {
+        self.anchor.min(self.cursor)..=self.anchor.max(self.cursor)
+    }
+
+    fn in_hunk(&self, repo: usize, file: usize, hunk: usize) -> bool {
+        (self.repo, self.file, self.hunk) == (repo, file, hunk)
+    }
+}
+
+/// Where the open composer sits in the diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DraftAt {
+    /// Under the last picked line.
+    Lines(LineSelection),
+    /// Under a whole hunk.
+    Hunk {
+        repo: usize,
+        file: usize,
+        hunk: usize,
+    },
+    Reply(CommentId),
+}
+
+struct DiffDraft {
+    at: DraftAt,
+    draft: CommentDraft,
 }
 
 enum Content {
@@ -151,6 +200,14 @@ pub struct ChangesPanel {
     collapsed: HashSet<String>,
     /// File key → fingerprint of the change the user marked as seen.
     seen: HashMap<String, u64>,
+    comments: Entity<CommentStore>,
+    focus_handle: FocusHandle,
+    selection: Option<LineSelection>,
+    dragging: bool,
+    draft: Option<DiffDraft>,
+    /// Threads the user opened or closed, overriding the default.
+    thread_open: HashMap<CommentId, bool>,
+    _comments_observer: Subscription,
 }
 
 impl EventEmitter<ChangesEvent> for ChangesPanel {}
@@ -160,14 +217,34 @@ fn file_key(repo: &str, path: &str) -> String {
 }
 
 impl ChangesPanel {
-    pub fn new() -> Self {
+    pub fn new(comments: Entity<CommentStore>, cx: &mut Context<Self>) -> Self {
+        let observer = cx.observe(&comments, |_, _, cx| cx.notify());
         Self {
             base: ChangeBase::default(),
             thread: None,
             content: Content::Idle,
             collapsed: HashSet::new(),
             seen: HashMap::new(),
+            comments,
+            focus_handle: cx.focus_handle(),
+            selection: None,
+            dragging: false,
+            draft: None,
+            thread_open: HashMap::new(),
+            _comments_observer: observer,
         }
+    }
+
+    /// An inline comment composer is open (Escape cancels it rather than
+    /// closing the drawer).
+    pub fn has_draft(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    fn forget_comment_ui(&mut self) {
+        self.selection = None;
+        self.dragging = false;
+        self.draft = None;
     }
 
     pub fn base(&self) -> ChangeBase {
@@ -180,6 +257,8 @@ impl ChangesPanel {
         if self.thread.as_ref() != Some(&thread) {
             self.collapsed.clear();
             self.seen.clear();
+            self.thread_open.clear();
+            self.forget_comment_ui();
             self.content = Content::Loading;
         } else if matches!(self.content, Content::Idle) {
             self.content = Content::Loading;
@@ -201,6 +280,15 @@ impl ChangesPanel {
             return false;
         }
         let views: Vec<RepoView> = repos.iter().map(RepoView::from_changes).collect();
+        // Line indices may point elsewhere in the new diff.
+        if self
+            .draft
+            .as_ref()
+            .is_some_and(|open| !matches!(open.at, DraftAt::Reply(_)))
+        {
+            self.draft = None;
+        }
+        self.selection = None;
         self.replace(views);
         cx.notify();
         true
@@ -247,6 +335,7 @@ impl ChangesPanel {
 
     /// Back to the "no data" state, e.g. when no thread is selected.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.forget_comment_ui();
         self.thread = None;
         self.content = Content::Idle;
         self.collapsed.clear();
@@ -257,6 +346,7 @@ impl ChangesPanel {
     fn select_base(&mut self, base: ChangeBase, cx: &mut Context<Self>) {
         if self.base != base {
             self.base = base;
+            self.forget_comment_ui();
             self.content = Content::Loading;
             self.seen.clear();
             self.collapsed.clear();
@@ -301,10 +391,336 @@ impl ChangesPanel {
     }
 }
 
-impl Default for ChangesPanel {
-    fn default() -> Self {
-        Self::new()
+// -- comments -------------------------------------------------------------
+
+impl ChangesPanel {
+    fn repo_file(&self, repo: usize, file: usize) -> Option<(&RepoView, &DiffFile)> {
+        let Content::Repos(repos) = &self.content else {
+            return None;
+        };
+        let view = repos.get(repo)?;
+        Some((view, view.files.get(file)?))
     }
+
+    /// Comments need the daemon's view of the repository: its id and base.
+    fn commentable(&self, repo: usize) -> bool {
+        self.thread.is_some()
+            && self
+                .repo_file(repo, 0)
+                .is_some_and(|(view, _)| view.base_revision.is_some())
+    }
+
+    /// Pick a line (shift extends within the hunk) and take keyboard focus,
+    /// so typing comments on the pick.
+    fn press_line(
+        &mut self,
+        at: (usize, usize, usize, usize),
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (repo, file, hunk, line) = at;
+        if !self.commentable(repo) {
+            return;
+        }
+        self.focus_handle.focus(window, cx);
+        self.selection = match self.selection {
+            Some(mut picked) if extend && picked.in_hunk(repo, file, hunk) => {
+                picked.cursor = line;
+                Some(picked)
+            }
+            _ => Some(LineSelection {
+                repo,
+                file,
+                hunk,
+                anchor: line,
+                cursor: line,
+            }),
+        };
+        self.dragging = true;
+        cx.notify();
+    }
+
+    fn drag_line(&mut self, at: (usize, usize, usize, usize), cx: &mut Context<Self>) {
+        let (repo, file, hunk, line) = at;
+        if let Some(picked) = self.selection.as_mut()
+            && self.dragging
+            && picked.in_hunk(repo, file, hunk)
+            && picked.cursor != line
+        {
+            picked.cursor = line;
+            cx.notify();
+        }
+    }
+
+    /// ⌘⌥M with lines picked.
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some() && self.draft.is_none()
+    }
+
+    pub fn comment_on_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(picked) = self.selection {
+            self.open_lines_draft(picked, None, window, cx);
+        }
+    }
+
+    fn type_to_comment(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(picked) = self.selection else {
+            return;
+        };
+        if self
+            .draft
+            .as_ref()
+            .is_some_and(|open| open.draft.is_focused(window, cx))
+        {
+            return;
+        }
+        if event.keystroke.key == "escape" {
+            self.selection = None;
+            cx.notify();
+            return;
+        }
+        let Some(text) = comments::typed_text(&event.keystroke) else {
+            return;
+        };
+        cx.stop_propagation();
+        window.prevent_default();
+        self.open_lines_draft(picked, Some(text), window, cx);
+    }
+
+    fn open_lines_draft(
+        &mut self,
+        picked: LineSelection,
+        initial: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((view, file)) = self.repo_file(picked.repo, picked.file) else {
+            return;
+        };
+        let (Some(base), Some(hunk)) = (view.base_revision.as_deref(), file.hunks.get(picked.hunk))
+        else {
+            return;
+        };
+        let target = comments::diff_target(&view.key, &file.path, base, hunk, picked.lines());
+        self.open_draft(DraftAt::Lines(picked), target, None, initial, window, cx);
+    }
+
+    fn open_hunk_draft(
+        &mut self,
+        (repo, file, hunk): (usize, usize, usize),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((view, diff)) = self.repo_file(repo, file) else {
+            return;
+        };
+        let (Some(base), Some(header)) = (
+            view.base_revision.clone(),
+            diff.hunks.get(hunk).map(|hunk| hunk.header.clone()),
+        ) else {
+            return;
+        };
+        let target = trama_protocol::CommentTarget::DiffHunk {
+            repository_id: view.key.as_str().into(),
+            path: diff.path.clone().into(),
+            base_revision: base,
+            hunk_header: header,
+        };
+        self.selection = None;
+        self.open_draft(
+            DraftAt::Hunk { repo, file, hunk },
+            target,
+            None,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    fn open_reply(&mut self, root: CommentId, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self
+            .comments
+            .read(cx)
+            .groups()
+            .into_iter()
+            .find(|group| group.id() == &root)
+            .map(|group| group.root.target);
+        if let Some(target) = target {
+            self.thread_open.insert(root.clone(), true);
+            self.open_draft(
+                DraftAt::Reply(root.clone()),
+                target,
+                Some(root),
+                None,
+                window,
+                cx,
+            );
+        }
+    }
+
+    fn open_draft(
+        &mut self,
+        at: DraftAt,
+        target: trama_protocol::CommentTarget,
+        parent: Option<CommentId>,
+        initial: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dragging = false;
+        let draft = CommentDraft::new(
+            target,
+            parent,
+            initial,
+            window,
+            cx,
+            |this: &mut Self, window, cx| this.submit_draft(window, cx),
+        );
+        self.draft = Some(DiffDraft { at, draft });
+        cx.notify();
+    }
+
+    fn submit_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = &self.draft else {
+            return;
+        };
+        if open.draft.submit(&self.comments, cx) {
+            self.draft = None;
+            self.selection = None;
+            self.focus_handle.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn cancel_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft = None;
+        self.selection = None;
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_thread(&mut self, id: CommentId, cx: &mut Context<Self>) {
+        let default = self
+            .comments
+            .read(cx)
+            .groups()
+            .iter()
+            .find(|group| group.id() == &id)
+            .is_some_and(CommentGroup::open_by_default);
+        let open = self.thread_open.get(&id).copied().unwrap_or(default);
+        self.thread_open.insert(id, !open);
+        cx.notify();
+    }
+
+    fn card_handlers(&self, cx: &mut Context<Self>) -> CardHandlers {
+        let toggle = cx.entity().downgrade();
+        let reply = toggle.clone();
+        let answer = toggle.clone();
+        CardHandlers {
+            store: self.comments.clone(),
+            on_toggle: Rc::new(move |id, _, cx| {
+                let _ = toggle.update(cx, |this, cx| this.toggle_thread(id, cx));
+            }),
+            on_reply: Rc::new(move |id, window, cx| {
+                let _ = reply.update(cx, |this, cx| this.open_reply(id, window, cx));
+            }),
+            on_answer: Rc::new(move |id, _, cx| {
+                let _ = answer.update(cx, |_, cx| cx.emit(ChangesEvent::RevealMessage(id)));
+            }),
+        }
+    }
+
+    fn render_open_draft(
+        &self,
+        open: &DiffDraft,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let submit = cx.listener(|this, _, window, cx| this.submit_draft(window, cx));
+        let weak = cx.entity().downgrade();
+        let cancel: comments::CancelDraft = Rc::new(move |window, cx| {
+            let _ = weak.update(cx, |this, cx| this.cancel_draft(window, cx));
+        });
+        comment_slot(comments::render_draft(
+            "diff-draft",
+            &open.draft,
+            submit,
+            cancel,
+            p,
+            cx,
+        ))
+    }
+
+    /// A thread in the diff: its card (with a reply composer) or a row.
+    #[allow(clippy::too_many_arguments)]
+    fn thread_element(
+        &self,
+        group: &CommentGroup,
+        badge: Option<AnchorBadge>,
+        show_excerpt: bool,
+        handlers: &CardHandlers,
+        now: i64,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let badge = badge.or_else(|| AnchorBadge::for_group(group));
+        let open = self
+            .thread_open
+            .get(group.id())
+            .copied()
+            .unwrap_or_else(|| group.open_by_default());
+        if !open {
+            return comment_slot(comments::render_collapsed(
+                format!("diff-thread-row-{}", group.id()),
+                group,
+                badge,
+                handlers,
+                p,
+            ));
+        }
+        let reply = self
+            .draft
+            .as_ref()
+            .filter(|open| open.at == DraftAt::Reply(group.id().clone()))
+            .map(|open| self.render_open_draft(open, p, cx));
+        comment_slot(comments::render_card(
+            format!("diff-thread-{}", group.id()),
+            group,
+            show_excerpt,
+            badge,
+            reply,
+            handlers,
+            now,
+            p,
+        ))
+    }
+}
+
+/// Comment UI inside the monospace diff column: UI type, and no wider
+/// than the drawer even when long lines widen the column.
+fn comment_slot(element: AnyElement) -> AnyElement {
+    div()
+        .w_full()
+        .max_w(theme::drawer_width() - px(44.))
+        .px(theme::sp(2.))
+        .py(theme::sp(1.5))
+        .font_family(theme::UI_FONT)
+        .text_size(theme::text_ui())
+        .child(element)
+        .into_any_element()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FileFlags {
+    collapsed: bool,
+    seen: bool,
+    hunks_missing: bool,
 }
 
 /// Keep only seen marks whose file still has the identical change.
@@ -410,6 +826,24 @@ impl Render for ChangesPanel {
             )
             .into_any_element(),
             Content::Repos(repos) => {
+                let groups = self.comments.read(cx).groups();
+                let handlers = self.card_handlers(cx);
+                let now = comments::now_secs();
+                let shown: HashSet<(String, String)> = repos
+                    .iter()
+                    .flat_map(|repo| {
+                        repo.files
+                            .iter()
+                            .map(|file| (repo.key.clone(), file.path.clone()))
+                    })
+                    .collect();
+                let elsewhere: Vec<&CommentGroup> = groups
+                    .iter()
+                    .filter(|group| {
+                        comments::target_file(&group.root.target)
+                            .is_some_and(|file| !shown.contains(&file))
+                    })
+                    .collect();
                 let mut list = v_flex()
                     .id("changes-files")
                     .flex_1()
@@ -417,6 +851,27 @@ impl Render for ChangesPanel {
                     .overflow_y_scrollbar()
                     .p(theme::sp(2.))
                     .gap(theme::sp(2.));
+                if !elsewhere.is_empty() {
+                    list = list.child(
+                        div()
+                            .px(theme::sp(1.))
+                            .pt(theme::sp(1.))
+                            .text_size(theme::text_sm())
+                            .text_color(p.text_muted)
+                            .child("Comments on files without changes here"),
+                    );
+                    for group in elsewhere {
+                        list = list.child(self.thread_element(
+                            group,
+                            Some(AnchorBadge::Detached(Detached::OutsideDiff)),
+                            true,
+                            &handlers,
+                            now,
+                            &p,
+                            cx,
+                        ));
+                    }
+                }
                 for (repo_index, repo) in repos.iter().enumerate() {
                     if repo.files.is_empty() && repos.len() > 1 {
                         list = list.child(repo_header(repo, 0, &p));
@@ -446,13 +901,19 @@ impl Render for ChangesPanel {
                         let collapsed = self.collapsed.contains(&key);
                         let seen = self.is_seen(&key, file);
                         let hunks_missing = repo.without_hunks.contains(&file.path);
-                        list = list.child(render_file(
+                        list = list.child(self.render_file(
                             (repo_index, index),
+                            repo,
                             key,
                             file,
-                            collapsed,
-                            seen,
-                            hunks_missing,
+                            FileFlags {
+                                collapsed,
+                                seen,
+                                hunks_missing,
+                            },
+                            &groups,
+                            &handlers,
+                            now,
                             &p,
                             cx,
                         ));
@@ -462,7 +923,23 @@ impl Render for ChangesPanel {
             }
         };
 
-        v_flex().size_full().child(selector).child(body)
+        v_flex()
+            .size_full()
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.type_to_comment(event, window, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.dragging {
+                        this.dragging = false;
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(selector)
+            .child(body)
     }
 }
 
@@ -583,169 +1060,347 @@ fn split_path(path: &str) -> (String, String) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_file(
-    (repo, index): (usize, usize),
-    key: String,
-    file: &DiffFile,
-    collapsed: bool,
-    seen: bool,
-    hunks_missing: bool,
-    p: &Palette,
-    cx: &mut Context<ChangesPanel>,
-) -> impl IntoElement {
-    let (dir, name) = split_path(&file.path);
-    let id = SharedString::from(format!("diff-file-{repo}-{index}"));
-    let header = h_flex()
-        .id(id)
-        .w_full()
-        .gap(theme::sp(2.))
-        .px(theme::sp(2.))
-        .py(theme::sp(1.5))
-        .items_center()
-        .cursor_pointer()
-        .hover(|style| style.bg(p.hover))
-        .when(!collapsed, |this| this.border_b_1().border_color(p.border))
-        .on_click(cx.listener(move |this, _, _, cx| this.toggle_collapsed(key.clone(), cx)))
-        .child(
-            Icon::new(if collapsed {
-                IconName::ChevronRight
-            } else {
-                IconName::ChevronDown
+impl ChangesPanel {
+    #[allow(clippy::too_many_arguments)]
+    fn render_file(
+        &self,
+        (repo, index): (usize, usize),
+        view: &RepoView,
+        key: String,
+        file: &DiffFile,
+        flags: FileFlags,
+        groups: &[CommentGroup],
+        handlers: &CardHandlers,
+        now: i64,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let FileFlags {
+            collapsed,
+            seen,
+            hunks_missing,
+        } = flags;
+        let (dir, name) = split_path(&file.path);
+        let id = SharedString::from(format!("diff-file-{repo}-{index}"));
+        let slots: Vec<(&CommentGroup, DiffSlot)> = groups
+            .iter()
+            .filter_map(|group| {
+                comments::diff_slot(group, &view.key, &file.path, &file.hunks)
+                    .map(|slot| (group, slot))
             })
-            .with_size(px(12.))
-            .text_color(p.text_faint),
-        )
-        .child(
-            div()
-                .w(px(14.))
-                .flex_shrink_0()
-                .font_family(theme::MONO_FONT)
-                .text_size(theme::text_xs())
-                .font_weight(FontWeight::BOLD)
-                .text_color(status_color(file.status, p))
-                .child(file.status.letter()),
-        )
-        .child(
-            h_flex()
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .text_size(theme::text_sm())
-                .child(
-                    div()
-                        .flex_shrink(1.)
-                        .min_w_0()
-                        .truncate()
-                        .text_color(p.text_faint)
-                        .child(dir),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_color(if seen { p.text_muted } else { p.text })
-                        .child(name),
-                )
-                .when_some(file.old_path.clone(), |this, old| {
-                    this.child(
-                        div()
-                            .flex_shrink_0()
-                            .pl(theme::sp(1.5))
-                            .text_color(p.text_faint)
-                            .child(format!("\u{2190} {old}")),
-                    )
-                }),
-        )
-        .child(counts(file.additions, file.deletions, p))
-        .child(
-            Checkbox::new(SharedString::from(format!("seen-{repo}-{index}")))
-                .label("Seen")
-                .checked(seen)
-                .small()
-                .on_click(cx.listener(move |this, checked: &bool, _, cx| {
-                    this.set_seen(repo, index, *checked, cx);
-                })),
-        );
-
-    let body = (!collapsed).then(|| {
-        if hunks_missing {
-            return div()
-                .px(theme::sp(3.))
-                .py(theme::sp(2.))
-                .text_size(theme::text_sm())
-                .text_color(p.text_muted)
-                .child("Diff not included (past the size limit).")
-                .into_any_element();
-        }
-        if file.binary {
-            return div()
-                .px(theme::sp(3.))
-                .py(theme::sp(2.))
-                .text_size(theme::text_sm())
-                .text_color(p.text_muted)
-                .child("Binary file not shown.")
-                .into_any_element();
-        }
-        if file.hunks.is_empty() {
-            return div()
-                .px(theme::sp(3.))
-                .py(theme::sp(2.))
-                .text_size(theme::text_sm())
-                .text_color(p.text_muted)
-                .child("No content changes (mode or rename only).")
-                .into_any_element();
-        }
-        // Long lines scroll sideways instead of being clipped.
-        h_flex()
-            .id(SharedString::from(format!("diff-body-{repo}-{index}")))
+            .collect();
+        let thread_count = slots.len();
+        let commentable = view.base_revision.is_some() && self.thread.is_some();
+        let header = h_flex()
+            .id(id)
             .w_full()
-            .overflow_x_scroll()
+            .gap(theme::sp(2.))
+            .px(theme::sp(2.))
+            .py(theme::sp(1.5))
+            .items_center()
+            .cursor_pointer()
+            .hover(|style| style.bg(p.hover))
+            .when(!collapsed, |this| this.border_b_1().border_color(p.border))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_collapsed(key.clone(), cx)))
             .child(
-                v_flex()
+                Icon::new(if collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .with_size(px(12.))
+                .text_color(p.text_faint),
+            )
+            .child(
+                div()
+                    .w(px(14.))
                     .flex_shrink_0()
-                    .min_w_full()
                     .font_family(theme::MONO_FONT)
                     .text_size(theme::text_xs())
-                    .children(file.hunks.iter().flat_map(|hunk| {
-                        let header = div()
-                            .w_full()
-                            .px(theme::sp(2.))
-                            .py(theme::sp(0.5))
-                            .bg(p.diff_hunk_bg)
-                            .text_color(p.text_faint)
-                            .whitespace_nowrap()
-                            .child(format!(
-                                "@@ -{},{} +{},{} @@ {}",
-                                hunk.old_start,
-                                hunk.old_len,
-                                hunk.new_start,
-                                hunk.new_len,
-                                hunk.section
-                            ))
-                            .into_any_element();
-                        std::iter::once(header).chain(
-                            hunk.lines
-                                .iter()
-                                .map(|line| render_line(line, p).into_any_element()),
-                        )
-                    })),
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(status_color(file.status, p))
+                    .child(file.status.letter()),
             )
-            .into_any_element()
-    });
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_size(theme::text_sm())
+                    .child(
+                        div()
+                            .flex_shrink(1.)
+                            .min_w_0()
+                            .truncate()
+                            .text_color(p.text_faint)
+                            .child(dir),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(if seen { p.text_muted } else { p.text })
+                            .child(name),
+                    )
+                    .when_some(file.old_path.clone(), |this, old| {
+                        this.child(
+                            div()
+                                .flex_shrink_0()
+                                .pl(theme::sp(1.5))
+                                .text_color(p.text_faint)
+                                .child(format!("\u{2190} {old}")),
+                        )
+                    }),
+            )
+            .when(thread_count > 0, |this| {
+                this.child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .gap(theme::sp(0.5))
+                        .items_center()
+                        .text_size(theme::text_xs())
+                        .text_color(p.accent_text)
+                        .child(Icon::new(IconName::MessageSquare).with_size(px(11.)))
+                        .child(thread_count.to_string()),
+                )
+            })
+            .child(counts(file.additions, file.deletions, p))
+            .child(
+                Checkbox::new(SharedString::from(format!("seen-{repo}-{index}")))
+                    .label("Seen")
+                    .checked(seen)
+                    .small()
+                    .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                        this.set_seen(repo, index, *checked, cx);
+                    })),
+            );
 
-    v_flex()
-        .w_full()
-        .flex_shrink_0()
-        .rounded(theme::radius())
-        .border_1()
-        .border_color(p.border)
-        .bg(p.bg)
-        .overflow_hidden()
-        .child(header)
-        .children(body)
+        let body = (!collapsed).then(|| {
+            let detached: Vec<AnyElement> = slots
+                .iter()
+                .filter_map(|(group, slot)| match slot {
+                    DiffSlot::Detached(reason) => Some(self.thread_element(
+                        group,
+                        Some(match reason {
+                            Detached::Orphaned => AnchorBadge::Detached(Detached::Orphaned),
+                            other => AnchorBadge::Detached(*other),
+                        }),
+                        true,
+                        handlers,
+                        now,
+                        p,
+                        cx,
+                    )),
+                    _ => None,
+                })
+                .collect();
+            let notice = |text: &'static str| {
+                div()
+                    .px(theme::sp(3.))
+                    .py(theme::sp(2.))
+                    .text_size(theme::text_sm())
+                    .text_color(p.text_muted)
+                    .child(text)
+                    .into_any_element()
+            };
+            if hunks_missing {
+                return v_flex()
+                    .children(detached)
+                    .child(notice("Diff not included (past the size limit)."))
+                    .into_any_element();
+            }
+            if file.binary {
+                return v_flex()
+                    .children(detached)
+                    .child(notice("Binary file not shown."))
+                    .into_any_element();
+            }
+            if file.hunks.is_empty() {
+                return v_flex()
+                    .children(detached)
+                    .child(notice("No content changes (mode or rename only)."))
+                    .into_any_element();
+            }
+
+            let mut column = v_flex()
+                .flex_shrink_0()
+                .min_w_full()
+                .font_family(theme::MONO_FONT)
+                .text_size(theme::text_xs());
+            for (hunk_ix, hunk) in file.hunks.iter().enumerate() {
+                let hunk_group = SharedString::from(format!("hunk-{repo}-{index}-{hunk_ix}"));
+                column = column.child(
+                    h_flex()
+                        .id(SharedString::from(format!(
+                            "diff-hunk-{repo}-{index}-{hunk_ix}"
+                        )))
+                        .w_full()
+                        .group(hunk_group.clone())
+                        .px(theme::sp(2.))
+                        .py(theme::sp(0.5))
+                        .gap(theme::sp(2.))
+                        .bg(p.diff_hunk_bg)
+                        .text_color(p.text_faint)
+                        .whitespace_nowrap()
+                        .child(format!("{} {}", hunk.header, hunk.section))
+                        .when(commentable, |this| {
+                            this.child(
+                                h_flex()
+                                    .id(SharedString::from(format!(
+                                        "diff-hunk-comment-{repo}-{index}-{hunk_ix}"
+                                    )))
+                                    .gap(theme::sp(1.))
+                                    .px(theme::sp(1.5))
+                                    .items_center()
+                                    .rounded(theme::radius_sm())
+                                    .cursor_pointer()
+                                    .font_family(theme::UI_FONT)
+                                    .text_color(p.accent_text)
+                                    .opacity(0.)
+                                    .group_hover(hunk_group.clone(), |style| style.opacity(1.))
+                                    .hover(|style| style.bg(p.accent_soft))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_hunk_draft((repo, index, hunk_ix), window, cx);
+                                    }))
+                                    .child(Icon::new(IconName::Plus).with_size(px(10.)))
+                                    .child("Comment on hunk"),
+                            )
+                        }),
+                );
+                for (line_ix, line) in hunk.lines.iter().enumerate() {
+                    let at = (repo, index, hunk_ix, line_ix);
+                    let picked = self.selection.is_some_and(|picked| {
+                        picked.in_hunk(repo, index, hunk_ix) && picked.lines().contains(&line_ix)
+                    });
+                    let line_group =
+                        SharedString::from(format!("diff-line-{repo}-{index}-{hunk_ix}-{line_ix}"));
+                    let plus = div()
+                        .id(SharedString::from(format!(
+                            "diff-line-comment-{repo}-{index}-{hunk_ix}-{line_ix}"
+                        )))
+                        .w(px(16.))
+                        .h(px(16.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(theme::radius_sm())
+                        .bg(p.accent)
+                        .cursor_pointer()
+                        .opacity(0.)
+                        .when(commentable, |this| {
+                            this.group_hover(line_group.clone(), |style| style.opacity(1.))
+                        })
+                        .tooltip(|window, cx| {
+                            Tooltip::new(
+                                "Comment on this line. Tip: select lines and start typing.",
+                            )
+                            .build(window, cx)
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                let picked = LineSelection {
+                                    repo,
+                                    file: index,
+                                    hunk: hunk_ix,
+                                    anchor: line_ix,
+                                    cursor: line_ix,
+                                };
+                                this.selection = Some(picked);
+                                this.open_lines_draft(picked, None, window, cx);
+                            }),
+                        )
+                        .child(
+                            Icon::new(IconName::Plus)
+                                .with_size(px(11.))
+                                .text_color(gpui_kit::white()),
+                        );
+                    column = column.child(
+                        render_line(line, picked, p)
+                            .relative()
+                            .id(line_group.clone())
+                            .group(line_group)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    this.press_line(at, event.modifiers.shift, window, cx);
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(
+                                move |this, event: &MouseMoveEvent, _, cx| {
+                                    if event.pressed_button == Some(MouseButton::Left) {
+                                        this.drag_line(at, cx);
+                                    }
+                                },
+                            ))
+                            .child(div().absolute().left(px(1.)).top(px(1.)).child(plus)),
+                    );
+                    for (group, slot) in &slots {
+                        if *slot
+                            == (DiffSlot::Line {
+                                hunk: hunk_ix,
+                                line: line_ix,
+                            })
+                        {
+                            column = column.child(
+                                self.thread_element(group, None, false, handlers, now, p, cx),
+                            );
+                        }
+                    }
+                    if let Some(open) = &self.draft
+                        && let DraftAt::Lines(picked) = open.at
+                        && picked.in_hunk(repo, index, hunk_ix)
+                        && *picked.lines().end() == line_ix
+                    {
+                        column = column.child(self.render_open_draft(open, p, cx));
+                    }
+                }
+                for (group, slot) in &slots {
+                    if *slot == DiffSlot::Hunk(hunk_ix) {
+                        column = column
+                            .child(self.thread_element(group, None, true, handlers, now, p, cx));
+                    }
+                }
+                if let Some(open) = &self.draft
+                    && open.at
+                        == (DraftAt::Hunk {
+                            repo,
+                            file: index,
+                            hunk: hunk_ix,
+                        })
+                {
+                    column = column.child(self.render_open_draft(open, p, cx));
+                }
+            }
+            // Long lines scroll sideways instead of being clipped.
+            v_flex()
+                .w_full()
+                .children(detached)
+                .child(
+                    h_flex()
+                        .id(SharedString::from(format!("diff-body-{repo}-{index}")))
+                        .w_full()
+                        .overflow_x_scroll()
+                        .child(column),
+                )
+                .into_any_element()
+        });
+
+        v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .rounded(theme::radius())
+            .border_1()
+            .border_color(p.border)
+            .bg(p.bg)
+            .overflow_hidden()
+            .child(header)
+            .children(body)
+    }
 }
 
-fn render_line(line: &DiffLine, p: &Palette) -> impl IntoElement {
+fn render_line(line: &DiffLine, picked: bool, p: &Palette) -> Div {
     let (bg, sign, text_color) = match line.kind {
         LineKind::Added => (Some(p.diff_add_bg), "+", p.text),
         LineKind::Removed => (Some(p.diff_del_bg), "-", p.text),
@@ -769,6 +1424,7 @@ fn render_line(line: &DiffLine, p: &Palette) -> impl IntoElement {
     h_flex()
         .w_full()
         .when_some(bg, |this, bg| this.bg(bg))
+        .when(picked, |this| this.bg(p.accent.opacity(0.22)))
         .child(number(line.old_line))
         .child(number(line.new_line))
         .child(
