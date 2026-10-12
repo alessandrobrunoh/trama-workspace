@@ -143,6 +143,8 @@ async fn real_claude_asks_trama_before_running_bash() {
             text: "Use the Bash tool to run exactly: touch approved-by-trama.txt \
                    Then reply with the single word DONE."
                 .into(),
+            mentions: Vec::new(),
+            terminals: Vec::new(),
         },
     )
     .await;

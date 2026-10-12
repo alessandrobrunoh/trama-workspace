@@ -552,6 +552,8 @@ impl ChatPanel {
             if self.client.send(ClientMessage::SendPrompt {
                 thread_id: thread_id.clone(),
                 text: prompt.clone(),
+                mentions: Vec::new(),
+                terminals: Vec::new(),
             }) == SendStatus::Rejected
             {
                 self.restore_prompt(&thread_id, &prompt, window, cx);

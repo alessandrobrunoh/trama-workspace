@@ -14,7 +14,7 @@ mod approval_tests;
 mod testing;
 
 pub use error::{DaemonError, Result};
-pub use session::SessionManager;
+pub use session::{NoCollaborators, PeopleSource, Person, PromptContext, SessionManager};
 
 use crate::approval::ApprovalHookSettings;
 use crate::claude::ProductionAdapter;
@@ -118,6 +118,7 @@ pub async fn serve_on_socket(socket_path: &Path, sessions: SessionManager) -> Re
         }
     }
 
+    sessions.shutdown_terminals();
     let _ = std::fs::remove_file(socket_path);
     Ok(())
 }

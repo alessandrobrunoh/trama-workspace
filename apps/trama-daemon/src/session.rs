@@ -2,8 +2,16 @@
 
 mod comments;
 #[cfg(test)]
+mod composer_tests;
+mod context;
+#[cfg(test)]
 mod setup_tests;
+mod skills;
 mod subthreads;
+mod terminal;
+
+pub(crate) use context::model_choices;
+pub use context::{NoCollaborators, PeopleSource, Person, PromptContext};
 
 use crate::approval::{self, ApprovalHookSettings, HookDecision};
 
@@ -150,6 +158,8 @@ pub struct SessionManager {
     billing: BillingMode,
     /// `None`: no approval channel; the CLI denies prompts on its own.
     approval_hook: Option<Arc<ApprovalHookSettings>>,
+    /// Mentions, skills, model selection and terminals.
+    composer: Arc<context::ComposerState>,
 }
 
 impl SessionManager {
@@ -176,6 +186,7 @@ impl SessionManager {
             })),
             billing: BillingMode::default(),
             approval_hook: None,
+            composer: Arc::new(context::ComposerState::new()),
         }
     }
 
@@ -875,13 +886,26 @@ impl SessionManager {
     /// message is exactly the prompt sent. A second prompt on a busy or
     /// migrating thread returns [`DaemonError::Busy`].
     pub async fn send_prompt(&self, thread_id: ThreadId, text: String) -> Result<Message> {
-        self.start_turn(thread_id, text, false).await
+        self.start_turn(thread_id, text, false, PromptContext::default())
+            .await
+    }
+
+    /// [`Self::send_prompt`] with `@` mentions and terminal snapshots,
+    /// expanded into a context block (see [`context`]).
+    pub async fn send_prompt_with_context(
+        &self,
+        thread_id: ThreadId,
+        text: String,
+        context: PromptContext,
+    ) -> Result<Message> {
+        self.start_turn(thread_id, text, false, context).await
     }
 
     /// Deliver the pending comments as a turn of their own. Fails with
     /// [`DaemonError::Invalid`] when nothing is pending.
     pub async fn send_comments(&self, thread_id: ThreadId) -> Result<Message> {
-        self.start_turn(thread_id, String::new(), true).await
+        self.start_turn(thread_id, String::new(), true, PromptContext::default())
+            .await
     }
 
     async fn start_turn(
@@ -889,6 +913,7 @@ impl SessionManager {
         thread_id: ThreadId,
         text: String,
         comments_only: bool,
+        attached: PromptContext,
     ) -> Result<Message> {
         if self.db.get_thread(&thread_id).await?.is_none() {
             return Err(DaemonError::NotFound(format!("thread {thread_id}")));
@@ -913,11 +938,25 @@ impl SessionManager {
             return Err(err);
         }
 
-        let delivery = match self.pending_delivery(&thread_id).await {
-            Ok(delivery) => delivery,
+        let attached = match self.prompt_context(&thread_id, &attached).await {
+            Ok(block) => block,
             Err(err) => {
                 self.release_turn(&thread_id);
                 return Err(err);
+            }
+        };
+        let text = context::compose_with_context(&text, &attached);
+        // A slash command must reach Claude first and unchanged; pending
+        // comments wait for the next prompt.
+        let delivery = if !comments_only && context::is_slash_command(&text) {
+            None
+        } else {
+            match self.pending_delivery(&thread_id).await {
+                Ok(delivery) => delivery,
+                Err(err) => {
+                    self.release_turn(&thread_id);
+                    return Err(err);
+                }
             }
         };
         if comments_only && delivery.is_none() {
@@ -1556,10 +1595,16 @@ impl SessionManager {
                 .get(thread_id)
                 .and_then(|t| t.live_session.clone())
         } {
-            return Ok(session);
+            // A model change applies from the next turn: restart the
+            // session, which then resumes the conversation with `--model`.
+            if !self.live_model_outdated(thread_id).await? {
+                return Ok(session);
+            }
+            self.retire_live_session(thread_id, session).await;
         }
 
         let mut config = self.session_config(thread_id).await?;
+        let started_model = config.model.clone();
         let token = self.attach_approval_hook(thread_id, &mut config);
         let (tx, rx) = async_channel::unbounded();
         let session = match self.adapter.start(config, tx).await {
@@ -1586,12 +1631,17 @@ impl SessionManager {
             thread.session_allowed_tools.clear();
             thread.session_info = None;
         }
+        self.composer.note_live_model(thread_id, started_model);
 
         let manager = self.clone();
         let pump_thread = thread_id.clone();
+        let pump_session = session.id.clone();
         tokio::spawn(async move {
             while let Ok(event) = rx.recv().await {
                 manager.on_agent_event(&pump_thread, event).await;
+            }
+            if manager.composer.take_retired(&pump_session) {
+                return;
             }
             manager.on_pump_closed(&pump_thread).await;
         });
@@ -1678,7 +1728,7 @@ impl SessionManager {
             Some(id) => self.db.get_workspace(id).await?,
             None => None,
         };
-        let (permission_mode, model) = match &workspace {
+        let (permission_mode, workspace_model) = match &workspace {
             Some(ws) => (
                 permission_mode_from_settings(&ws.settings),
                 ws.settings
@@ -1692,7 +1742,13 @@ impl SessionManager {
                 DEFAULT_CLAUDE_MODEL.to_string(),
             ),
         };
-        let model = Some(model);
+        // The thread's own choice (or its parent's) wins over the workspace,
+        // which falls back to DEFAULT_CLAUDE_MODEL.
+        let model = Some(
+            self.thread_model_override(&thread)
+                .await?
+                .unwrap_or(workspace_model),
+        );
 
         let own_session = self
             .db
@@ -1765,6 +1821,15 @@ impl SessionManager {
                     crate::log::warn(format!("failed to persist external session id: {err}"));
                 }
             }
+        }
+
+        if let AgentEvent::CommandsReported {
+            slash_commands,
+            skills,
+        } = &event
+        {
+            self.record_reported_commands(thread_id, slash_commands, skills)
+                .await;
         }
 
         if matches!(event, AgentEvent::SessionInfo { .. }) {
@@ -2235,6 +2300,7 @@ fn thread_snapshot(thread: &Thread) -> ThreadSnapshot {
         parent_thread_id: thread.parent_thread_id.clone(),
         kind: thread.kind,
         review_verdict: None,
+        model: None,
     }
 }
 

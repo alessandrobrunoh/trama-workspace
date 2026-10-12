@@ -143,6 +143,7 @@ impl SessionManager {
         let mut out = Vec::with_capacity(threads.len());
         for thread in threads {
             let mut snapshot = thread_snapshot(thread);
+            snapshot.model = self.db.thread_model(&thread.id).await?;
             if thread.kind == ThreadKind::Review {
                 snapshot.review_verdict = self
                     .db

@@ -769,7 +769,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let ClientMessage::SendPrompt { thread_id, text } = message {
+        if let ClientMessage::SendPrompt {
+            thread_id, text, ..
+        } = message
+        {
             let restore = self.sidebar.update(cx, |sidebar, _cx| {
                 sidebar
                     .onboarding

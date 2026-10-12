@@ -94,6 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &ClientMessage::SendPrompt {
                         thread_id: tid,
                         text: prompt.clone(),
+                        mentions: Vec::new(),
+                        terminals: Vec::new(),
                     },
                 )
                 .await?;

@@ -57,11 +57,11 @@ Do not override `HOME` for that: the `claude` child process needs your real
 Starting the binaries directly does not acquire Cargo's build lock. Do not
 start parallel `cargo run`/check/test commands while building. The desktop also
 offers **Start daemon** when the sibling binary is installed and no daemon is
-listening. Stop old app/daemon processes before restarting with protocol v6.
+listening. Stop old app/daemon processes before restarting with protocol v7.
 Build profiles and editor-check settings are described in
 [build and disk usage](docs/build-and-space.md).
 
-The UI and daemon speak newline-delimited JSON (`crates/trama-protocol`). First message on a connection must be `Hello` with `protocol_version = 6`. A mismatch is rejected at the handshake; it does not rewrite stored threads or workspace ids. See [onboarding and legacy migration](docs/onboarding-and-migration.md).
+The UI and daemon speak newline-delimited JSON (`crates/trama-protocol`). First message on a connection must be `Hello` with `protocol_version = 7`. A mismatch is rejected at the handshake; it does not rewrite stored threads or workspace ids. See [onboarding and legacy migration](docs/onboarding-and-migration.md).
 
 ## Roadmap
 

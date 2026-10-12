@@ -682,6 +682,7 @@ mod tests {
             parent_thread_id: parent.map(ThreadId::from),
             kind,
             review_verdict: None,
+            model: None,
         }
     }
 

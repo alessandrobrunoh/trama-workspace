@@ -839,6 +839,7 @@ mod tests {
             parent_thread_id: None,
             kind: trama_protocol::ThreadKind::Top,
             review_verdict: None,
+            model: None,
         }
     }
 

@@ -27,7 +27,9 @@
 //! and the `session_info` / `approval_resolved` agent events. **5** added
 //! subthreads, changes, pull changes, review verdicts and land results. **6**
 //! adds anchored comments (create, list, reply, resolve, reopen, delete, send)
-//! and delivers pending comments with `SendPrompt`. Each bump is
+//! and delivers pending comments with `SendPrompt`. **7** adds the composer
+//! backend: `@` mentionables, `/` skills, per-thread model selection, inline
+//! terminals, and `SendPrompt.mentions` / `SendPrompt.terminals`. Each bump is
 //! transport-only. Persisted domain ids and SQLite rows are not rewritten.
 //!
 //! A version mismatch fails the handshake (`Welcome.accepted = false`). Extra object
@@ -50,6 +52,11 @@ pub use trama_domain::thread::ThreadKind;
 
 /// Wire protocol version carried in `Hello` / `Welcome`.
 ///
+/// Version 7 adds the composer backend: `ListMentionables`, `ListSkills`,
+/// `SetThreadModel`, `ListModels`, inline terminals (`OpenTerminal`,
+/// `TerminalInput`, `ResizeTerminal`, `CloseTerminal`, `ListTerminals`,
+/// `ReplayTerminal`), `ThreadSnapshot.model`, and `SendPrompt` mentions and
+/// terminal attachments.
 /// Version 6 adds anchored comments: `CreateComment`, `ListComments`,
 /// `ResolveComment`, `ReopenComment`, `DeleteComment`, `SendComments`, and
 /// `SendPrompt` now delivers the thread's pending comments with the prompt.
@@ -58,7 +65,7 @@ pub use trama_domain::thread::ThreadKind;
 /// Version 4 added the Claude approval channel and 3 thread checkout
 /// discovery. It does not migrate stored data; peers with a different version
 /// are rejected at handshake time.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Environment variable that relocates the whole app-data directory (socket,
 /// database, config, legacy checkouts). Use it for isolated test instances
@@ -112,9 +119,20 @@ pub enum ClientMessage {
     /// Run a turn. The thread's pending comments are delivered with it: the
     /// agent receives a comment block followed by `text`, and the stored user
     /// message holds exactly what was sent.
+    ///
+    /// `mentions` are expanded into a short `Referenced:` preamble (absolute
+    /// checkout paths, thread excerpts, names); `terminals` attach a plain-text
+    /// snapshot of each terminal's recent output. A `text` starting with `/`
+    /// is a Claude Code slash command or skill: it is sent first and
+    /// unchanged, attachments follow it, and pending comments wait for the
+    /// next prompt.
     SendPrompt {
         thread_id: ThreadId,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mentions: Vec<PromptMention>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        terminals: Vec<String>,
     },
     Interrupt {
         thread_id: ThreadId,
@@ -228,7 +246,160 @@ pub enum ClientMessage {
     SendComments {
         thread_id: ThreadId,
     },
+    /// `@` completion: files and directories of the thread's checkouts,
+    /// threads of the same workspace, and people, fuzzy-ranked by `query`.
+    /// `limit` defaults to 30 (max 200). Answered with `Mentionables`.
+    ListMentionables {
+        thread_id: ThreadId,
+        #[serde(default)]
+        query: String,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    /// `/` completion: skills and commands visible to the thread's agent.
+    /// Answered with `Skills`.
+    ListSkills {
+        thread_id: ThreadId,
+    },
+    /// Model for the thread's next turns (`None` or `"default"`: the
+    /// workspace default). Applied on the next turn, resuming the session
+    /// with `--model`. Answered with `ThreadModelChanged` (also broadcast).
+    SetThreadModel {
+        thread_id: ThreadId,
+        #[serde(default)]
+        model: Option<String>,
+    },
+    /// Answered with `Models`.
+    ListModels,
+    /// Start an interactive terminal (a real PTY) in the thread's checkout
+    /// (`repository_id`, else the first one). `command` runs through the
+    /// user's shell; without it an interactive shell starts. Output goes to
+    /// the thread's subscribers. Answered with `TerminalOpened`.
+    OpenTerminal {
+        thread_id: ThreadId,
+        #[serde(default)]
+        repository_id: Option<RepositoryId>,
+        #[serde(default)]
+        command: Option<String>,
+        cols: u16,
+        rows: u16,
+    },
+    /// Keystrokes for the terminal, UTF-8 text as typed (control characters
+    /// included, e.g. `"\u0003"` for Ctrl-C).
+    TerminalInput {
+        terminal_id: String,
+        data: String,
+    },
+    ResizeTerminal {
+        terminal_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    /// Kill the terminal (if running) and forget it.
+    CloseTerminal {
+        terminal_id: String,
+    },
+    /// Answered with `Terminals` (running and exited terminals of the thread).
+    ListTerminals {
+        thread_id: ThreadId,
+    },
+    /// Re-send the bounded scrollback as one `TerminalOutput` with
+    /// `replay = true`, e.g. after reconnecting.
+    ReplayTerminal {
+        terminal_id: String,
+    },
     Shutdown,
+}
+
+/// What an `@` mention refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MentionKind {
+    File,
+    Directory,
+    Thread,
+    Person,
+}
+
+/// One `@` completion. `value` is opaque: send it back unchanged in
+/// `SendPrompt.mentions` (files and directories: `<repository_id>:<path>`,
+/// threads: the thread id, people: a person id).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mentionable {
+    pub kind: MentionKind,
+    pub label: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub value: String,
+}
+
+/// A mention carried by `SendPrompt`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptMention {
+    pub kind: MentionKind,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillSource {
+    /// The thread's checkout (`.claude/skills`, `.agents/skills`,
+    /// `.claude/commands`).
+    Project,
+    /// `~/.claude/skills`, `~/.claude/commands`.
+    User,
+    /// A Claude Code plugin under `~/.claude/plugins`.
+    Plugin,
+    /// Built into Claude Code, or reported by the agent without a file Trama
+    /// could find.
+    Builtin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillKind {
+    Skill,
+    Command,
+}
+
+/// One `/` completion. Send `/<name> [args]` as the prompt text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillInfo {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub source: SkillSource,
+    pub kind: SkillKind,
+}
+
+/// A selectable model. `id` `"default"` clears the thread override.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub label: String,
+}
+
+/// How a terminal's process ended. `signal` is set when it was killed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalExitStatus {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+}
+
+/// A terminal as listed by `ListTerminals`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSnapshot {
+    pub terminal_id: String,
+    pub thread_id: ThreadId,
+    pub repository_id: RepositoryId,
+    pub cwd: PathBuf,
+    pub command: Option<String>,
+    pub cols: u16,
+    pub rows: u16,
+    /// Sequence number of the latest output chunk (0: none yet).
+    pub last_seq: u64,
+    /// `None` while running.
+    pub exit_status: Option<TerminalExitStatus>,
 }
 
 /// Where a comment is in its lifecycle. Serialized with a `kind` tag.
@@ -414,6 +585,54 @@ pub enum DaemonMessage {
         thread_id: ThreadId,
         comment_ids: Vec<CommentId>,
     },
+    /// Reply to `ListMentionables`, best match first.
+    Mentionables {
+        thread_id: ThreadId,
+        query: String,
+        items: Vec<Mentionable>,
+    },
+    /// Reply to `ListSkills`, sorted by name.
+    Skills {
+        thread_id: ThreadId,
+        items: Vec<SkillInfo>,
+    },
+    /// Reply to `SetThreadModel`; also broadcast to the thread's subscribers.
+    ThreadModelChanged {
+        thread_id: ThreadId,
+        model: Option<String>,
+    },
+    /// Reply to `ListModels`.
+    Models {
+        items: Vec<ModelInfo>,
+    },
+    /// Reply to `OpenTerminal`.
+    TerminalOpened {
+        thread_id: ThreadId,
+        terminal: TerminalSnapshot,
+    },
+    /// Raw PTY output, base64 (standard alphabet, padded) so escape sequences
+    /// and split UTF-8 survive. `seq` increases by one per chunk. Sent to the
+    /// thread's subscribers; `replay` marks a `ReplayTerminal` answer that
+    /// carries the whole retained scrollback.
+    TerminalOutput {
+        thread_id: ThreadId,
+        terminal_id: String,
+        data: String,
+        seq: u64,
+        #[serde(default)]
+        replay: bool,
+    },
+    /// The terminal's process ended (sent to the thread's subscribers).
+    TerminalExited {
+        thread_id: ThreadId,
+        terminal_id: String,
+        status: TerminalExitStatus,
+    },
+    /// Reply to `ListTerminals`.
+    Terminals {
+        thread_id: ThreadId,
+        terminals: Vec<TerminalSnapshot>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -457,6 +676,9 @@ pub struct ThreadSnapshot {
     /// Latest verdict of a review subthread.
     #[serde(default)]
     pub review_verdict: Option<ReviewVerdict>,
+    /// The thread's model override; `None` uses the workspace default.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 fn top_kind() -> ThreadKind {
@@ -535,6 +757,7 @@ mod tests {
             parent_thread_id: None,
             kind: ThreadKind::Top,
             review_verdict: None,
+            model: None,
         }
     }
 
@@ -573,6 +796,8 @@ mod tests {
             ClientMessage::SendPrompt {
                 thread_id: tid.clone(),
                 text: "hello".into(),
+                mentions: Vec::new(),
+                terminals: Vec::new(),
             },
             ClientMessage::Interrupt {
                 thread_id: tid.clone(),
@@ -776,7 +1001,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&DaemonMessage::ThreadMigrated(snapshot_th())).unwrap(),
             format!(
-                r#"{{"type":"thread_migrated","payload":{{"id":"{thread}","title":"Fix auth","repo_count":1,"parent_thread_id":null,"kind":"top","review_verdict":null}}}}"#
+                r#"{{"type":"thread_migrated","payload":{{"id":"{thread}","title":"Fix auth","repo_count":1,"parent_thread_id":null,"kind":"top","review_verdict":null,"model":null}}}}"#
             )
         );
         roundtrip_eq(&repo);
@@ -842,8 +1067,209 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_six() {
-        assert_eq!(PROTOCOL_VERSION, 6);
+    fn protocol_version_is_seven() {
+        assert_eq!(PROTOCOL_VERSION, 7);
+    }
+
+    #[test]
+    fn composer_contract_shapes() {
+        let tid = thread_id();
+        // Older clients omit the attachments; empty ones are not serialized.
+        let plain: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type":"send_prompt","payload":{"thread_id": tid.to_string(), "text":"hi"}}))
+        .unwrap();
+        assert_eq!(
+            plain,
+            ClientMessage::SendPrompt {
+                thread_id: tid.clone(),
+                text: "hi".into(),
+                mentions: vec![],
+                terminals: vec![],
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({"type":"send_prompt","payload":{"thread_id": tid.to_string(), "text":"hi"}})
+        );
+        let send = ClientMessage::SendPrompt {
+            thread_id: tid.clone(),
+            text: "look".into(),
+            mentions: vec![PromptMention {
+                kind: MentionKind::File,
+                value: "repo1:src/lib.rs".into(),
+            }],
+            terminals: vec!["term-1".into()],
+        };
+        assert_eq!(
+            serde_json::to_value(&send).unwrap()["payload"],
+            serde_json::json!({"thread_id": tid.to_string(), "text":"look",
+                "mentions":[{"kind":"file","value":"repo1:src/lib.rs"}],
+                "terminals":["term-1"]})
+        );
+        let client = [
+            send,
+            ClientMessage::ListMentionables {
+                thread_id: tid.clone(),
+                query: "lib".into(),
+                limit: Some(10),
+            },
+            ClientMessage::ListSkills {
+                thread_id: tid.clone(),
+            },
+            ClientMessage::SetThreadModel {
+                thread_id: tid.clone(),
+                model: Some("claude-opus-5-5".into()),
+            },
+            ClientMessage::ListModels,
+            ClientMessage::OpenTerminal {
+                thread_id: tid.clone(),
+                repository_id: None,
+                command: Some("cargo test".into()),
+                cols: 80,
+                rows: 24,
+            },
+            ClientMessage::TerminalInput {
+                terminal_id: "term-1".into(),
+                data: "ls\r".into(),
+            },
+            ClientMessage::ResizeTerminal {
+                terminal_id: "term-1".into(),
+                cols: 120,
+                rows: 40,
+            },
+            ClientMessage::CloseTerminal {
+                terminal_id: "term-1".into(),
+            },
+            ClientMessage::ListTerminals {
+                thread_id: tid.clone(),
+            },
+            ClientMessage::ReplayTerminal {
+                terminal_id: "term-1".into(),
+            },
+        ];
+        for msg in &client {
+            roundtrip_eq(msg);
+            roundtrip_json(msg);
+        }
+        let minimal: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type":"list_mentionables","payload":{"thread_id": tid.to_string()}}))
+        .unwrap();
+        assert_eq!(
+            minimal,
+            ClientMessage::ListMentionables {
+                thread_id: tid.clone(),
+                query: String::new(),
+                limit: None
+            }
+        );
+        let open: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type":"open_terminal","payload":{"thread_id": tid.to_string(),"cols":80,"rows":24}}))
+        .unwrap();
+        assert!(matches!(
+            open,
+            ClientMessage::OpenTerminal {
+                command: None,
+                repository_id: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_string(&ClientMessage::ListModels).unwrap(),
+            r#"{"type":"list_models"}"#
+        );
+
+        let terminal = TerminalSnapshot {
+            terminal_id: "term-1".into(),
+            thread_id: tid.clone(),
+            repository_id: RepositoryId::from("repo1"),
+            cwd: PathBuf::from("/src/app/.trama/worktrees/t/c"),
+            command: None,
+            cols: 80,
+            rows: 24,
+            last_seq: 3,
+            exit_status: Some(TerminalExitStatus {
+                code: Some(0),
+                signal: None,
+            }),
+        };
+        let daemon = [
+            DaemonMessage::Mentionables {
+                thread_id: tid.clone(),
+                query: "lib".into(),
+                items: vec![Mentionable {
+                    kind: MentionKind::Directory,
+                    label: "src/".into(),
+                    detail: Some("app".into()),
+                    value: "repo1:src".into(),
+                }],
+            },
+            DaemonMessage::Skills {
+                thread_id: tid.clone(),
+                items: vec![SkillInfo {
+                    name: "land".into(),
+                    description: Some("Land the branch".into()),
+                    source: SkillSource::Project,
+                    kind: SkillKind::Skill,
+                }],
+            },
+            DaemonMessage::ThreadModelChanged {
+                thread_id: tid.clone(),
+                model: None,
+            },
+            DaemonMessage::Models {
+                items: vec![ModelInfo {
+                    id: "default".into(),
+                    label: "Default".into(),
+                }],
+            },
+            DaemonMessage::TerminalOpened {
+                thread_id: tid.clone(),
+                terminal: terminal.clone(),
+            },
+            DaemonMessage::TerminalOutput {
+                thread_id: tid.clone(),
+                terminal_id: "term-1".into(),
+                data: "aGk=".into(),
+                seq: 1,
+                replay: false,
+            },
+            DaemonMessage::TerminalExited {
+                thread_id: tid.clone(),
+                terminal_id: "term-1".into(),
+                status: TerminalExitStatus {
+                    code: None,
+                    signal: Some(9),
+                },
+            },
+            DaemonMessage::Terminals {
+                thread_id: tid.clone(),
+                terminals: vec![terminal],
+            },
+        ];
+        for msg in &daemon {
+            roundtrip_json(msg);
+        }
+        assert_eq!(
+            serde_json::to_value(&daemon[0]).unwrap(),
+            serde_json::json!({"type":"mentionables","payload":{"thread_id": tid.to_string(),
+                "query":"lib","items":[{"kind":"directory","label":"src/","detail":"app","value":"repo1:src"}]}})
+        );
+        assert_eq!(
+            serde_json::to_value(&daemon[1]).unwrap()["payload"]["items"][0],
+            serde_json::json!({"name":"land","description":"Land the branch","source":"project","kind":"skill"})
+        );
+        assert_eq!(
+            serde_json::to_value(&daemon[5]).unwrap(),
+            serde_json::json!({"type":"terminal_output","payload":{"thread_id": tid.to_string(),
+                "terminal_id":"term-1","data":"aGk=","seq":1,"replay":false}})
+        );
+        assert_eq!(
+            serde_json::to_value(&daemon[6]).unwrap()["payload"]["status"],
+            serde_json::json!({"code":null,"signal":9})
+        );
+        let snapshot = serde_json::to_value(&daemon[4]).unwrap();
+        assert_eq!(snapshot["payload"]["terminal"]["exit_status"]["code"], 0);
+        assert_eq!(snapshot["payload"]["terminal"]["last_seq"], 3);
     }
 
     #[test]
@@ -907,6 +1333,7 @@ mod tests {
             parent_thread_id: Some(parent.clone()),
             kind: ThreadKind::Review,
             review_verdict: Some(ReviewVerdict::Approve),
+            model: Some("claude-opus-5-5".into()),
         };
         let daemon = [
             DaemonMessage::SubthreadCreated(child.clone()),

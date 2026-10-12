@@ -252,8 +252,20 @@ async fn handle_line(
                 sessions.unsubscribe(&thread_id, sub_id)?;
             }
         }
-        ClientMessage::SendPrompt { thread_id, text } => {
-            if let Err(error) = sessions.send_prompt(thread_id.clone(), text).await {
+        ClientMessage::SendPrompt {
+            thread_id,
+            text,
+            mentions,
+            terminals,
+        } => {
+            let context = crate::session::PromptContext {
+                mentions,
+                terminals,
+            };
+            if let Err(error) = sessions
+                .send_prompt_with_context(thread_id.clone(), text, context)
+                .await
+            {
                 let message = error.to_string();
                 let _ = out_tx.send(DaemonMessage::Error {
                     code: error.code().into(),
@@ -424,6 +436,77 @@ async fn handle_line(
                 });
             }
         }
+        ClientMessage::ListMentionables {
+            thread_id,
+            query,
+            limit,
+        } => {
+            let items = sessions
+                .list_mentionables(&thread_id, &query, limit)
+                .await?;
+            let _ = out_tx.send(DaemonMessage::Mentionables {
+                thread_id,
+                query,
+                items,
+            });
+        }
+        ClientMessage::ListSkills { thread_id } => {
+            let items = sessions.list_skills(&thread_id).await?;
+            let _ = out_tx.send(DaemonMessage::Skills { thread_id, items });
+        }
+        ClientMessage::SetThreadModel { thread_id, model } => {
+            let model = sessions.set_thread_model(&thread_id, model).await?;
+            if !subscriptions.contains_key(&thread_id) {
+                let _ = out_tx.send(DaemonMessage::ThreadModelChanged { thread_id, model });
+            }
+        }
+        ClientMessage::ListModels => {
+            let _ = out_tx.send(DaemonMessage::Models {
+                items: crate::session::model_choices(),
+            });
+        }
+        // Terminal events go to the thread's subscribers; a requester that
+        // is not subscribed gets the opening reply directly.
+        ClientMessage::OpenTerminal {
+            thread_id,
+            repository_id,
+            command,
+            cols,
+            rows,
+        } => {
+            let terminal = sessions
+                .open_terminal(&thread_id, repository_id, command, cols, rows)
+                .await?;
+            if !subscriptions.contains_key(&thread_id) {
+                let _ = out_tx.send(DaemonMessage::TerminalOpened {
+                    thread_id,
+                    terminal,
+                });
+            }
+        }
+        ClientMessage::TerminalInput { terminal_id, data } => {
+            sessions.terminal_input(&terminal_id, data).await?;
+        }
+        ClientMessage::ResizeTerminal {
+            terminal_id,
+            cols,
+            rows,
+        } => {
+            sessions.resize_terminal(&terminal_id, cols, rows)?;
+        }
+        ClientMessage::CloseTerminal { terminal_id } => {
+            sessions.close_terminal(&terminal_id)?;
+        }
+        ClientMessage::ListTerminals { thread_id } => {
+            let terminals = sessions.list_terminals(&thread_id);
+            let _ = out_tx.send(DaemonMessage::Terminals {
+                thread_id,
+                terminals,
+            });
+        }
+        ClientMessage::ReplayTerminal { terminal_id } => {
+            let _ = out_tx.send(sessions.replay_terminal(&terminal_id)?);
+        }
         ClientMessage::Shutdown => {
             let _ = shutdown.send(true);
             return Ok(ConnectionControl::Close);
@@ -521,6 +604,8 @@ mod tests {
         let line = serde_json::to_string(&ClientMessage::SendPrompt {
             thread_id: thread_id.clone(),
             text: "keep this draft".into(),
+            mentions: Vec::new(),
+            terminals: Vec::new(),
         })
         .unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -665,6 +750,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn composer_requests_over_duplex() {
+        let (client, server) = duplex(64 * 1024);
+        let sessions = test_sessions().await;
+        let (shutdown, _rx) = watch::channel(false);
+        tokio::spawn(async move {
+            let _ = handle_connection(server, sessions, shutdown).await;
+        });
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut reader = BufReader::new(client_read);
+        write_client(
+            &mut client_write,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "test".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_daemon(&mut reader).await,
+            DaemonMessage::Welcome { accepted: true, .. }
+        ));
+        write_client(&mut client_write, &ClientMessage::ListWorkspaces).await;
+        let DaemonMessage::Workspaces(workspaces) = read_daemon(&mut reader).await else {
+            panic!("workspaces");
+        };
+        write_client(
+            &mut client_write,
+            &ClientMessage::CreateThread {
+                workspace_id: workspaces[0].id.clone(),
+                title: "composer".into(),
+            },
+        )
+        .await;
+        let DaemonMessage::ThreadCreated(thread) = read_daemon(&mut reader).await else {
+            panic!("thread");
+        };
+
+        write_client(&mut client_write, &ClientMessage::ListModels).await;
+        match read_daemon(&mut reader).await {
+            DaemonMessage::Models { items } => {
+                assert!(items.iter().any(|m| m.id == "claude-sonnet-5-5"))
+            }
+            other => panic!("{other:?}"),
+        }
+        write_client(
+            &mut client_write,
+            &ClientMessage::ListMentionables {
+                thread_id: thread.id.clone(),
+                query: "same".into(),
+                limit: None,
+            },
+        )
+        .await;
+        match read_daemon(&mut reader).await {
+            DaemonMessage::Mentionables { items, query, .. } => {
+                assert_eq!(query, "same");
+                assert_eq!(items[0].label, "same.txt");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Not subscribed: replies come directly.
+        write_client(
+            &mut client_write,
+            &ClientMessage::SetThreadModel {
+                thread_id: thread.id.clone(),
+                model: Some("claude-opus-5-5".into()),
+            },
+        )
+        .await;
+        match read_daemon(&mut reader).await {
+            DaemonMessage::ThreadModelChanged { model, .. } => {
+                assert_eq!(model.as_deref(), Some("claude-opus-5-5"))
+            }
+            other => panic!("{other:?}"),
+        }
+        write_client(
+            &mut client_write,
+            &ClientMessage::OpenTerminal {
+                thread_id: thread.id.clone(),
+                repository_id: None,
+                command: Some("sleep 30".into()),
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .await;
+        let terminal = match read_daemon(&mut reader).await {
+            DaemonMessage::TerminalOpened { terminal, .. } => terminal,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(terminal.exit_status, None);
+        write_client(
+            &mut client_write,
+            &ClientMessage::CloseTerminal {
+                terminal_id: terminal.terminal_id.clone(),
+            },
+        )
+        .await;
+        write_client(
+            &mut client_write,
+            &ClientMessage::ListTerminals {
+                thread_id: thread.id.clone(),
+            },
+        )
+        .await;
+        match read_daemon(&mut reader).await {
+            DaemonMessage::Terminals { terminals, .. } => assert!(terminals.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn hello_send_prompt_interrupt_over_duplex() {
         let (client, server) = duplex(64 * 1024);
         let sessions = test_sessions().await;
@@ -723,6 +920,8 @@ mod tests {
             &ClientMessage::SendPrompt {
                 thread_id: thread.id.clone(),
                 text: "hello".into(),
+                mentions: Vec::new(),
+                terminals: Vec::new(),
             },
         )
         .await;
@@ -980,6 +1179,8 @@ mod tests {
             &ClientMessage::SendPrompt {
                 thread_id: thread.id.clone(),
                 text: "hello".into(),
+                mentions: Vec::new(),
+                terminals: Vec::new(),
             },
         )
         .await;
