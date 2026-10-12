@@ -5,7 +5,7 @@ use crate::log;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use trama_db::TramaDb;
-use trama_domain::agent::PermissionMode;
+use trama_domain::agent::{BillingMode, PermissionMode};
 use trama_domain::event::{Aggregate, DomainEvent, EventRecord};
 use trama_domain::message::Actor;
 use trama_domain::workspace::{Repository, Workspace, WorkspaceMembership, WorkspaceSettings};
@@ -15,6 +15,11 @@ use trama_infra::checkout::CheckoutManager;
 pub struct FileConfig {
     #[serde(default)]
     pub workspaces: Vec<FileWorkspace>,
+    /// `"subscription"` (default) hides `ANTHROPIC_API_KEY` /
+    /// `ANTHROPIC_AUTH_TOKEN` from Claude Code so it bills the Claude login.
+    /// `"api_key"` is the explicit opt-in to API billing.
+    #[serde(default)]
+    pub billing: BillingMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -262,6 +267,7 @@ mod tests {
                     },
                 ],
             }],
+            ..Default::default()
         };
         let db = TramaDb::open_in_memory().unwrap();
         seed_from_config(&db, &config).await.unwrap();
@@ -323,6 +329,7 @@ mod tests {
                     },
                 ],
             }],
+            ..Default::default()
         };
         let err = seed_from_config(&db, &config).await.unwrap_err();
         assert!(err.to_string().contains("not-a-repo"), "{err}");
@@ -347,6 +354,7 @@ mod tests {
                     path: dir.path().join("gone"),
                 }],
             }],
+            ..Default::default()
         };
         assert!(seed_from_config(&db, &missing_config).await.is_err());
         assert!(db.list_workspaces().await.unwrap().is_empty());
@@ -364,6 +372,7 @@ mod tests {
                     permission_mode: None,
                     repos: vec![],
                 }],
+                ..Default::default()
             },
         )
         .await
@@ -405,6 +414,7 @@ mod tests {
                     permission_mode: None,
                     repos: vec![],
                 }],
+                ..Default::default()
             },
         )
         .await

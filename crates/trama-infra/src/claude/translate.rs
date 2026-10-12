@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 
-use trama_domain::agent::{AgentEvent, UsageReport};
+use trama_domain::agent::{AgentEvent, BillingSource, UsageReport};
 
 use super::protocol::{
     AssistantLine, ClaudeLine, ClaudeUsage, ContentBlock, MessageContent, ResultLine,
@@ -88,6 +88,25 @@ fn translate_system(sys: &SystemLine, state: &mut TranslateState, events: &mut V
         external_session_id: sys.session_id.clone(),
         model: sys.model.clone(),
     });
+    events.push(AgentEvent::SessionInfo {
+        billing: billing_source(sys.api_key_source.as_deref()),
+        api_key_source: sys.api_key_source.clone(),
+        agent_version: sys.claude_code_version.clone(),
+        permission_mode: sys.permission_mode.clone(),
+    });
+}
+
+/// Map Claude Code's `apiKeySource` to what the session bills against.
+/// `"none"` means no API key is in use, so requests go through the
+/// subscription login. Anything else that names a key source is API billing.
+/// A missing or unrecognized value is reported as unknown rather than
+/// guessed.
+pub fn billing_source(api_key_source: Option<&str>) -> BillingSource {
+    match api_key_source.map(str::trim) {
+        Some("none") => BillingSource::Subscription,
+        Some("ANTHROPIC_API_KEY" | "apiKeyHelper" | "/login managed key") => BillingSource::ApiKey,
+        _ => BillingSource::Unknown,
+    }
 }
 
 fn translate_assistant(
@@ -242,6 +261,22 @@ fn usage_event(usage: &ClaudeUsage, state: &TranslateState) -> AgentEvent {
 mod tests {
     use super::*;
     use crate::claude::protocol::parse_ndjson;
+
+    #[test]
+    fn billing_source_maps_known_api_key_sources() {
+        assert_eq!(billing_source(Some("none")), BillingSource::Subscription);
+        assert_eq!(
+            billing_source(Some("ANTHROPIC_API_KEY")),
+            BillingSource::ApiKey
+        );
+        assert_eq!(billing_source(Some("apiKeyHelper")), BillingSource::ApiKey);
+        assert_eq!(
+            billing_source(Some("/login managed key")),
+            BillingSource::ApiKey
+        );
+        assert_eq!(billing_source(Some("future")), BillingSource::Unknown);
+        assert_eq!(billing_source(None), BillingSource::Unknown);
+    }
 
     #[test]
     fn parent_tool_use_id_emits_subagent_lifecycle() {

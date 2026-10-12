@@ -1,7 +1,8 @@
 //! Per-connection JSON-lines handler.
 
+use crate::approval::HookDecision;
 use crate::error::Result;
-use crate::session::{SessionManager, SubscriptionId};
+use crate::session::{ApprovalWait, SessionManager, SubscriptionId};
 use std::collections::HashMap;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch};
@@ -54,6 +55,24 @@ where
                         if line.trim().is_empty() {
                             continue;
                         }
+                        if let Ok(ClientMessage::ApprovalHook {
+                            token,
+                            tool_name,
+                            tool_input,
+                        }) = decode_json_line::<ClientMessage>(&line)
+                        {
+                            // A hook connection carries exactly one request.
+                            serve_approval_hook(
+                                &sessions,
+                                &mut lines,
+                                &mut writer,
+                                &token,
+                                tool_name,
+                                tool_input,
+                            )
+                            .await?;
+                            break;
+                        }
                         match handle_line(
                             &line,
                             &sessions,
@@ -92,6 +111,79 @@ where
 enum ConnectionControl {
     Continue,
     Close,
+}
+
+/// Block until the request is answered, timed out, or the hook hangs up,
+/// then write the single decision. A hang-up (Claude's hook timeout, an
+/// interrupted or killed CLI) withdraws the request so clients stop showing
+/// it.
+async fn serve_approval_hook<R, W>(
+    sessions: &SessionManager,
+    lines: &mut tokio::io::Lines<R>,
+    writer: &mut W,
+    token: &str,
+    tool_name: String,
+    tool_input: serde_json::Value,
+) -> Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let decision = match sessions
+        .request_approval(token, tool_name, tool_input)
+        .await
+    {
+        ApprovalWait::Decided(decision) => decision,
+        ApprovalWait::Pending { request_id, mut rx } => {
+            let timeout = sessions.approval_timeout();
+            tokio::select! {
+                answered = tokio::time::timeout(timeout, &mut rx) => match answered {
+                    Ok(Ok(decision)) => decision,
+                    Ok(Err(_)) => HookDecision::deny("The approval request was dropped by Trama."),
+                    Err(_) => {
+                        let message = format!(
+                            "No decision in Trama within {} minutes, so the tool call was denied.",
+                            timeout.as_secs().div_ceil(60)
+                        );
+                        if sessions.cancel_approval(&request_id, &message).await {
+                            HookDecision::deny(message)
+                        } else {
+                            // Answered as the timer fired: report that answer.
+                            rx.try_recv().unwrap_or_else(|_| HookDecision::deny(message))
+                        }
+                    }
+                },
+                _ = hook_gone(lines) => {
+                    sessions
+                        .cancel_approval(
+                            &request_id,
+                            "The agent stopped waiting for this approval.",
+                        )
+                        .await;
+                    return Ok(());
+                }
+            }
+        }
+    };
+    write_msg(
+        writer,
+        &DaemonMessage::ApprovalHookDecision {
+            decision: decision.decision,
+            message: decision.message,
+            interrupt: decision.interrupt,
+        },
+    )
+    .await
+}
+
+/// Resolves when the hook side closes or errors. Extra lines are ignored.
+async fn hook_gone<R: tokio::io::AsyncBufRead + Unpin>(lines: &mut tokio::io::Lines<R>) {
+    loop {
+        match lines.next_line().await {
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => return,
+        }
+    }
 }
 
 fn welcome(accepted: bool) -> DaemonMessage {
@@ -220,6 +312,13 @@ async fn handle_line(
             let _ = out_tx.send(DaemonMessage::ThreadCheckouts {
                 thread_id,
                 checkouts,
+            });
+        }
+        ClientMessage::ApprovalHook { .. } => {
+            // Intercepted by `handle_connection` before reaching here.
+            let _ = out_tx.send(DaemonMessage::Error {
+                code: "protocol".into(),
+                message: "approval_hook is only accepted from the approval hook".into(),
             });
         }
         ClientMessage::Shutdown => {

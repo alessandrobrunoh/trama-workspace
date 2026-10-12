@@ -1,5 +1,6 @@
 //! Local TramaWorkspace daemon: Unix-socket JSON-lines server and real sessions.
 
+pub mod approval;
 mod claude;
 mod config;
 mod connection;
@@ -8,11 +9,14 @@ mod log;
 mod session;
 
 #[cfg(test)]
+mod approval_tests;
+#[cfg(test)]
 mod testing;
 
 pub use error::{DaemonError, Result};
 pub use session::SessionManager;
 
+use crate::approval::ApprovalHookSettings;
 use crate::claude::ProductionAdapter;
 use crate::config::{load_or_init_config, seed_from_config};
 use std::path::{Path, PathBuf};
@@ -48,11 +52,10 @@ pub async fn bootstrap_sessions() -> Result<SessionManager> {
     let config = load_or_init_config(&dir.join("config.json"))?;
     let db = TramaDb::open(&dir.join("trama.db"))?;
     seed_from_config(&db, &config).await?;
-    Ok(SessionManager::with_checkout_root(
-        db,
-        Arc::new(ProductionAdapter::new()),
-        dir,
-    ))
+    Ok(
+        SessionManager::with_checkout_root(db, Arc::new(ProductionAdapter::new()), dir)
+            .with_billing(config.billing),
+    )
 }
 
 pub async fn run() -> Result<()> {
@@ -60,7 +63,9 @@ pub async fn run() -> Result<()> {
 }
 
 pub async fn run_on_socket(socket_path: &Path) -> Result<()> {
-    let sessions = bootstrap_sessions().await?;
+    let sessions = bootstrap_sessions()
+        .await?
+        .with_approval_hook(ApprovalHookSettings::for_current_exe(socket_path)?);
     serve_on_socket(socket_path, sessions).await
 }
 

@@ -44,6 +44,12 @@ pub struct SystemLine {
     pub cwd: Option<String>,
     #[serde(default)]
     pub mcp_servers: Value,
+    /// `"none"` when Claude Code uses the subscription login; otherwise the
+    /// API-key source (`"ANTHROPIC_API_KEY"`, `"apiKeyHelper"`, ...).
+    #[serde(default, rename = "apiKeySource")]
+    pub api_key_source: Option<String>,
+    #[serde(default)]
+    pub claude_code_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -307,6 +313,7 @@ mod tests {
                 assert_eq!(sys.session_id.as_deref(), Some("ses_1"));
                 assert_eq!(sys.model.as_deref(), Some("sonnet"));
                 assert_eq!(sys.permission_mode.as_deref(), Some("default"));
+                assert!(sys.api_key_source.is_none());
             }
             other => panic!("expected system, got {other:?}"),
         }

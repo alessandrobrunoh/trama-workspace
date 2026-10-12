@@ -490,7 +490,9 @@ impl ChatPanel {
                 self.finish_turn();
             }
             AgentEvent::ReasoningDelta { .. }
+            | AgentEvent::SessionInfo { .. }
             | AgentEvent::ApprovalRequested { .. }
+            | AgentEvent::ApprovalResolved { .. }
             | AgentEvent::SubagentStarted { .. }
             | AgentEvent::SubagentFinished { .. } => {}
         }

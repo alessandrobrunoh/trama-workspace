@@ -1,3 +1,4 @@
+use crate::agent::ApprovalDecision;
 use crate::checkpoint::Checkpoint;
 use crate::comment::Comment;
 use crate::ids::{AgentSessionId, RepositoryId, ThreadId, WorkspaceId};
@@ -92,6 +93,26 @@ pub enum DomainEvent {
         num_turns: u32,
         cost_usd_micros: Option<u64>,
     },
+    /// The agent asked for permission to run a tool and the request was
+    /// shown to clients.
+    ApprovalRequested {
+        thread_id: ThreadId,
+        session_id: AgentSessionId,
+        request_id: String,
+        tool_name: String,
+        input_json: serde_json::Value,
+    },
+    /// A permission request was answered. `reason` is set when it was not
+    /// a client decision (remembered for the session, timeout, interrupt,
+    /// session end).
+    ApprovalResolved {
+        thread_id: ThreadId,
+        session_id: AgentSessionId,
+        request_id: String,
+        tool_name: String,
+        decision: ApprovalDecision,
+        reason: Option<String>,
+    },
     FileRevisionRecorded {
         revision: FileRevision,
     },
@@ -111,6 +132,8 @@ impl DomainEvent {
             Self::MessageAdded { .. } => "message.added",
             Self::AgentTurnStarted { .. } => "agent.turn_started",
             Self::AgentTurnCompleted { .. } => "agent.turn_completed",
+            Self::ApprovalRequested { .. } => "agent.approval_requested",
+            Self::ApprovalResolved { .. } => "agent.approval_resolved",
             Self::FileRevisionRecorded { .. } => "file.revision_recorded",
             Self::CommentCreated { .. } => "comment.created",
             Self::CheckpointCreated { .. } => "checkpoint.created",
@@ -268,8 +291,35 @@ mod tests {
                     num_turns: 2,
                     cost_usd_micros: Some(1500),
                 },
-                Aggregate::Session { id: session },
+                Aggregate::Session {
+                    id: session.clone(),
+                },
                 "agent.turn_completed",
+            ),
+            (
+                DomainEvent::ApprovalRequested {
+                    thread_id: th.id.clone(),
+                    session_id: session.clone(),
+                    request_id: "apr-1".into(),
+                    tool_name: "Bash".into(),
+                    input_json: serde_json::json!({"command": "ls"}),
+                },
+                Aggregate::Session {
+                    id: session.clone(),
+                },
+                "agent.approval_requested",
+            ),
+            (
+                DomainEvent::ApprovalResolved {
+                    thread_id: th.id.clone(),
+                    session_id: session.clone(),
+                    request_id: "apr-1".into(),
+                    tool_name: "Bash".into(),
+                    decision: ApprovalDecision::Deny,
+                    reason: Some("timed out".into()),
+                },
+                Aggregate::Session { id: session },
+                "agent.approval_resolved",
             ),
             (
                 DomainEvent::FileRevisionRecorded {

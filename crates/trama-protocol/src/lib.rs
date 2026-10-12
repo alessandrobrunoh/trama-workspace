@@ -20,9 +20,12 @@
 //! Unknown `type` tags are **denied**. Serde rejects them at deserialize time; the
 //! daemon must not silently ignore a variant it does not understand. Because of that,
 //! a new variant is a breaking handshake change: an older peer would accept `Hello`
-//! and then fail the command. [`PROTOCOL_VERSION`] is **3** for checkout discovery,
-//! repository membership, and legacy-thread migration. The bump is transport-only.
-//! Persisted domain ids and SQLite rows are not rewritten.
+//! and then fail the command. [`PROTOCOL_VERSION`] **2** added workspace creation,
+//! repository membership, and legacy-thread migration. **3** added thread
+//! checkout discovery. **4** adds the approval channel
+//! ([`ClientMessage::ApprovalHook`], [`DaemonMessage::ApprovalHookDecision`])
+//! and the `session_info` / `approval_resolved` agent events. Each bump is
+//! transport-only. Persisted domain ids and SQLite rows are not rewritten.
 //!
 //! A version mismatch fails the handshake (`Welcome.accepted = false`). Extra object
 //! fields inside a known payload are ignored (serde default). Bump [`PROTOCOL_VERSION`]
@@ -31,16 +34,17 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::PathBuf;
 
-pub use trama_domain::agent::{AgentEvent, ApprovalDecision, UsageReport};
+pub use trama_domain::agent::{AgentEvent, ApprovalDecision, BillingSource, UsageReport};
 pub use trama_domain::ids::{RepositoryId, ThreadId, WorkspaceId};
 pub use trama_domain::message::Message;
 
 /// Wire protocol version carried in `Hello` / `Welcome`.
 ///
-/// Version 3 adds thread checkout discovery. It does
-/// not migrate stored data; peers with a different version are rejected at
-/// handshake time.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// Version 4 adds the Claude approval channel and the `session_info` /
+/// `approval_resolved` agent events (3 added thread checkout discovery). It
+/// does not migrate stored data; peers with a different version are rejected
+/// at handshake time.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Encode `value` as one JSON line (compact JSON plus a trailing `\n`).
 pub fn encode_json_line<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
@@ -109,6 +113,16 @@ pub enum ClientMessage {
     GetThreadCheckouts {
         thread_id: ThreadId,
     },
+    /// Sent only by the `trama-daemon approval-hook` helper that Claude Code
+    /// runs as its `PermissionRequest` hook. `token` identifies the agent
+    /// session (from the hook's environment). The daemon answers once with
+    /// [`DaemonMessage::ApprovalHookDecision`]; closing the connection first
+    /// cancels the request. UI clients never send this.
+    ApprovalHook {
+        token: String,
+        tool_name: String,
+        tool_input: serde_json::Value,
+    },
     Shutdown,
 }
 
@@ -150,6 +164,14 @@ pub enum DaemonMessage {
         repository: RepositorySnapshot,
     },
     ThreadMigrated(ThreadSnapshot),
+    /// Reply to [`ClientMessage::ApprovalHook`], sent only on that hook's
+    /// connection. `message` explains a denial to the agent; `interrupt`
+    /// asks the agent to stop the turn (set when the user interrupted).
+    ApprovalHookDecision {
+        decision: ApprovalDecision,
+        message: Option<String>,
+        interrupt: bool,
+    },
     ThreadCheckouts {
         thread_id: ThreadId,
         checkouts: Vec<CheckoutSnapshot>,
@@ -319,13 +341,18 @@ mod tests {
                 workspace_id: workspace_id(),
             },
             ClientMessage::MigrateLegacyThread { thread_id: tid },
+            ClientMessage::ApprovalHook {
+                token: "tok".into(),
+                tool_name: "Bash".into(),
+                tool_input: serde_json::json!({"command": "ls"}),
+            },
             ClientMessage::Shutdown,
         ];
         for msg in &kinds {
             roundtrip_eq(msg);
             roundtrip_json(msg);
         }
-        assert_eq!(kinds.len(), 14);
+        assert_eq!(kinds.len(), 15);
     }
 
     #[test]
@@ -375,11 +402,16 @@ mod tests {
                 repository: snapshot_repo(),
             },
             DaemonMessage::ThreadMigrated(snapshot_th()),
+            DaemonMessage::ApprovalHookDecision {
+                decision: ApprovalDecision::Deny,
+                message: Some("denied".into()),
+                interrupt: false,
+            },
         ];
         for msg in &kinds {
             roundtrip_json(msg);
         }
-        assert_eq!(kinds.len(), 12);
+        assert_eq!(kinds.len(), 13);
     }
 
     #[test]
@@ -498,8 +530,39 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_three() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+    fn approval_channel_json_shape() {
+        assert_eq!(
+            serde_json::to_string(&ClientMessage::ApprovalHook {
+                token: "tok".into(),
+                tool_name: "Bash".into(),
+                tool_input: serde_json::json!({"command": "ls"}),
+            })
+            .unwrap(),
+            r#"{"type":"approval_hook","payload":{"token":"tok","tool_name":"Bash","tool_input":{"command":"ls"}}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&DaemonMessage::ApprovalHookDecision {
+                decision: ApprovalDecision::AllowSession,
+                message: None,
+                interrupt: false,
+            })
+            .unwrap(),
+            r#"{"type":"approval_hook_decision","payload":{"decision":"allow_session","message":null,"interrupt":false}}"#
+        );
+        let envelope = DaemonMessage::AgentEventEnvelope {
+            thread_id: thread_id(),
+            event: AgentEvent::ApprovalRequested {
+                request_id: "apr-1".into(),
+                tool_name: "Bash".into(),
+                input_json: serde_json::json!({"command": "ls"}),
+            },
+        };
+        roundtrip_json(&envelope);
+    }
+
+    #[test]
+    fn protocol_version_is_four() {
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     #[test]

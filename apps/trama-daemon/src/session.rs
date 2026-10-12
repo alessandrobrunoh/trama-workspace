@@ -1,19 +1,21 @@
 //! Persistent session manager: TramaDB + injected `AgentAdapter`.
 
+use crate::approval::{self, ApprovalHookSettings, HookDecision};
 use crate::config::permission_mode_from_settings;
 use crate::error::{DaemonError, Result};
 use chrono::Utc;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
 use trama_db::{CheckoutLocation, TramaDb};
 use trama_domain::agent::{
-    AgentAdapter, AgentEvent, AgentKind, AgentPrompt, AgentSession, ApprovalDecision,
+    AgentAdapter, AgentEvent, AgentKind, AgentPrompt, AgentSession, ApprovalDecision, BillingMode,
     SessionConfig, UsageReport,
 };
 use trama_domain::event::{Aggregate, DomainEvent, EventRecord, EventStore};
-use trama_domain::ids::{CheckoutId, MessageId, ThreadId, WorkspaceId};
+use trama_domain::ids::{AgentSessionId, CheckoutId, MessageId, ThreadId, WorkspaceId};
 use trama_domain::message::{Actor, ContentBlock, Message, Role};
 use trama_domain::thread::{AttachMode, Thread, ThreadRepositoryAttachment};
 use trama_domain::workspace::{Repository, Workspace, WorkspaceMembership};
@@ -47,12 +49,46 @@ struct ThreadRuntime {
     interrupt_requested: bool,
     acc_text: String,
     subscribers: Vec<Subscriber>,
+    /// Token in the live session's environment; see [`approval`].
+    approval_token: Option<String>,
+    /// Tools answered `allow_session` for the live session. Cleared whenever
+    /// the live session starts or ends.
+    session_allowed_tools: HashSet<String>,
+    /// Last `SessionInfo` of the live session, replayed to new subscribers.
+    session_info: Option<AgentEvent>,
+}
+
+/// A permission request blocking a Claude Code hook process. The hook's
+/// connection task holds the receiving end; exactly one resolution sends.
+struct PendingApproval {
+    thread_id: ThreadId,
+    session_id: AgentSessionId,
+    tool_name: String,
+    input_json: serde_json::Value,
+    responder: oneshot::Sender<HookDecision>,
 }
 
 struct Inner {
     next_sub: u64,
     threads: HashMap<ThreadId, ThreadRuntime>,
+    approval_tokens: HashMap<String, ThreadId>,
+    pending_approvals: HashMap<String, PendingApproval>,
 }
+
+/// Outcome of [`SessionManager::request_approval`].
+pub enum ApprovalWait {
+    /// Answered without asking (remembered, or no live session).
+    Decided(HookDecision),
+    /// Shown to clients; wait on `rx`, and call
+    /// [`SessionManager::cancel_approval`] on timeout or hook disconnect.
+    Pending {
+        request_id: String,
+        rx: oneshot::Receiver<HookDecision>,
+    },
+}
+
+const USER_DENIED: &str = "The user denied this tool call in Trama.";
+const REMEMBERED_FOR_SESSION: &str = "allowed for this session";
 
 /// Releases a migration reservation when dropped, including when the future
 /// that holds it is cancelled or returns early through `?`.
@@ -97,6 +133,9 @@ pub struct SessionManager {
     adapter: Arc<dyn AgentAdapter>,
     checkout_manager: trama_infra::checkout::CheckoutManager,
     inner: Arc<Mutex<Inner>>,
+    billing: BillingMode,
+    /// `None`: no approval channel; the CLI denies prompts on its own.
+    approval_hook: Option<Arc<ApprovalHookSettings>>,
 }
 
 impl SessionManager {
@@ -120,8 +159,32 @@ impl SessionManager {
             inner: Arc::new(Mutex::new(Inner {
                 next_sub: 1,
                 threads: HashMap::new(),
+                approval_tokens: HashMap::new(),
+                pending_approvals: HashMap::new(),
             })),
+            billing: BillingMode::default(),
+            approval_hook: None,
         }
+    }
+
+    /// Billing for new agent sessions. Defaults to the subscription.
+    pub fn with_billing(mut self, billing: BillingMode) -> Self {
+        self.billing = billing;
+        self
+    }
+
+    /// Route tool permission prompts of new sessions through `settings`.
+    pub fn with_approval_hook(mut self, settings: ApprovalHookSettings) -> Self {
+        self.approval_hook = Some(Arc::new(settings));
+        self
+    }
+
+    /// How long a hook connection waits for a person before denying.
+    pub fn approval_timeout(&self) -> Duration {
+        self.approval_hook
+            .as_ref()
+            .map(|settings| settings.timeout)
+            .unwrap_or(approval::DEFAULT_APPROVAL_TIMEOUT)
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -717,6 +780,43 @@ impl SessionManager {
                 totals,
             });
         }
+        // A client that (re)connects mid-turn must see what the agent is
+        // blocked on. Request ids are ULID-based, so sorting keeps order.
+        let (session_info, mut pending): (
+            Option<AgentEvent>,
+            Vec<(String, String, serde_json::Value)>,
+        ) = {
+            let inner = self.lock();
+            (
+                inner
+                    .threads
+                    .get(thread_id)
+                    .and_then(|t| t.session_info.clone()),
+                inner
+                    .pending_approvals
+                    .iter()
+                    .filter(|(_, p)| &p.thread_id == thread_id)
+                    .map(|(id, p)| (id.clone(), p.tool_name.clone(), p.input_json.clone()))
+                    .collect(),
+            )
+        };
+        if let Some(event) = session_info {
+            let _ = tx.send(DaemonMessage::AgentEventEnvelope {
+                thread_id: thread_id.clone(),
+                event,
+            });
+        }
+        pending.sort_by(|a, b| a.0.cmp(&b.0));
+        for (request_id, tool_name, input_json) in pending {
+            let _ = tx.send(DaemonMessage::AgentEventEnvelope {
+                thread_id: thread_id.clone(),
+                event: AgentEvent::ApprovalRequested {
+                    request_id,
+                    tool_name,
+                    input_json,
+                },
+            });
+        }
         Ok(id)
     }
 
@@ -812,6 +912,10 @@ impl SessionManager {
             thread.interrupt_requested = true;
             thread.live_session.clone()
         };
+        // Release a hook blocked on a person first; `interrupt` tells Claude
+        // Code to stop rather than try another approach.
+        self.cancel_thread_approvals(thread_id, "The user interrupted the turn in Trama.", true)
+            .await;
         match session {
             Some(session) => {
                 self.adapter.interrupt(&session).await?;
@@ -830,6 +934,36 @@ impl SessionManager {
         if self.db.get_thread(thread_id).await?.is_none() {
             return Err(DaemonError::NotFound(format!("thread {thread_id}")));
         }
+        if let Some((answered, remembered)) = self.take_answered(thread_id, request_id, decision) {
+            let hook = match decision {
+                ApprovalDecision::Deny => HookDecision::deny(USER_DENIED),
+                allow => HookDecision::allow(allow),
+            };
+            self.finish_approvals(
+                vec![answered],
+                &hook,
+                None,
+                Actor::Human { id: "user".into() },
+            )
+            .await;
+            // Other requests for the same tool that were already waiting.
+            self.finish_approvals(
+                remembered,
+                &HookDecision::allow(ApprovalDecision::AllowSession),
+                Some(REMEMBERED_FOR_SESSION.into()),
+                Actor::System,
+            )
+            .await;
+            return Ok(());
+        }
+        // Brokered sessions (Claude Code, or any session given the hook)
+        // answer only through the broker above. Other runtimes may hold the
+        // request in-band.
+        if self.approval_hook.is_some() || self.adapter.kind() == AgentKind::ClaudeCode {
+            return Err(DaemonError::NotFound(format!(
+                "approval request {request_id} is not pending (already answered, timed out, or the session ended)"
+            )));
+        }
         let session = {
             let inner = self.lock();
             inner
@@ -845,6 +979,290 @@ impl SessionManager {
                 Ok(())
             }
             None => Ok(()),
+        }
+    }
+
+    /// Remove the answered request (only if it belongs to `thread_id`). For
+    /// `allow_session`, remember the tool for the live session and also take
+    /// every other pending request for that tool on the thread.
+    #[allow(clippy::type_complexity)]
+    fn take_answered(
+        &self,
+        thread_id: &ThreadId,
+        request_id: &str,
+        decision: ApprovalDecision,
+    ) -> Option<((String, PendingApproval), Vec<(String, PendingApproval)>)> {
+        let mut inner = self.lock();
+        if inner
+            .pending_approvals
+            .get(request_id)
+            .is_none_or(|p| &p.thread_id != thread_id)
+        {
+            return None;
+        }
+        let answered = inner.pending_approvals.remove(request_id)?;
+        let mut remembered = Vec::new();
+        if decision == ApprovalDecision::AllowSession {
+            let tool = answered.tool_name.clone();
+            if let Some(thread) = inner.threads.get_mut(thread_id) {
+                if thread
+                    .live_session
+                    .as_ref()
+                    .is_some_and(|s| s.id == answered.session_id)
+                {
+                    thread.session_allowed_tools.insert(tool.clone());
+                }
+            }
+            let siblings: Vec<String> = inner
+                .pending_approvals
+                .iter()
+                .filter(|(_, p)| {
+                    &p.thread_id == thread_id
+                        && p.tool_name == tool
+                        && p.session_id == answered.session_id
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in siblings {
+                if let Some(p) = inner.pending_approvals.remove(&id) {
+                    remembered.push((id, p));
+                }
+            }
+        }
+        Some(((request_id.to_string(), answered), remembered))
+    }
+
+    /// Called for every `PermissionRequest` hook. Unknown tokens and ended
+    /// sessions are denied; tools remembered for the session are allowed
+    /// without asking; anything else is shown to subscribers.
+    pub async fn request_approval(
+        &self,
+        token: &str,
+        tool_name: String,
+        input_json: serde_json::Value,
+    ) -> ApprovalWait {
+        enum Next {
+            Deny(&'static str),
+            Remembered(ThreadId, AgentSessionId),
+            Ask(ThreadId, AgentSessionId),
+        }
+        let request_id = format!("apr-{}", MessageId::generate());
+        let (tx, rx) = oneshot::channel();
+        let next = {
+            let mut inner = self.lock();
+            match inner.approval_tokens.get(token).cloned() {
+                None => Next::Deny("This approval token does not belong to a live Trama session."),
+                Some(thread_id) => {
+                    let live = inner.threads.get(&thread_id).and_then(|thread| {
+                        let session = thread.live_session.as_ref()?;
+                        Some((
+                            session.id.clone(),
+                            thread.session_allowed_tools.contains(&tool_name),
+                        ))
+                    });
+                    match live {
+                        None => Next::Deny("The agent session has ended in Trama."),
+                        Some((session_id, true)) => Next::Remembered(thread_id, session_id),
+                        Some((session_id, false)) => {
+                            inner.pending_approvals.insert(
+                                request_id.clone(),
+                                PendingApproval {
+                                    thread_id: thread_id.clone(),
+                                    session_id: session_id.clone(),
+                                    tool_name: tool_name.clone(),
+                                    input_json: input_json.clone(),
+                                    responder: tx,
+                                },
+                            );
+                            Next::Ask(thread_id, session_id)
+                        }
+                    }
+                }
+            }
+        };
+
+        match next {
+            Next::Deny(message) => ApprovalWait::Decided(HookDecision::deny(message)),
+            Next::Remembered(thread_id, session_id) => {
+                self.record_approval(
+                    &session_id,
+                    Actor::System,
+                    DomainEvent::ApprovalResolved {
+                        thread_id: thread_id.clone(),
+                        session_id: session_id.clone(),
+                        request_id,
+                        tool_name,
+                        decision: ApprovalDecision::AllowSession,
+                        reason: Some(REMEMBERED_FOR_SESSION.into()),
+                    },
+                )
+                .await;
+                ApprovalWait::Decided(HookDecision::allow(ApprovalDecision::AllowSession))
+            }
+            Next::Ask(thread_id, session_id) => {
+                self.record_approval(
+                    &session_id,
+                    Actor::Agent {
+                        session: session_id.clone(),
+                    },
+                    DomainEvent::ApprovalRequested {
+                        thread_id: thread_id.clone(),
+                        session_id: session_id.clone(),
+                        request_id: request_id.clone(),
+                        tool_name: tool_name.clone(),
+                        input_json: input_json.clone(),
+                    },
+                )
+                .await;
+                self.broadcast(
+                    &thread_id,
+                    DaemonMessage::AgentEventEnvelope {
+                        thread_id: thread_id.clone(),
+                        event: AgentEvent::ApprovalRequested {
+                            request_id: request_id.clone(),
+                            tool_name,
+                            input_json,
+                        },
+                    },
+                );
+                ApprovalWait::Pending { request_id, rx }
+            }
+        }
+    }
+
+    /// Deny a pending request that timed out or whose hook went away.
+    /// Returns `false` when it was already resolved, so the caller should
+    /// report that resolution instead.
+    pub async fn cancel_approval(&self, request_id: &str, message: &str) -> bool {
+        let taken = self.lock().pending_approvals.remove(request_id);
+        let Some(pending) = taken else {
+            return false;
+        };
+        self.finish_approvals(
+            vec![(request_id.to_string(), pending)],
+            &HookDecision::deny(message),
+            Some(message.to_string()),
+            Actor::System,
+        )
+        .await;
+        true
+    }
+
+    /// Deny every pending request on a thread (interrupt, session end).
+    async fn cancel_thread_approvals(&self, thread_id: &ThreadId, message: &str, interrupt: bool) {
+        let taken: Vec<(String, PendingApproval)> = {
+            let mut inner = self.lock();
+            let ids: Vec<String> = inner
+                .pending_approvals
+                .iter()
+                .filter(|(_, p)| &p.thread_id == thread_id)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| inner.pending_approvals.remove(&id).map(|p| (id, p)))
+                .collect()
+        };
+        if taken.is_empty() {
+            return;
+        }
+        let mut decision = HookDecision::deny(message);
+        decision.interrupt = interrupt;
+        self.finish_approvals(taken, &decision, Some(message.to_string()), Actor::System)
+            .await;
+    }
+
+    /// Unblock each hook, persist the resolution, and tell subscribers.
+    async fn finish_approvals(
+        &self,
+        resolved: Vec<(String, PendingApproval)>,
+        decision: &HookDecision,
+        reason: Option<String>,
+        actor: Actor,
+    ) {
+        for (request_id, pending) in resolved {
+            // The hook may already be gone; its connection task then cancels
+            // nothing, because the request is no longer pending.
+            let _ = pending.responder.send(decision.clone());
+            self.record_approval(
+                &pending.session_id,
+                actor.clone(),
+                DomainEvent::ApprovalResolved {
+                    thread_id: pending.thread_id.clone(),
+                    session_id: pending.session_id.clone(),
+                    request_id: request_id.clone(),
+                    tool_name: pending.tool_name,
+                    decision: decision.decision,
+                    reason: reason.clone(),
+                },
+            )
+            .await;
+            self.broadcast(
+                &pending.thread_id,
+                DaemonMessage::AgentEventEnvelope {
+                    thread_id: pending.thread_id.clone(),
+                    event: AgentEvent::ApprovalResolved {
+                        request_id,
+                        decision: decision.decision,
+                        reason: reason.clone(),
+                    },
+                },
+            );
+        }
+    }
+
+    async fn record_approval(&self, session_id: &AgentSessionId, actor: Actor, event: DomainEvent) {
+        let kind = event.kind();
+        if let Err(err) = self
+            .append_event(
+                Aggregate::Session {
+                    id: session_id.clone(),
+                },
+                actor,
+                event,
+            )
+            .await
+        {
+            crate::log::warn(format!("failed to append {kind}: {err}"));
+        }
+    }
+
+    /// Give a new session's config the hook, the daemon socket, and a fresh
+    /// token mapped to `thread_id`. Returns the token so a failed start can
+    /// drop it.
+    fn attach_approval_hook(
+        &self,
+        thread_id: &ThreadId,
+        config: &mut SessionConfig,
+    ) -> Option<String> {
+        let settings = self.approval_hook.as_ref()?;
+        let token = approval::generate_token();
+        config.env.insert(
+            approval::ENV_SOCKET.into(),
+            settings.socket_path.to_string_lossy().into_owned(),
+        );
+        config.env.insert(approval::ENV_TOKEN.into(), token.clone());
+        config.approval_hook = Some(settings.hook_config());
+        let mut inner = self.lock();
+        inner
+            .approval_tokens
+            .insert(token.clone(), thread_id.clone());
+        let thread = inner.threads.entry(thread_id.clone()).or_default();
+        if let Some(old) = thread.approval_token.replace(token.clone()) {
+            inner.approval_tokens.remove(&old);
+        }
+        Some(token)
+    }
+
+    fn drop_approval_token(&self, thread_id: &ThreadId, token: Option<String>) {
+        let Some(token) = token else {
+            return;
+        };
+        let mut inner = self.lock();
+        inner.approval_tokens.remove(&token);
+        if let Some(thread) = inner.threads.get_mut(thread_id) {
+            if thread.approval_token.as_deref() == Some(token.as_str()) {
+                thread.approval_token = None;
+            }
         }
     }
 
@@ -1010,23 +1428,32 @@ impl SessionManager {
             return Ok(session);
         }
 
-        let config = self.session_config(thread_id).await?;
+        let mut config = self.session_config(thread_id).await?;
+        let token = self.attach_approval_hook(thread_id, &mut config);
         let (tx, rx) = async_channel::unbounded();
         let session = match self.adapter.start(config, tx).await {
             Ok(session) => session,
             Err(err) => {
+                self.drop_approval_token(thread_id, token);
                 return Err(DaemonError::Agent(format!(
                     "{err}. Install Claude Code or set CLAUDE_BIN to the `claude` binary."
                 )));
             }
         };
-        self.db
+        if let Err(err) = self
+            .db
             .create_agent_session(thread_id, &session, agent_kind_label(self.adapter.kind()))
-            .await?;
+            .await
+        {
+            self.drop_approval_token(thread_id, token);
+            return Err(err.into());
+        }
         {
             let mut inner = self.lock();
             let thread = inner.threads.entry(thread_id.clone()).or_default();
             thread.live_session = Some(session.clone());
+            thread.session_allowed_tools.clear();
+            thread.session_info = None;
         }
 
         let manager = self.clone();
@@ -1147,6 +1574,8 @@ impl SessionManager {
             max_turns: None,
             env: BTreeMap::new(),
             resume_external_session,
+            billing: self.billing,
+            approval_hook: None,
         })
     }
 
@@ -1186,6 +1615,13 @@ impl SessionManager {
                 {
                     crate::log::warn(format!("failed to persist external session id: {err}"));
                 }
+            }
+        }
+
+        if matches!(event, AgentEvent::SessionInfo { .. }) {
+            let mut inner = self.lock();
+            if let Some(thread) = inner.threads.get_mut(thread_id) {
+                thread.session_info = Some(event.clone());
             }
         }
 
@@ -1373,9 +1809,18 @@ impl SessionManager {
     async fn on_pump_closed(&self, thread_id: &ThreadId) {
         let (in_flight, partial) = {
             let mut inner = self.lock();
+            let token = inner
+                .threads
+                .get_mut(thread_id)
+                .and_then(|thread| thread.approval_token.take());
+            if let Some(token) = token {
+                inner.approval_tokens.remove(&token);
+            }
             match inner.threads.get_mut(thread_id) {
                 Some(thread) => {
                     thread.live_session = None;
+                    thread.session_allowed_tools.clear();
+                    thread.session_info = None;
                     if thread.reservation == Some(Reservation::Turn) {
                         thread.reservation = None;
                         (true, std::mem::take(&mut thread.acc_text))
@@ -1386,6 +1831,13 @@ impl SessionManager {
                 None => (false, String::new()),
             }
         };
+        // A hook still waiting would otherwise block until its timeout.
+        self.cancel_thread_approvals(
+            thread_id,
+            "The agent session ended before this approval was answered.",
+            false,
+        )
+        .await;
         if !in_flight {
             return;
         }

@@ -8,8 +8,15 @@
 //! Interrupt sends SIGINT to the child pid via `kill -INT` on Unix. The
 //! SIGKILL fallback is [`tokio::process::Child::kill`].
 //!
-//! Approval is not wired: the SDK control / `--permission-prompt-tool stdio`
-//! channel is version-sensitive. [`AgentAdapter::respond_approval`] returns
+//! Billing: with [`BillingMode::Subscription`] (the default) the child never
+//! sees `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`, so Claude Code bills the
+//! user's Claude login instead of the API. [`BillingMode::ApiKey`] keeps them.
+//!
+//! Approval: when [`SessionConfig::approval_hook`] is set, a
+//! `PermissionRequest` hook is injected with `--settings` (ADR 0002). Claude
+//! Code runs it for every tool call that would prompt; the hook asks the
+//! daemon and prints the decision. The decision never flows through this
+//! adapter, so [`AgentAdapter::respond_approval`] returns
 //! [`DomainError::Invalid`].
 
 use std::collections::HashMap;
@@ -27,7 +34,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use trama_domain::agent::{
     AgentAdapter, AgentEvent, AgentKind, AgentPrompt, AgentSession, ApprovalDecision,
-    PermissionMode, SessionConfig,
+    ApprovalHookConfig, BillingMode, PermissionMode, SessionConfig,
 };
 use trama_domain::ids::AgentSessionId;
 use trama_domain::{DomainError, Result};
@@ -36,6 +43,10 @@ use super::protocol::{ClaudeLine, parse_line};
 use super::translate::{TranslateState, translate_line_in};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(1500);
+
+/// Variables that make Claude Code bill the Anthropic API instead of the
+/// subscription login. Removed from the child unless billing is `ApiKey`.
+pub const API_BILLING_ENV: [&str; 2] = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
 
 struct SessionState {
     child: Child,
@@ -179,7 +190,52 @@ pub fn claude_cli_args(config: &SessionConfig) -> Vec<String> {
         args.push("--resume".to_string());
         args.push(resume.clone());
     }
+    if let Some(hook) = &config.approval_hook {
+        // `--settings` overlays the user's settings for this session only;
+        // hook entries merge with theirs rather than replacing them.
+        args.push("--settings".to_string());
+        args.push(approval_hook_settings(hook).to_string());
+    }
     args
+}
+
+/// Settings JSON that registers `hook` as a `PermissionRequest` command hook
+/// for every tool. Claude Code runs it only when a call would otherwise
+/// prompt, after deny/ask rules, the permission mode, and allow rules.
+pub fn approval_hook_settings(hook: &ApprovalHookConfig) -> serde_json::Value {
+    let mut command = shell_quote(&hook.command.to_string_lossy());
+    for arg in &hook.args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    serde_json::json!({
+        "hooks": {
+            "PermissionRequest": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": command,
+                    "timeout": hook.timeout_secs,
+                }],
+            }],
+        },
+    })
+}
+
+/// Single-quote for `sh`. Hook commands run through a shell, and the daemon
+/// lives under `Application Support`, so paths routinely contain spaces.
+fn shell_quote(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "'\\''"))
+}
+
+/// Child env keys to remove after `config.env` is applied. Under the
+/// subscription default this also drops API credentials set explicitly in
+/// `config.env`: API billing must be opted into with [`BillingMode::ApiKey`].
+pub fn child_env_removals(config: &SessionConfig) -> &'static [&'static str] {
+    match config.billing {
+        BillingMode::Subscription => &API_BILLING_ENV,
+        BillingMode::ApiKey => &[],
+    }
 }
 
 pub fn permission_mode_flag(mode: &PermissionMode) -> &'static str {
@@ -224,6 +280,9 @@ impl AgentAdapter for ClaudeAdapter {
             .kill_on_drop(true);
         for (key, value) in &config.env {
             cmd.env(key, value);
+        }
+        for key in child_env_removals(&config) {
+            cmd.env_remove(key);
         }
 
         let mut child = cmd.spawn().map_err(|err| {
@@ -300,11 +359,13 @@ impl AgentAdapter for ClaudeAdapter {
         _request_id: &str,
         _decision: ApprovalDecision,
     ) -> Result<()> {
-        // Approval control channel: TODO (--permission-prompt-tool stdio).
-        // Claude Code's SDK control requests are version-sensitive; wiring a
-        // canary against one CLI build would silently break on the next.
+        // Claude Code blocks on the `PermissionRequest` hook process, which
+        // receives the decision from the daemon's approval broker. There is
+        // no in-band channel on this process to answer through.
         Err(DomainError::Invalid(
-            "approval control channel: TODO (--permission-prompt-tool stdio)".to_string(),
+            "Claude Code approvals are answered through the PermissionRequest hook; \
+             no pending request is held by the adapter"
+                .to_string(),
         ))
     }
 
@@ -451,6 +512,8 @@ mod tests {
             max_turns: Some(4),
             env: BTreeMap::new(),
             resume_external_session: Some("ses_resume".into()),
+            billing: BillingMode::Subscription,
+            approval_hook: None,
         }
     }
 
@@ -473,6 +536,139 @@ mod tests {
         assert!(joined.contains("--max-turns 4"));
         assert!(joined.contains("--resume ses_resume"));
         assert!(!args.iter().any(|a| a == "--bare"));
+        assert!(!args.iter().any(|a| a == "--settings"));
+    }
+
+    #[test]
+    fn approval_hook_is_injected_as_permission_request_settings() {
+        let mut config = sample_config();
+        config.approval_hook = Some(ApprovalHookConfig {
+            command: PathBuf::from("/Users/me/Library/Application Support/it's/trama-daemon"),
+            args: vec!["approval-hook".into()],
+            timeout_secs: 1830,
+        });
+        let args = claude_cli_args(&config);
+        assert!(!args.iter().any(|a| a == "--bare"));
+        assert!(!args.iter().any(|a| a == "--permission-prompt-tool"));
+        let at = args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings");
+        let settings: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
+        assert_eq!(
+            settings,
+            serde_json::json!({
+                "hooks": {
+                    "PermissionRequest": [{
+                        "matcher": "*",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "'/Users/me/Library/Application Support/it'\\''s/trama-daemon' 'approval-hook'",
+                            "timeout": 1830
+                        }]
+                    }]
+                }
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_command_survives_sh_word_splitting() {
+        let hook = ApprovalHookConfig {
+            command: PathBuf::from("/bin/echo"),
+            args: vec!["a b".into(), "it's".into()],
+            timeout_secs: 5,
+        };
+        let settings = approval_hook_settings(&hook);
+        let command = settings["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let out = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "a b it's\n");
+    }
+
+    #[test]
+    fn subscription_billing_strips_api_credentials() {
+        let mut config = sample_config();
+        assert_eq!(config.billing, BillingMode::Subscription);
+        assert_eq!(
+            child_env_removals(&config),
+            ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+        );
+        config.billing = BillingMode::ApiKey;
+        assert!(child_env_removals(&config).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_child_env_respects_billing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile_dir("billing-env");
+        let dump = dir.join("env.txt");
+        let script = dir.join("claude");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nenv > \"{}\"\nexec cat >/dev/null\n",
+                dump.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let adapter = ClaudeAdapter::with_binary(script.to_string_lossy().into_owned());
+
+        for (billing, expect_keys) in [
+            (BillingMode::Subscription, false),
+            (BillingMode::ApiKey, true),
+        ] {
+            let _ = std::fs::remove_file(&dump);
+            let mut config = sample_config();
+            config.cwd = dir.clone();
+            config.extra_dirs.clear();
+            config.billing = billing;
+            config.env = BTreeMap::from([
+                ("ANTHROPIC_API_KEY".into(), "sk-test".into()),
+                ("ANTHROPIC_AUTH_TOKEN".into(), "tok-test".into()),
+                ("TRAMA_KEEP".into(), "1".into()),
+            ]);
+            let (tx, _rx) = async_channel::unbounded();
+            let session = adapter.start(config, tx).await.unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            let env = loop {
+                match std::fs::read_to_string(&dump) {
+                    Ok(env) if env.contains("TRAMA_KEEP=1") => break env,
+                    _ if tokio::time::Instant::now() > deadline => panic!("env dump missing"),
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            };
+            adapter.shutdown(&session).await.unwrap();
+            assert_eq!(
+                env.contains("ANTHROPIC_API_KEY="),
+                expect_keys,
+                "{billing:?}"
+            );
+            assert_eq!(
+                env.contains("ANTHROPIC_AUTH_TOKEN="),
+                expect_keys,
+                "{billing:?}"
+            );
+        }
+    }
+
+    fn tempfile_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "trama-claude-{label}-{}-{}",
+            std::process::id(),
+            AgentSessionId::generate()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -520,7 +716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn respond_approval_is_todo() {
+    async fn respond_approval_points_at_the_hook() {
         let adapter = ClaudeAdapter::with_binary("claude");
         let session = AgentSession {
             id: AgentSessionId::from("s1"),
@@ -532,7 +728,7 @@ mod tests {
             .respond_approval(&session, "req", ApprovalDecision::AllowOnce)
             .await
             .unwrap_err();
-        assert!(matches!(err, DomainError::Invalid(msg) if msg.contains("TODO")));
+        assert!(matches!(err, DomainError::Invalid(msg) if msg.contains("PermissionRequest hook")));
     }
 
     #[cfg(unix)]
@@ -568,6 +764,8 @@ mod tests {
             max_turns: None,
             env: BTreeMap::new(),
             resume_external_session: None,
+            billing: BillingMode::Subscription,
+            approval_hook: None,
         };
         let session = adapter.start(config, tx).await.unwrap();
 
