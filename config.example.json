@@ -1,5 +1,10 @@
 {
   "billing": "subscription",
+  "subagents": {
+    "max_running_per_thread": 4,
+    "max_running_total": 8,
+    "allow_builtin_subagents": false
+  },
   "workspaces": [
     {
       "name": "LaFraternita",

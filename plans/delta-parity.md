@@ -11,13 +11,13 @@ no automatic push or land, and unimplemented features must not look operational.
 |---|---|
 | Thread (conversation + worktrees) | Thread + isolated managed checkouts (exists) |
 | Project | Repository in a workspace group (ADR 0005) |
-| Subthread (Plain / Review / Land), no nesting | Child thread, forked checkouts + `--resume --fork-session` |
+| Subthread (Plain / Review / Land) | Child thread at any depth, forked checkouts + `--resume --fork-session`; fork at a message (ADR 0010) |
 | Changes tab, per-file Seen, bases | Daemon `git diff` per repo, drawer view |
 | Review thread, change guide, verdict, Pull Changes | Review subthread, verdict events, `git apply --3way` into parent |
 | Land via a `delta-action: land` skill | Land subthread that runs the repo skill tagged `trama-action: land` |
 | Comments on transcript, diffs and code, delivered on next send | `trama-domain::comment` (exists), delivered with the prompt |
 | Multiplayer: shared threads, drafts, presence, inbox | `trama-collab` service; each turn runs on the sender's runner |
-| Subagents (Worker / Scout / Reviewer) | Claude Code's own Task subagents, nested by `parent_tool_use_id` |
+| Subagents (Worker / Scout / Reviewer) | Trama threads spawned through the `trama-workspace` MCP server (ADR 0010) |
 | `.agents/prepare`, `.agents/linked` | Checkout provisioning hooks |
 
 ## Phase 1 — in progress (parallel branches)

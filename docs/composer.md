@@ -1,7 +1,7 @@
 # Composer backend
 
 The daemon side of the composer: `@` mentions, `/` skills and commands, model
-selection, and inline `!` terminals. Protocol version 7 (see
+selection, and inline `!` terminals. Added in protocol version 7 (current: 9, see
 `crates/trama-protocol`). Code: `apps/trama-daemon/src/session/{context,skills,terminal}.rs`,
 `crates/trama-infra/src/pty.rs`.
 
