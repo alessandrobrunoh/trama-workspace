@@ -4,7 +4,7 @@ description = "Infrastructure adapters: Claude Code stream-json driver, git, run
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 
 [dependencies]
 trama-domain = { path = "../trama-domain" }

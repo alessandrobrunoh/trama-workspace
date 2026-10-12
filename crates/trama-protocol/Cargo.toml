@@ -4,7 +4,7 @@ description = "Versioned IPC protocol between desktop UI, daemon and remote runn
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 
 [dependencies]
 trama-domain = { path = "../trama-domain" }
