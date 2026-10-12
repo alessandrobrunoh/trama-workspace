@@ -161,7 +161,19 @@ async fn handle_line(
             }
         }
         ClientMessage::SendPrompt { thread_id, text } => {
-            sessions.send_prompt(thread_id, text).await?;
+            if let Err(error) = sessions.send_prompt(thread_id.clone(), text).await {
+                let message = error.to_string();
+                let _ = out_tx.send(DaemonMessage::Error {
+                    code: error.code().into(),
+                    message: message.clone(),
+                });
+                // This attempt was rejected, not another subscriber's running
+                // turn. Reply only to the requesting client, scoped by thread.
+                let _ = out_tx.send(DaemonMessage::AgentEventEnvelope {
+                    thread_id,
+                    event: trama_domain::agent::AgentEvent::Failed { message },
+                });
+            }
         }
         ClientMessage::Interrupt { thread_id } => {
             sessions.interrupt(&thread_id).await?;
@@ -174,6 +186,34 @@ async fn handle_line(
             sessions
                 .respond_approval(&thread_id, &request_id, decision)
                 .await?;
+        }
+        ClientMessage::CreateWorkspace { name } => {
+            let snapshot = sessions.create_workspace(name).await?;
+            let _ = out_tx.send(DaemonMessage::WorkspaceCreated(snapshot));
+        }
+        ClientMessage::AddRepository {
+            workspace_id,
+            path,
+            alias,
+        } => {
+            let repository = sessions
+                .add_repository(workspace_id.clone(), path, alias)
+                .await?;
+            let _ = out_tx.send(DaemonMessage::RepositoryAdded {
+                workspace_id,
+                repository,
+            });
+        }
+        ClientMessage::ListRepositories { workspace_id } => {
+            let repositories = sessions.list_repositories(&workspace_id).await?;
+            let _ = out_tx.send(DaemonMessage::Repositories {
+                workspace_id,
+                repositories,
+            });
+        }
+        ClientMessage::MigrateLegacyThread { thread_id } => {
+            let snapshot = sessions.migrate_legacy_thread(thread_id).await?;
+            let _ = out_tx.send(DaemonMessage::ThreadMigrated(snapshot));
         }
         ClientMessage::Shutdown => {
             let _ = shutdown.send(true);
@@ -203,7 +243,29 @@ mod tests {
         let db = TramaDb::open_in_memory().unwrap();
         let workspace = Workspace::new("Default");
         db.create_workspace(&workspace).await.unwrap();
-        let repo = Repository::new(None, Some(std::env::temp_dir()), Some("main".into()));
+        let source = std::env::temp_dir().join(format!(
+            "trama-connection-test-{}",
+            trama_domain::ids::RepositoryId::generate()
+        ));
+        std::fs::create_dir_all(&source).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Trama Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Trama Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(source.join("same.txt"), "source\n").unwrap();
+        git(&["add", "same.txt"]);
+        git(&["commit", "-m", "initial"]);
+        let repo = Repository::new(None, Some(source), Some("main".into()));
         db.create_repository(&repo).await.unwrap();
         db.add_membership(&WorkspaceMembership {
             workspace_id: workspace.id,
@@ -213,7 +275,14 @@ mod tests {
         })
         .await
         .unwrap();
-        SessionManager::new(db, Arc::new(FakeAdapter::scripted()))
+        SessionManager::with_checkout_root(
+            db,
+            Arc::new(FakeAdapter::scripted()),
+            std::env::temp_dir().join(format!(
+                "trama-connection-managed-{}",
+                trama_domain::ids::ThreadId::generate()
+            )),
+        )
     }
 
     async fn write_client<W: AsyncWrite + Unpin>(writer: &mut W, msg: &ClientMessage) {
@@ -229,6 +298,40 @@ mod tests {
             .expect("read timeout")
             .unwrap();
         decode_json_line(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejected_prompt_ends_only_the_requesting_clients_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::with_checkout_root(
+            TramaDb::open_in_memory().unwrap(),
+            Arc::new(FakeAdapter::scripted()),
+            root.path(),
+        );
+        let thread_id = ThreadId::from("missing-thread");
+        let line = serde_json::to_string(&ClientMessage::SendPrompt {
+            thread_id: thread_id.clone(),
+            text: "keep this draft".into(),
+        })
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (shutdown, _) = watch::channel(false);
+        let result = handle_line(&line, &sessions, &tx, &mut HashMap::new(), &shutdown).await;
+        assert!(
+            result.is_ok(),
+            "a rejected prompt must keep the connection usable"
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            DaemonMessage::Error { .. }
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            DaemonMessage::AgentEventEnvelope {
+                thread_id: id,
+                event: AgentEvent::Failed { .. }
+            } if id == thread_id
+        ));
     }
 
     #[tokio::test]
@@ -403,5 +506,209 @@ mod tests {
             DaemonMessage::Welcome { accepted, .. } => assert!(!accepted),
             other => panic!("expected welcome, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn empty_config_onboarding_persists_across_reopen_over_ipc() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("trama.db");
+        let db = TramaDb::open(&db_path).unwrap();
+        let config = crate::config::load_or_init_config(&dir.path().join("config.json")).unwrap();
+        assert!(config.workspaces.is_empty());
+        crate::config::seed_from_config(&db, &config).await.unwrap();
+
+        let source = dir.path().join("app");
+        std::fs::create_dir_all(&source).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Trama Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Trama Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(source.join("same.txt"), "source\n").unwrap();
+        git(&["add", "same.txt"]);
+        git(&["commit", "-m", "initial"]);
+
+        let fake = FakeAdapter::scripted();
+        let sessions = SessionManager::with_checkout_root(
+            db.clone(),
+            Arc::new(fake.clone()),
+            dir.path().join("managed"),
+        );
+        let (client, server) = duplex(64 * 1024);
+        let (shutdown, _rx) = watch::channel(false);
+        let server = tokio::spawn(async move {
+            let _ = handle_connection(server, sessions, shutdown).await;
+        });
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut reader = BufReader::new(client_read);
+
+        write_client(
+            &mut client_write,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "onboarding-test".into(),
+            },
+        )
+        .await;
+        match read_daemon(&mut reader).await {
+            DaemonMessage::Welcome { accepted, .. } => assert!(accepted),
+            other => panic!("expected welcome, got {other:?}"),
+        }
+
+        write_client(
+            &mut client_write,
+            &ClientMessage::CreateWorkspace {
+                name: "Demo".into(),
+            },
+        )
+        .await;
+        let workspace = match read_daemon(&mut reader).await {
+            DaemonMessage::WorkspaceCreated(snapshot) => snapshot,
+            other => panic!("expected workspace, got {other:?}"),
+        };
+        assert_eq!(workspace.title, "Demo");
+        assert_eq!(workspace.repo_count, 0);
+
+        write_client(
+            &mut client_write,
+            &ClientMessage::CreateThread {
+                workspace_id: workspace.id.clone(),
+                title: "too soon".into(),
+            },
+        )
+        .await;
+        match read_daemon(&mut reader).await {
+            DaemonMessage::Error { message, .. } => {
+                assert!(message.contains("Add a local Git repository"), "{message}");
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+
+        write_client(
+            &mut client_write,
+            &ClientMessage::AddRepository {
+                workspace_id: workspace.id.clone(),
+                path: source.clone(),
+                alias: "app".into(),
+            },
+        )
+        .await;
+        let added = match read_daemon(&mut reader).await {
+            DaemonMessage::RepositoryAdded { repository, .. } => repository,
+            other => panic!("expected repository, got {other:?}"),
+        };
+        assert_eq!(added.title, "app");
+        assert!(added.default_enabled);
+
+        write_client(
+            &mut client_write,
+            &ClientMessage::AddRepository {
+                workspace_id: workspace.id.clone(),
+                path: source,
+                alias: "app".into(),
+            },
+        )
+        .await;
+        match read_daemon(&mut reader).await {
+            DaemonMessage::RepositoryAdded { repository, .. } => {
+                assert_eq!(repository.id, added.id);
+            }
+            other => panic!("expected idempotent repository, got {other:?}"),
+        }
+
+        write_client(
+            &mut client_write,
+            &ClientMessage::CreateThread {
+                workspace_id: workspace.id.clone(),
+                title: "first".into(),
+            },
+        )
+        .await;
+        let thread = match read_daemon(&mut reader).await {
+            DaemonMessage::ThreadCreated(snapshot) => snapshot,
+            other => panic!("expected thread, got {other:?}"),
+        };
+
+        write_client(
+            &mut client_write,
+            &ClientMessage::SubscribeThread {
+                thread_id: thread.id.clone(),
+            },
+        )
+        .await;
+        write_client(
+            &mut client_write,
+            &ClientMessage::SendPrompt {
+                thread_id: thread.id.clone(),
+                text: "hello".into(),
+            },
+        )
+        .await;
+        let deadline = Duration::from_secs(3);
+        let mut saw_agent = false;
+        for _ in 0..20 {
+            let msg = timeout(deadline, async { read_daemon(&mut reader).await })
+                .await
+                .expect("event timeout");
+            if matches!(
+                msg,
+                DaemonMessage::AgentEventEnvelope {
+                    event: AgentEvent::TextDelta { .. },
+                    ..
+                }
+            ) {
+                saw_agent = true;
+                break;
+            }
+        }
+        assert!(saw_agent, "fake adapter should stream over IPC");
+
+        drop(client_write);
+        drop(reader);
+        server.await.unwrap();
+        crate::config::seed_from_config(&db, &crate::config::FileConfig::default())
+            .await
+            .unwrap();
+        drop(db);
+        let reopened = TramaDb::open(&db_path).unwrap();
+        let workspaces = reopened.list_workspaces().await.unwrap();
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].name, "Demo");
+        assert_eq!(
+            reopened
+                .list_memberships(&workspaces[0].id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let threads = reopened.list_threads(&workspaces[0].id).await.unwrap();
+        assert_eq!(threads.len(), 1);
+        assert!(threads[0].repo_attachments[0].checkout_id.is_some());
+        assert!(threads[0].repo_attachments[0].base_revision.is_some());
+        assert!(
+            !reopened
+                .list_messages_by_thread(&threads[0].id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let configs = fake
+            .start_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(configs.len(), 1);
+        assert!(configs[0].resume_external_session.is_none());
+        assert!(configs[0].cwd.starts_with(dir.path().join("managed")));
     }
 }

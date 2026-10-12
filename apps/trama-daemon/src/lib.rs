@@ -48,7 +48,11 @@ pub async fn bootstrap_sessions() -> Result<SessionManager> {
     let config = load_or_init_config(&dir.join("config.json"))?;
     let db = TramaDb::open(&dir.join("trama.db"))?;
     seed_from_config(&db, &config).await?;
-    Ok(SessionManager::new(db, Arc::new(ProductionAdapter::new())))
+    Ok(SessionManager::with_checkout_root(
+        db,
+        Arc::new(ProductionAdapter::new()),
+        dir,
+    ))
 }
 
 pub async fn run() -> Result<()> {

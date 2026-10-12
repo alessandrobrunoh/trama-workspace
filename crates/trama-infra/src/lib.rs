@@ -4,6 +4,7 @@
 //! CLI and speaks NDJSON (`--input-format stream-json` /
 //! `--output-format stream-json`). ACP is not used for Claude Code.
 
+pub mod checkout;
 pub mod claude;
 
 pub use claude::adapter::ClaudeAdapter;

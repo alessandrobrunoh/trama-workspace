@@ -1,10 +1,11 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _,
+    Disableable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{InputEvent, Textarea, TextareaState},
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// Composer input: Kit `TextareaState` (0.7.1's textarea counterpart of
@@ -37,6 +38,16 @@ impl Composer {
         prompt
     }
 
+    pub fn value(&self, cx: &App) -> String {
+        self.input.read(cx).value().to_string()
+    }
+
+    pub fn set_prompt(&self, prompt: &str, window: &mut Window, cx: &mut App) {
+        self.input.update(cx, |input, cx| {
+            input.set_value(prompt.to_string(), window, cx);
+        });
+    }
+
     pub fn set_disabled(&self, disabled: bool, cx: &mut App) {
         self.input.update(cx, |input, cx| {
             input.set_disabled(disabled, cx);
@@ -59,7 +70,9 @@ impl Composer {
     pub fn render(
         &self,
         running: bool,
+        stoppable: bool,
         on_send: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        on_stop: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         cx: &mut App,
     ) -> impl IntoElement {
         let can_send = !running && !self.input.read(cx).value().trim().is_empty();
@@ -68,23 +81,34 @@ impl Composer {
             .w_full()
             .items_end()
             .gap_2()
-            .p_3()
+            .px_10()
+            .py_3()
             .border_t_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().background)
+            .border_color(rgb(0x34373a))
+            .bg(rgb(0x191b1d))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .child(Textarea::new(&self.input).h(px(72.))),
             )
-            .child(
-                Button::new("send-message")
-                    .primary()
-                    .icon(IconName::Send)
-                    .label("Send")
-                    .disabled(!can_send)
-                    .on_click(on_send),
-            )
+            .when(stoppable, |this| {
+                this.child(
+                    Button::new("stop-message")
+                        .ghost()
+                        .label("Stop")
+                        .on_click(on_stop),
+                )
+            })
+            .when(!running, |this| {
+                this.child(
+                    Button::new("send-message")
+                        .primary()
+                        .icon(IconName::Send)
+                        .label("Send")
+                        .disabled(!can_send)
+                        .on_click(on_send),
+                )
+            })
     }
 }

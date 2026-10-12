@@ -1,10 +1,16 @@
 mod agent;
 mod chat;
 mod composer;
+mod dialog;
 mod net;
+mod onboarding;
+mod startup;
 mod workspace;
 
-use gpui_kit::component::TitleBar;
+use gpui_kit::component::{
+    TitleBar,
+    theme::{Theme, ThemeMode},
+};
 use gpui_kit::*;
 
 use workspace::Workspace;
@@ -14,6 +20,7 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);
+            Theme::change(ThemeMode::Dark, None, cx);
 
             let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
             let options = WindowOptions {

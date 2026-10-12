@@ -5,7 +5,8 @@
 //! and polls [`NetEvent`]s over `async_channel`, the same pattern as FakeAgent.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
@@ -30,6 +31,15 @@ pub enum NetCommand {
     SelectThread(ThreadId),
 }
 
+/// Whether [`DaemonClient::send`] wrote the message onto the live socket queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendStatus {
+    /// Queued for the connected daemon.
+    Enqueued,
+    /// The daemon socket is down. The message was not written.
+    Rejected,
+}
+
 /// Events the UI polls on GPUI's foreground via `cx.spawn`.
 #[derive(Debug)]
 pub enum NetEvent {
@@ -37,7 +47,14 @@ pub enum NetEvent {
         #[allow(dead_code)]
         daemon_version: String,
     },
+    /// The socket is gone and the client will keep trying.
     Disconnected,
+    /// Welcome was refused. The reconnect loop has stopped.
+    ProtocolMismatch {
+        daemon_protocol: u32,
+    },
+    /// Enqueued earlier, then the socket could not take it. Restore any draft.
+    OutboundRejected(ClientMessage),
     Message(DaemonMessage),
 }
 
@@ -45,6 +62,7 @@ pub enum NetEvent {
 #[derive(Clone)]
 pub struct DaemonClient {
     commands: Sender<NetCommand>,
+    connected: Arc<AtomicBool>,
 }
 
 /// Unique receiver for daemon events. Held by [`crate::workspace::Workspace`].
@@ -59,8 +77,17 @@ impl DaemonEvents {
 }
 
 impl DaemonClient {
-    pub fn send(&self, message: ClientMessage) {
-        let _ = self.commands.try_send(NetCommand::Send(message));
+    /// Returns [`SendStatus::Rejected`] immediately when the daemon is offline
+    /// so the caller can keep the user's draft. A disconnect that happens after
+    /// [`SendStatus::Enqueued`] is reported as [`NetEvent::OutboundRejected`].
+    pub fn send(&self, message: ClientMessage) -> SendStatus {
+        if !self.connected.load(Ordering::Acquire) {
+            return SendStatus::Rejected;
+        }
+        match self.commands.try_send(NetCommand::Send(message)) {
+            Ok(()) => SendStatus::Enqueued,
+            Err(_) => SendStatus::Rejected,
+        }
     }
 
     pub fn select_workspace(&self, workspace_id: WorkspaceId) {
@@ -100,10 +127,11 @@ fn runtime() -> Option<&'static tokio::runtime::Runtime> {
 pub fn start() -> (DaemonClient, DaemonEvents) {
     let (command_tx, command_rx) = async_channel::unbounded();
     let (event_tx, event_rx) = async_channel::unbounded();
+    let connected = Arc::new(AtomicBool::new(false));
 
     match runtime() {
         Some(rt) => {
-            rt.spawn(net_loop(command_rx, event_tx));
+            rt.spawn(net_loop(command_rx, event_tx, Arc::clone(&connected)));
         }
         None => {
             let _ = event_tx.try_send(NetEvent::Disconnected);
@@ -113,9 +141,61 @@ pub fn start() -> (DaemonClient, DaemonEvents) {
     (
         DaemonClient {
             commands: command_tx,
+            connected,
         },
         DaemonEvents { events: event_rx },
     )
+}
+
+/// Messages sent once a socket is up again. Subscriptions died with the
+/// previous socket, so history is resubscribed without an unsubscribe.
+pub(crate) fn replay_messages(
+    workspace: Option<WorkspaceId>,
+    thread: Option<ThreadId>,
+) -> Vec<ClientMessage> {
+    let mut messages = vec![ClientMessage::ListWorkspaces];
+    if let Some(workspace_id) = workspace {
+        messages.push(ClientMessage::ListThreads {
+            workspace_id: workspace_id.clone(),
+        });
+        messages.push(ClientMessage::ListRepositories { workspace_id });
+    }
+    if let Some(thread_id) = thread {
+        messages.push(ClientMessage::SubscribeThread { thread_id });
+    }
+    messages
+}
+
+/// Resubscribe even when the id did not change, so a migrated thread reloads
+/// history instead of keeping a stale daemon subscription.
+pub(crate) fn select_thread_messages(
+    previous: Option<ThreadId>,
+    thread_id: ThreadId,
+) -> Vec<ClientMessage> {
+    let mut messages = Vec::new();
+    if let Some(previous) = previous {
+        messages.push(ClientMessage::UnsubscribeThread {
+            thread_id: previous,
+        });
+    }
+    messages.push(ClientMessage::SubscribeThread { thread_id });
+    messages
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WelcomeOutcome {
+    Ready,
+    Mismatch { daemon_protocol: u32 },
+}
+
+pub(crate) fn classify_welcome(accepted: bool, protocol_version: u32) -> WelcomeOutcome {
+    if accepted && protocol_version == PROTOCOL_VERSION {
+        WelcomeOutcome::Ready
+    } else {
+        WelcomeOutcome::Mismatch {
+            daemon_protocol: protocol_version,
+        }
+    }
 }
 
 struct SessionState {
@@ -141,12 +221,17 @@ fn lock_state(state: &Mutex<SessionState>) -> std::sync::MutexGuard<'_, SessionS
     }
 }
 
-async fn net_loop(commands: Receiver<NetCommand>, events: Sender<NetEvent>) {
-    let state = std::sync::Arc::new(Mutex::new(SessionState::new()));
-    let command_state = std::sync::Arc::clone(&state);
+async fn net_loop(
+    commands: Receiver<NetCommand>,
+    events: Sender<NetEvent>,
+    connected: Arc<AtomicBool>,
+) {
+    let state = Arc::new(Mutex::new(SessionState::new()));
+    let command_state = Arc::clone(&state);
+    let command_events = events.clone();
 
     tokio::spawn(async move {
-        dispatch_commands(commands, command_state).await;
+        dispatch_commands(commands, command_state, command_events).await;
     });
 
     let mut first = true;
@@ -169,15 +254,12 @@ async fn net_loop(commands: Receiver<NetCommand>, events: Sender<NetEvent>) {
                 let replay = {
                     let mut st = lock_state(&state);
                     st.write_tx = Some(write_tx.clone());
+                    connected.store(true, Ordering::Release);
                     (st.workspace.clone(), st.thread.clone())
                 };
 
-                let _ = write_tx.send(ClientMessage::ListWorkspaces);
-                if let Some(workspace_id) = replay.0 {
-                    let _ = write_tx.send(ClientMessage::ListThreads { workspace_id });
-                }
-                if let Some(thread_id) = replay.1 {
-                    let _ = write_tx.send(ClientMessage::SubscribeThread { thread_id });
+                for message in replay_messages(replay.0, replay.1) {
+                    let _ = write_tx.send(message);
                 }
 
                 let _ = events.send(NetEvent::Connected { daemon_version }).await;
@@ -190,6 +272,7 @@ async fn net_loop(commands: Receiver<NetCommand>, events: Sender<NetEvent>) {
                     _ = &mut reader => { writer.abort(); }
                 }
 
+                connected.store(false, Ordering::Release);
                 {
                     let mut st = lock_state(&state);
                     st.write_tx = None;
@@ -197,7 +280,18 @@ async fn net_loop(commands: Receiver<NetCommand>, events: Sender<NetEvent>) {
                 let _ = events.send(NetEvent::Disconnected).await;
                 announce_offline = false;
             }
-            Err(_) => {
+            Err(ConnectFailure::ProtocolMismatch { daemon_protocol }) => {
+                connected.store(false, Ordering::Release);
+                {
+                    let mut st = lock_state(&state);
+                    st.write_tx = None;
+                }
+                let _ = events
+                    .send(NetEvent::ProtocolMismatch { daemon_protocol })
+                    .await;
+                break;
+            }
+            Err(ConnectFailure::Unavailable(_)) => {
                 if announce_offline {
                     announce_offline = false;
                     let _ = events.send(NetEvent::Disconnected).await;
@@ -215,39 +309,51 @@ async fn net_loop(commands: Receiver<NetCommand>, events: Sender<NetEvent>) {
 
 async fn dispatch_commands(
     commands: Receiver<NetCommand>,
-    state: std::sync::Arc<Mutex<SessionState>>,
+    state: Arc<Mutex<SessionState>>,
+    events: Sender<NetEvent>,
 ) {
     while let Ok(command) = commands.recv().await {
-        let mut st = lock_state(&state);
-        match command {
-            NetCommand::Send(message) => {
-                if let Some(tx) = st.write_tx.as_ref() {
-                    let _ = tx.send(message);
+        let rejected = {
+            let mut st = lock_state(&state);
+            match command {
+                NetCommand::Send(message) => {
+                    let sent = st
+                        .write_tx
+                        .as_ref()
+                        .is_some_and(|tx| tx.send(message.clone()).is_ok());
+                    if sent { None } else { Some(message) }
                 }
-            }
-            NetCommand::SelectWorkspace(workspace_id) => {
-                st.workspace = Some(workspace_id.clone());
-                if let Some(tx) = st.write_tx.as_ref() {
-                    let _ = tx.send(ClientMessage::ListThreads { workspace_id });
+                NetCommand::SelectWorkspace(workspace_id) => {
+                    st.workspace = Some(workspace_id.clone());
+                    if let Some(tx) = st.write_tx.as_ref() {
+                        let _ = tx.send(ClientMessage::ListThreads {
+                            workspace_id: workspace_id.clone(),
+                        });
+                        let _ = tx.send(ClientMessage::ListRepositories { workspace_id });
+                    }
+                    None
                 }
-            }
-            NetCommand::SelectThread(thread_id) => {
-                if let Some(previous) = st.thread.clone() {
-                    if previous != thread_id {
-                        if let Some(tx) = st.write_tx.as_ref() {
-                            let _ = tx.send(ClientMessage::UnsubscribeThread {
-                                thread_id: previous,
-                            });
+                NetCommand::SelectThread(thread_id) => {
+                    let previous = st.thread.clone();
+                    st.thread = Some(thread_id.clone());
+                    if let Some(tx) = st.write_tx.as_ref() {
+                        for message in select_thread_messages(previous, thread_id) {
+                            let _ = tx.send(message);
                         }
                     }
-                }
-                st.thread = Some(thread_id.clone());
-                if let Some(tx) = st.write_tx.as_ref() {
-                    let _ = tx.send(ClientMessage::SubscribeThread { thread_id });
+                    None
                 }
             }
+        };
+        if let Some(message) = rejected {
+            let _ = events.send(NetEvent::OutboundRejected(message)).await;
         }
     }
+}
+
+enum ConnectFailure {
+    Unavailable(String),
+    ProtocolMismatch { daemon_protocol: u32 },
 }
 
 type DaemonRead = tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>;
@@ -255,37 +361,46 @@ type DaemonWrite = tokio::net::unix::OwnedWriteHalf;
 
 async fn connect_and_handshake(
     timeout: Duration,
-) -> Result<(DaemonRead, DaemonWrite, String), String> {
-    let path = default_socket_path().ok_or_else(|| "HOME is not set".to_string())?;
-    tokio::time::timeout(timeout, handshake_on(&path))
-        .await
-        .map_err(|_| "connect timeout".to_string())?
+) -> Result<(DaemonRead, DaemonWrite, String), ConnectFailure> {
+    let path = default_socket_path()
+        .ok_or_else(|| ConnectFailure::Unavailable("HOME is not set".to_string()))?;
+    match tokio::time::timeout(timeout, handshake_on(&path)).await {
+        Ok(result) => result,
+        Err(_) => Err(ConnectFailure::Unavailable("connect timeout".to_string())),
+    }
 }
 
-async fn handshake_on(path: &Path) -> Result<(DaemonRead, DaemonWrite, String), String> {
+async fn handshake_on(path: &Path) -> Result<(DaemonRead, DaemonWrite, String), ConnectFailure> {
     let stream = UnixStream::connect(path)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| ConnectFailure::Unavailable(err.to_string()))?;
     let (read, mut write) = stream.into_split();
 
     let hello = encode_json_line(&ClientMessage::Hello {
         protocol_version: PROTOCOL_VERSION,
         client_name: CLIENT_NAME.to_string(),
     })
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| ConnectFailure::Unavailable(err.to_string()))?;
     write
         .write_all(&hello)
         .await
-        .map_err(|err| err.to_string())?;
-    write.flush().await.map_err(|err| err.to_string())?;
+        .map_err(|err| ConnectFailure::Unavailable(err.to_string()))?;
+    write
+        .flush()
+        .await
+        .map_err(|err| ConnectFailure::Unavailable(err.to_string()))?;
 
     let mut lines = BufReader::new(read).lines();
     let line = loop {
         match lines.next_line().await {
             Ok(Some(line)) if line.trim().is_empty() => continue,
             Ok(Some(line)) => break line,
-            Ok(None) => return Err("daemon closed during handshake".into()),
-            Err(err) => return Err(err.to_string()),
+            Ok(None) => {
+                return Err(ConnectFailure::Unavailable(
+                    "daemon closed during handshake".into(),
+                ));
+            }
+            Err(err) => return Err(ConnectFailure::Unavailable(err.to_string())),
         }
     };
 
@@ -294,18 +409,16 @@ async fn handshake_on(path: &Path) -> Result<(DaemonRead, DaemonWrite, String), 
             accepted,
             protocol_version,
             daemon_version,
-        }) if accepted && protocol_version == PROTOCOL_VERSION => {
-            Ok((lines, write, daemon_version))
-        }
-        Ok(DaemonMessage::Welcome {
-            accepted,
-            protocol_version,
-            ..
-        }) => Err(format!(
-            "welcome rejected (accepted={accepted}, protocol_version={protocol_version})"
+        }) => match classify_welcome(accepted, protocol_version) {
+            WelcomeOutcome::Ready => Ok((lines, write, daemon_version)),
+            WelcomeOutcome::Mismatch { daemon_protocol } => {
+                Err(ConnectFailure::ProtocolMismatch { daemon_protocol })
+            }
+        },
+        Ok(_) => Err(ConnectFailure::Unavailable(
+            "first daemon message was not welcome".into(),
         )),
-        Ok(_) => Err("first daemon message was not welcome".into()),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(ConnectFailure::Unavailable(err.to_string())),
     }
 }
 
@@ -358,5 +471,56 @@ mod tests {
     #[test]
     fn backoff_caps_at_ten_seconds() {
         assert_eq!(BACKOFF_SECS, [2, 5, 10]);
+    }
+
+    #[test]
+    fn rejected_welcome_is_a_mismatch_and_stops_being_a_silent_retry() {
+        assert_eq!(
+            classify_welcome(true, PROTOCOL_VERSION),
+            WelcomeOutcome::Ready
+        );
+        assert_eq!(
+            classify_welcome(false, PROTOCOL_VERSION),
+            WelcomeOutcome::Mismatch {
+                daemon_protocol: PROTOCOL_VERSION,
+            }
+        );
+        assert_eq!(
+            classify_welcome(false, PROTOCOL_VERSION.saturating_sub(1)),
+            WelcomeOutcome::Mismatch {
+                daemon_protocol: PROTOCOL_VERSION.saturating_sub(1),
+            }
+        );
+    }
+
+    #[test]
+    fn replay_lists_repositories_and_resubscribes_history() {
+        let workspace_id = WorkspaceId::from("ws");
+        let thread_id = ThreadId::from("th");
+        assert_eq!(
+            replay_messages(Some(workspace_id.clone()), Some(thread_id.clone())),
+            vec![
+                ClientMessage::ListWorkspaces,
+                ClientMessage::ListThreads {
+                    workspace_id: workspace_id.clone(),
+                },
+                ClientMessage::ListRepositories { workspace_id },
+                ClientMessage::SubscribeThread { thread_id },
+            ]
+        );
+    }
+
+    #[test]
+    fn selecting_the_same_thread_still_resubscribes() {
+        let thread_id = ThreadId::from("th");
+        assert_eq!(
+            select_thread_messages(Some(thread_id.clone()), thread_id.clone()),
+            vec![
+                ClientMessage::UnsubscribeThread {
+                    thread_id: thread_id.clone(),
+                },
+                ClientMessage::SubscribeThread { thread_id },
+            ]
+        );
     }
 }

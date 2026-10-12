@@ -9,6 +9,10 @@ TramaWorkspace is a native macOS development workspace for agent-first coding: a
 3. **MCP hybrid.** Project MCP config and extra directories flow through session config; the daemon/runtime owns process lifetime, the UI does not shell out.
 4. **Multi-repo workspace groups.** A workspace is a named group of repositories (e.g. backend + frontend). New threads snapshot default memberships; later workspace edits never mutate existing threads.
 
+Each new thread gets a separate managed clone for every default-enabled repository, stored under `$HOME/Library/Application Support/TramaWorkspace/checkouts/<thread-id>/<repository-id>/<checkout-id>`. The daemon records the checkout ID and base commit in TramaDB and starts the agent only with those managed paths (`cwd` plus `extra_dirs`). Clones use `--no-hardlinks` and have a `local` remote pointing to the configured source repository; Trama never pushes or lands changes automatically.
+
+Thread creation currently requires each source repo to be clean. Non-ignored uncommitted or untracked files cause an actionable error; ignored files (including secrets) are never copied. Existing managed clones are validated and are never replaced or cleaned automatically. Threads created before managed checkout support must be recreated to migrate to isolated checkouts; legacy adopted sessions are not resumed in a different working directory.
+
 ## Crate map
 
 ```
@@ -31,14 +35,24 @@ Architecture notes live in [`docs/adr/`](docs/adr/).
 Requires a current stable Rust (see `rust-toolchain.toml`) on macOS.
 
 ```bash
+# Build once, before starting either process
+cargo build --workspace --all-targets
+
 # Local daemon (Unix socket under Application Support)
-cargo run -p trama-daemon
+./target/debug/trama-daemon
 
 # Desktop UI (separate terminal)
-cargo run -p trama-desktop
+./target/debug/TramaWorkspace
 ```
 
-The UI and daemon speak newline-delimited JSON (`crates/trama-protocol`). First message on a connection must be `Hello` with `protocol_version = 1`.
+Starting the binaries directly does not acquire Cargo's build lock. Do not
+start parallel `cargo run`/check/test commands while building. The desktop also
+offers **Start daemon** when the sibling binary is installed and no daemon is
+listening. Stop old app/daemon processes before restarting with protocol v2.
+Build profiles and editor-check settings are described in
+[build and disk usage](docs/build-and-space.md).
+
+The UI and daemon speak newline-delimited JSON (`crates/trama-protocol`). First message on a connection must be `Hello` with `protocol_version = 2`. A mismatch is rejected at the handshake; it does not rewrite stored threads or workspace ids. See [onboarding and legacy migration](docs/onboarding-and-migration.md).
 
 ## Roadmap
 

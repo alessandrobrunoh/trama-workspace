@@ -1,0 +1,3 @@
+[build]
+# Avoid concurrent compiler/linker peaks on small developer disks.
+jobs = 1

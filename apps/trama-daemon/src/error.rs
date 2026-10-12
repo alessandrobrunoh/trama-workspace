@@ -17,6 +17,8 @@ pub enum DaemonError {
     Invalid(String),
     #[error("thread is busy")]
     Busy,
+    #[error("thread is busy; wait for the running turn or migration to finish before migrating")]
+    MigrationBusy,
     #[error("agent error: {0}")]
     Agent(String),
     #[error("storage error: {0}")]
@@ -31,7 +33,7 @@ impl DaemonError {
             Self::Json(_) => "invalid_json",
             Self::NotFound(_) => "not_found",
             Self::Invalid(_) => "invalid",
-            Self::Busy => "busy",
+            Self::Busy | Self::MigrationBusy => "busy",
             Self::Agent(_) => "agent",
             Self::Storage(_) => "storage",
         }

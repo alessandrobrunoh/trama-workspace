@@ -26,7 +26,9 @@ mod tests {
     use trama_domain::DomainError;
     use trama_domain::agent::{AgentSession, UsageReport};
     use trama_domain::event::{Aggregate, EVENT_SCHEMA_VERSION, EventRecord, EventStore};
-    use trama_domain::ids::{AgentSessionId, MessageId, RepositoryId, ThreadId, WorkspaceId};
+    use trama_domain::ids::{
+        AgentSessionId, CheckoutId, MessageId, RepositoryId, ThreadId, WorkspaceId,
+    };
     use trama_domain::message::{Actor, ContentBlock, Message, Role};
     use trama_domain::revision::{ContentStore, FileRevision, RevisionStore};
     use trama_domain::thread::{AttachMode, Thread, ThreadKind, ThreadRepositoryAttachment};
@@ -126,7 +128,7 @@ mod tests {
             repo_attachments: vec![ThreadRepositoryAttachment {
                 repository_id: repository.id.clone(),
                 base_revision: Some("abc123".into()),
-                checkout_id: None,
+                checkout_id: Some(CheckoutId::from("checkout-1")),
                 attach_mode: AttachMode::Isolated,
             }],
         };
@@ -140,6 +142,14 @@ mod tests {
         assert_eq!(
             threads[0].repo_attachments[0].attach_mode,
             AttachMode::Isolated
+        );
+        assert_eq!(
+            threads[0].repo_attachments[0].checkout_id,
+            Some(CheckoutId::from("checkout-1"))
+        );
+        assert_eq!(
+            threads[0].repo_attachments[0].base_revision.as_deref(),
+            Some("abc123")
         );
     }
 
@@ -441,5 +451,335 @@ mod tests {
         assert_eq!(totals.input_tokens, 3);
         assert_eq!(totals.output_tokens, 4);
         assert_eq!(totals.model, "opus");
+    }
+
+    #[tokio::test]
+    async fn workspace_event_membership_and_migration_are_atomic() {
+        let db = TramaDb::open_in_memory().unwrap();
+        let workspace = Workspace::new("ui");
+        let event = EventRecord::new(
+            Aggregate::Workspace {
+                id: workspace.id.clone(),
+            },
+            Actor::System,
+            trama_domain::event::DomainEvent::WorkspaceCreated {
+                workspace: workspace.clone(),
+            },
+            vec![],
+        )
+        .unwrap();
+        db.create_workspace_with_event(&workspace, &event)
+            .await
+            .unwrap();
+        let other = Workspace::new("other");
+        let mut duplicate = EventRecord::new(
+            Aggregate::Workspace {
+                id: other.id.clone(),
+            },
+            Actor::System,
+            trama_domain::event::DomainEvent::WorkspaceCreated {
+                workspace: other.clone(),
+            },
+            vec![],
+        )
+        .unwrap();
+        duplicate.id = event.id.clone();
+        assert!(
+            db.create_workspace_with_event(&other, &duplicate)
+                .await
+                .is_err()
+        );
+        assert!(db.get_workspace(&other.id).await.unwrap().is_none());
+
+        let path = PathBuf::from("/tmp/trama-upsert-app");
+        let repo = Repository::new(None, Some(path.clone()), Some("main".into()));
+        let stored = db
+            .upsert_repository_membership(
+                &repo,
+                &WorkspaceMembership {
+                    workspace_id: workspace.id.clone(),
+                    repository_id: repo.id.clone(),
+                    alias: Some("app".into()),
+                    default_enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        let again = db
+            .upsert_repository_membership(
+                &Repository::new(
+                    Some("git@example.com:org/app.git".into()),
+                    Some(path),
+                    Some("main".into()),
+                ),
+                &WorkspaceMembership {
+                    workspace_id: workspace.id.clone(),
+                    repository_id: RepositoryId::generate(),
+                    alias: Some("app".into()),
+                    default_enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.id, again.id);
+        assert_eq!(
+            again.canonical_remote.as_deref(),
+            Some("git@example.com:org/app.git")
+        );
+        assert_eq!(db.list_all_repositories().await.unwrap().len(), 1);
+        assert_eq!(db.list_memberships(&workspace.id).await.unwrap().len(), 1);
+
+        let thread = Thread {
+            id: ThreadId::generate(),
+            workspace_id: Some(workspace.id.clone()),
+            parent_thread_id: None,
+            kind: ThreadKind::Top,
+            title: Some("legacy".into()),
+            repo_attachments: vec![ThreadRepositoryAttachment {
+                repository_id: stored.id.clone(),
+                base_revision: None,
+                checkout_id: None,
+                attach_mode: AttachMode::Isolated,
+            }],
+        };
+        db.create_thread(&thread).await.unwrap();
+        db.append_message(&Message::new_user(thread.id.clone(), "user", "keep me"))
+            .await
+            .unwrap();
+        let failure = Message {
+            id: MessageId::generate(),
+            thread_id: thread.id.clone(),
+            parent_id: None,
+            actor: Actor::System,
+            role: Role::System,
+            content: vec![ContentBlock::Text {
+                text: "should roll back".into(),
+            }],
+            created_at: Utc::now(),
+        };
+        let failure_event = EventRecord::new(
+            Aggregate::Thread {
+                id: thread.id.clone(),
+            },
+            Actor::System,
+            trama_domain::event::DomainEvent::MessageAdded {
+                message: failure.clone(),
+            },
+            vec![],
+        )
+        .unwrap();
+        let rolled_back = db
+            .persist_thread_migration(
+                &thread.id,
+                &[
+                    ThreadRepositoryAttachment {
+                        repository_id: stored.id.clone(),
+                        base_revision: Some("abc".into()),
+                        checkout_id: Some(CheckoutId::from("checkout-ok")),
+                        attach_mode: AttachMode::Isolated,
+                    },
+                    ThreadRepositoryAttachment {
+                        repository_id: RepositoryId::from("missing-repo"),
+                        base_revision: Some("abc".into()),
+                        checkout_id: Some(CheckoutId::from("checkout-missing")),
+                        attach_mode: AttachMode::Isolated,
+                    },
+                ],
+                &failure,
+                &failure_event,
+            )
+            .await;
+        assert!(rolled_back.is_err());
+        let unchanged = db.get_thread(&thread.id).await.unwrap().unwrap();
+        assert!(unchanged.repo_attachments[0].checkout_id.is_none());
+        assert_eq!(
+            db.list_messages_by_thread(&thread.id).await.unwrap().len(),
+            1
+        );
+
+        let notice = Message {
+            id: MessageId::generate(),
+            thread_id: thread.id.clone(),
+            parent_id: None,
+            actor: Actor::System,
+            role: Role::System,
+            content: vec![ContentBlock::Text {
+                text: "migrated".into(),
+            }],
+            created_at: Utc::now(),
+        };
+        let notice_event = EventRecord::new(
+            Aggregate::Thread {
+                id: thread.id.clone(),
+            },
+            Actor::System,
+            trama_domain::event::DomainEvent::MessageAdded {
+                message: notice.clone(),
+            },
+            vec![],
+        )
+        .unwrap();
+        db.persist_thread_migration(
+            &thread.id,
+            &[ThreadRepositoryAttachment {
+                repository_id: stored.id.clone(),
+                base_revision: Some("abc".into()),
+                checkout_id: Some(CheckoutId::from("checkout-ok")),
+                attach_mode: AttachMode::Isolated,
+            }],
+            &notice,
+            &notice_event,
+        )
+        .await
+        .unwrap();
+        let migrated = db.get_thread(&thread.id).await.unwrap().unwrap();
+        assert_eq!(
+            migrated.repo_attachments[0].checkout_id,
+            Some(CheckoutId::from("checkout-ok"))
+        );
+        assert_eq!(
+            migrated.repo_attachments[0].base_revision.as_deref(),
+            Some("abc")
+        );
+        let messages = db.list_messages_by_thread(&thread.id).await.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().any(|message| message.text() == "keep me"));
+        assert!(messages.iter().any(|message| message.text() == "migrated"));
+    }
+
+    #[tokio::test]
+    async fn workspace_name_guard_rejects_duplicates_across_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("trama.db");
+        let first = TramaDb::open(&db_path).unwrap();
+        let second = TramaDb::open(&db_path).unwrap();
+
+        async fn create_named(db: &TramaDb, name: &str) -> trama_domain::Result<()> {
+            let workspace = Workspace::new(name.to_owned());
+            let event = EventRecord::new(
+                Aggregate::Workspace {
+                    id: workspace.id.clone(),
+                },
+                Actor::System,
+                trama_domain::event::DomainEvent::WorkspaceCreated {
+                    workspace: workspace.clone(),
+                },
+                vec![],
+            )
+            .unwrap();
+            db.create_workspace_with_event(&workspace, &event).await
+        }
+
+        // Sequential duplicate on a second connection is a typed error.
+        create_named(&first, "Race").await.unwrap();
+        let err = create_named(&second, "Race").await.unwrap_err();
+        match err {
+            DomainError::Invalid(msg) => assert!(msg.contains("already exists"), "{msg}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        assert_eq!(first.list_workspaces().await.unwrap().len(), 1);
+
+        // Concurrent creators on both connections: exactly one row survives.
+        let a = create_named(&first, "Concurrent");
+        let b = create_named(&second, "Concurrent");
+        let c = create_named(&first, "Concurrent");
+        let d = create_named(&second, "Concurrent");
+        let (a, b, c, d) = tokio::join!(a, b, c, d);
+        let outcomes = [a.is_ok(), b.is_ok(), c.is_ok(), d.is_ok()];
+        assert_eq!(
+            outcomes.iter().filter(|ok| **ok).count(),
+            1,
+            "exactly one concurrent creator wins: {outcomes:?}"
+        );
+        let names: Vec<_> = first
+            .list_workspaces()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|workspace| workspace.name)
+            .collect();
+        assert_eq!(names.iter().filter(|name| *name == "Concurrent").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn migration_clears_external_session_ids_in_the_same_transaction() {
+        let db = TramaDb::open_in_memory().unwrap();
+        let workspace = Workspace::new("invalidation");
+        db.create_workspace(&workspace).await.unwrap();
+        let repository = Repository::new(None, Some(PathBuf::from("/source")), Some("main".into()));
+        db.create_repository(&repository).await.unwrap();
+        let checkout_path = PathBuf::from("/managed/checkouts/t/r/c");
+        let thread = Thread {
+            id: ThreadId::generate(),
+            workspace_id: Some(workspace.id.clone()),
+            parent_thread_id: None,
+            kind: ThreadKind::Top,
+            title: Some("mixed".into()),
+            repo_attachments: vec![ThreadRepositoryAttachment {
+                repository_id: repository.id,
+                base_revision: None,
+                checkout_id: None,
+                attach_mode: AttachMode::Adopted,
+            }],
+        };
+        db.create_thread(&thread).await.unwrap();
+        db.create_agent_session(
+            &thread.id,
+            &AgentSession {
+                id: AgentSessionId::generate(),
+                external_session_id: Some("pre-migration-session".into()),
+                model: Some("old-model".into()),
+                // Same cwd as the checkout that stays managed: without the
+                // invalidation the daemon would resume this session.
+                cwd: checkout_path.clone(),
+            },
+            "claude_code",
+        )
+        .await
+        .unwrap();
+
+        let notice = Message {
+            id: MessageId::generate(),
+            thread_id: thread.id.clone(),
+            parent_id: None,
+            actor: Actor::System,
+            role: Role::System,
+            content: vec![ContentBlock::Text {
+                text: "migrated".into(),
+            }],
+            created_at: Utc::now(),
+        };
+        let event = EventRecord::new(
+            Aggregate::Thread {
+                id: thread.id.clone(),
+            },
+            Actor::System,
+            trama_domain::event::DomainEvent::MessageAdded {
+                message: notice.clone(),
+            },
+            vec![],
+        )
+        .unwrap();
+        db.persist_thread_migration(
+            &thread.id,
+            &[ThreadRepositoryAttachment {
+                repository_id: thread.repo_attachments[0].repository_id.clone(),
+                base_revision: Some("abc".into()),
+                checkout_id: Some(CheckoutId::from("checkout-new")),
+                attach_mode: AttachMode::Isolated,
+            }],
+            &notice,
+            &event,
+        )
+        .await
+        .unwrap();
+
+        let latest = db
+            .latest_agent_session_for_thread(&thread.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.external_session_id, None);
+        assert_eq!(latest.cwd, checkout_path);
     }
 }

@@ -47,6 +47,16 @@ impl FakeAdapter {
         fake.fail_start = true;
         fake
     }
+
+    /// Test hook: drop every event sender so each open pump observes channel
+    /// closure, simulating an adapter process that exits mid-turn without a
+    /// terminal event.
+    pub fn close_all_event_streams(&self) {
+        self.senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
 }
 
 impl Default for FakeAdapter {

@@ -19,6 +19,16 @@ async-channel = "2"
 ulid = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 
+# Native GPUI debug symbols and incremental state can consume many gigabytes.
+# Keep local builds small; opt into symbols for a dedicated debugging session.
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
+
 # GPUI is slow unoptimized; optimize dependencies in dev builds.
 [profile.dev.package."*"]
 opt-level = 2

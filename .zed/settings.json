@@ -1,0 +1,14 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "checkOnSave": false,
+        "cargo": {
+          "buildScripts": {
+            "enable": false
+          }
+        }
+      }
+    }
+  }
+}

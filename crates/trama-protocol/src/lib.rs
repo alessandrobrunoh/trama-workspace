@@ -18,20 +18,29 @@
 //! # Unknown-tag policy
 //!
 //! Unknown `type` tags are **denied**. Serde rejects them at deserialize time; the
-//! daemon must not silently ignore a variant it does not understand (forward-incompatible
-//! clients fail the handshake or receive `DaemonMessage::Error` after it). Extra object
-//! fields inside a known payload are ignored (serde default), so additive field changes
-//! within an existing variant stay compatible. Bump [`PROTOCOL_VERSION`] for breaking
-//! tag or payload shape changes.
+//! daemon must not silently ignore a variant it does not understand. Because of that,
+//! a new variant is a breaking handshake change: an older peer would accept `Hello`
+//! and then fail the command. [`PROTOCOL_VERSION`] is **2** for workspace creation,
+//! repository membership, and legacy-thread migration. The bump is transport-only.
+//! Persisted domain ids and SQLite rows are not rewritten.
+//!
+//! A version mismatch fails the handshake (`Welcome.accepted = false`). Extra object
+//! fields inside a known payload are ignored (serde default). Bump [`PROTOCOL_VERSION`]
+//! again for further tag or payload shape changes.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::path::PathBuf;
 
 pub use trama_domain::agent::{AgentEvent, ApprovalDecision, UsageReport};
-pub use trama_domain::ids::{ThreadId, WorkspaceId};
+pub use trama_domain::ids::{RepositoryId, ThreadId, WorkspaceId};
 pub use trama_domain::message::Message;
 
 /// Wire protocol version carried in `Hello` / `Welcome`.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Version 2 adds workspace, repository, and legacy-migration commands. It does
+/// not migrate stored data; peers with a different version are rejected at
+/// handshake time.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Encode `value` as one JSON line (compact JSON plus a trailing `\n`).
 pub fn encode_json_line<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
@@ -79,6 +88,24 @@ pub enum ClientMessage {
         request_id: String,
         decision: ApprovalDecision,
     },
+    /// Create a workspace in the database. Does not edit `config.json`.
+    CreateWorkspace {
+        name: String,
+    },
+    /// Attach an existing local Git working tree. Not a remote clone.
+    AddRepository {
+        workspace_id: WorkspaceId,
+        path: PathBuf,
+        alias: String,
+    },
+    ListRepositories {
+        workspace_id: WorkspaceId,
+    },
+    /// Explicit command. Prepares isolated clones and records checkout metadata.
+    /// Does not run the agent and does not modify the source working trees.
+    MigrateLegacyThread {
+        thread_id: ThreadId,
+    },
     Shutdown,
 }
 
@@ -110,6 +137,16 @@ pub enum DaemonMessage {
         code: String,
         message: String,
     },
+    WorkspaceCreated(WorkspaceSnapshot),
+    Repositories {
+        workspace_id: WorkspaceId,
+        repositories: Vec<RepositorySnapshot>,
+    },
+    RepositoryAdded {
+        workspace_id: WorkspaceId,
+        repository: RepositorySnapshot,
+    },
+    ThreadMigrated(ThreadSnapshot),
 }
 
 /// Minimal workspace view for IPC. Not the domain `Workspace` aggregate.
@@ -126,6 +163,16 @@ pub struct ThreadSnapshot {
     pub id: ThreadId,
     pub title: String,
     pub repo_count: u32,
+}
+
+/// One workspace membership. `title` is the membership alias when set.
+/// `path` is the canonical local working tree, not a remote URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositorySnapshot {
+    pub id: RepositoryId,
+    pub title: String,
+    pub path: PathBuf,
+    pub default_enabled: bool,
 }
 
 #[cfg(test)]
@@ -190,6 +237,15 @@ mod tests {
         }
     }
 
+    fn snapshot_repo() -> RepositorySnapshot {
+        RepositorySnapshot {
+            id: RepositoryId::from("01hrepo000000000000000000001"),
+            title: "app".into(),
+            path: std::path::PathBuf::from("/src/app"),
+            default_enabled: true,
+        }
+    }
+
     #[test]
     fn client_message_roundtrip_every_kind() {
         let tid = thread_id();
@@ -204,7 +260,7 @@ mod tests {
                 workspace_id: wid.clone(),
             },
             ClientMessage::CreateThread {
-                workspace_id: wid,
+                workspace_id: wid.clone(),
                 title: "New thread".into(),
             },
             ClientMessage::SubscribeThread {
@@ -221,17 +277,29 @@ mod tests {
                 thread_id: tid.clone(),
             },
             ClientMessage::RespondApproval {
-                thread_id: tid,
+                thread_id: tid.clone(),
                 request_id: "req-1".into(),
                 decision: ApprovalDecision::AllowOnce,
             },
+            ClientMessage::CreateWorkspace {
+                name: "LaFraternita".into(),
+            },
+            ClientMessage::AddRepository {
+                workspace_id: wid,
+                path: std::path::PathBuf::from("/src/app"),
+                alias: "app".into(),
+            },
+            ClientMessage::ListRepositories {
+                workspace_id: workspace_id(),
+            },
+            ClientMessage::MigrateLegacyThread { thread_id: tid },
             ClientMessage::Shutdown,
         ];
         for msg in &kinds {
             roundtrip_eq(msg);
             roundtrip_json(msg);
         }
-        assert_eq!(kinds.len(), 10);
+        assert_eq!(kinds.len(), 14);
     }
 
     #[test]
@@ -271,11 +339,21 @@ mod tests {
                 code: "not_found".into(),
                 message: "thread missing".into(),
             },
+            DaemonMessage::WorkspaceCreated(snapshot_ws()),
+            DaemonMessage::Repositories {
+                workspace_id: workspace_id(),
+                repositories: vec![snapshot_repo()],
+            },
+            DaemonMessage::RepositoryAdded {
+                workspace_id: workspace_id(),
+                repository: snapshot_repo(),
+            },
+            DaemonMessage::ThreadMigrated(snapshot_th()),
         ];
         for msg in &kinds {
             roundtrip_json(msg);
         }
-        assert_eq!(kinds.len(), 8);
+        assert_eq!(kinds.len(), 12);
     }
 
     #[test]
@@ -296,13 +374,15 @@ mod tests {
     #[test]
     fn hello_json_shape_is_adjacently_tagged() {
         let json = serde_json::to_string(&ClientMessage::Hello {
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
             client_name: "ui".into(),
         })
         .unwrap();
         assert_eq!(
             json,
-            r#"{"type":"hello","payload":{"protocol_version":1,"client_name":"ui"}}"#
+            format!(
+                r#"{{"type":"hello","payload":{{"protocol_version":{PROTOCOL_VERSION},"client_name":"ui"}}}}"#
+            )
         );
         assert_eq!(
             serde_json::to_string(&ClientMessage::ListWorkspaces).unwrap(),
@@ -315,7 +395,84 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_one() {
-        assert_eq!(PROTOCOL_VERSION, 1);
+    fn onboarding_and_migration_tags_keep_existing_shape() {
+        let workspace = workspace_id();
+        let repo = snapshot_repo();
+        assert_eq!(
+            serde_json::to_string(&ClientMessage::CreateWorkspace {
+                name: "Demo".into(),
+            })
+            .unwrap(),
+            r#"{"type":"create_workspace","payload":{"name":"Demo"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ClientMessage::AddRepository {
+                workspace_id: workspace.clone(),
+                path: std::path::PathBuf::from("/src/app"),
+                alias: "app".into(),
+            })
+            .unwrap(),
+            format!(
+                r#"{{"type":"add_repository","payload":{{"workspace_id":"{workspace}","path":"/src/app","alias":"app"}}}}"#
+            )
+        );
+        assert_eq!(
+            serde_json::to_string(&ClientMessage::ListRepositories {
+                workspace_id: workspace.clone(),
+            })
+            .unwrap(),
+            format!(r#"{{"type":"list_repositories","payload":{{"workspace_id":"{workspace}"}}}}"#)
+        );
+        assert_eq!(
+            serde_json::to_string(&ClientMessage::MigrateLegacyThread {
+                thread_id: thread_id(),
+            })
+            .unwrap(),
+            format!(
+                r#"{{"type":"migrate_legacy_thread","payload":{{"thread_id":"{}"}}}}"#,
+                thread_id()
+            )
+        );
+        assert_eq!(
+            serde_json::to_string(&DaemonMessage::WorkspaceCreated(snapshot_ws())).unwrap(),
+            format!(
+                r#"{{"type":"workspace_created","payload":{{"id":"{workspace}","title":"LaFraternita","repo_count":2}}}}"#
+            )
+        );
+        assert_eq!(
+            serde_json::to_string(&DaemonMessage::Repositories {
+                workspace_id: workspace.clone(),
+                repositories: vec![repo.clone()],
+            })
+            .unwrap(),
+            format!(
+                r#"{{"type":"repositories","payload":{{"workspace_id":"{workspace}","repositories":[{{"id":"{}","title":"app","path":"/src/app","default_enabled":true}}]}}}}"#,
+                repo.id
+            )
+        );
+        assert_eq!(
+            serde_json::to_string(&DaemonMessage::RepositoryAdded {
+                workspace_id: workspace.clone(),
+                repository: repo.clone(),
+            })
+            .unwrap(),
+            format!(
+                r#"{{"type":"repository_added","payload":{{"workspace_id":"{workspace}","repository":{{"id":"{}","title":"app","path":"/src/app","default_enabled":true}}}}}}"#,
+                repo.id
+            )
+        );
+        let thread = thread_id();
+        assert_eq!(
+            serde_json::to_string(&DaemonMessage::ThreadMigrated(snapshot_th())).unwrap(),
+            format!(
+                r#"{{"type":"thread_migrated","payload":{{"id":"{thread}","title":"Fix auth","repo_count":1}}}}"#
+            )
+        );
+        roundtrip_eq(&repo);
+    }
+
+    #[test]
+    fn protocol_version_is_two() {
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 }
