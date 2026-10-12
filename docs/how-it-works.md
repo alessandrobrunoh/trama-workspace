@@ -58,7 +58,7 @@ A new comment is pending until the next prompt (or an explicit **send comments**
 
 ## Shared threads
 
-Shared threads (protocol v8) go through a separate, loopback-only collaboration service (`apps/trama-collab`, [ADR 0008](adr/0008-claude-subscription-and-multiplayer-turns.md), [ADR 0009](adr/0009-collab-shared-threads.md)).
+Shared threads (protocol v8) go through a separate collaboration service (`apps/trama-collab`, loopback by default, or HTTPS behind a proxy on your own server: [deploy/](../deploy/README.md), [ADR 0008](adr/0008-claude-subscription-and-multiplayer-turns.md), [ADR 0009](adr/0009-collab-shared-threads.md)).
 
 `ConnectCollab` signs the daemon in with a username and password and stores the session token and a runner token owner-only in `<app dir>/collab-credentials.json` (the password is not stored; tokens are never logged). A top-level thread can be shared (invite or link access) or a shared thread joined into a new local thread with this machine's own checkouts.
 

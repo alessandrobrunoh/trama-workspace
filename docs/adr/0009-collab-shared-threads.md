@@ -1,6 +1,7 @@
 # ADR 0009: Shared threads in the collaboration service
 
-- Status: Accepted for the first multiplayer server increment
+- Status: Accepted for the first multiplayer server increment; deployment on a
+  server is covered by [ADR 0014](0014-vps-deployment.md)
 - Scope: FEAT-209 / DEV-29, server side only (desktop and daemon integration later)
 - Builds on: ADR 0007 (standalone authentication), ADR 0008 (each turn runs on
   the sender's own runner and `claude` login)

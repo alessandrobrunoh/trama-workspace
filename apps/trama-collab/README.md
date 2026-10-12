@@ -1,13 +1,19 @@
-# TramaWorkspace collaboration service (development only)
+# TramaWorkspace collaboration service
 
 This standalone service provides username/password authentication and the
 server side of shared threads: thread access control, a durable ordered
 per-thread event log with live WebSocket delivery, ephemeral drafts and
-presence, idempotent commands, and the runner claim protocol. It is not an
-online deployment. It does not use Trama accounts and does not expose signup,
-files, processes, or shutdown. Do not expose it to a network: `serve` rejects
-non-loopback bind addresses. TLS ingress, deployment, backup and retention
-decisions are still required before internet exposure.
+presence, idempotent commands, and the runner claim protocol. It does not use
+Trama accounts and does not expose signup, files, processes, or shutdown.
+
+The service speaks plain HTTP and never terminates TLS. By default `serve`
+rejects non-loopback bind addresses. To run it for other people, put it
+behind a TLS reverse proxy on a private network and opt in with
+`--behind-proxy`; [`deploy/`](../../deploy/README.md) is a ready Docker
+Compose setup with Caddy and automatic HTTPS for a VPS
+([ADR 0014](../../docs/adr/0014-vps-deployment.md)). Be aware that whoever
+operates the server can read every shared thread: there is no end-to-end
+encryption.
 
 Execution rule (ADR 0008, ADR 0009): a turn runs on the machine of the person
 who pressed Send, using that person's own `claude` login. The service
@@ -23,6 +29,14 @@ from `create-runner` (or provisions one through `POST /runners`), and stores
 both owner-only in its app dir. Its runner claims only turns that daemon
 submitted for its own user. See `apps/trama-daemon/src/collab`.
 
+Transport policy of that client (ADR 0014): `https://host[:port]` (and `wss://`
+for sockets) is accepted for any host, with the certificate chain and host
+name always verified against the system trust store; plain `http://` is
+accepted only for loopback. A private CA can be trusted in addition with
+`TRAMA_COLLAB_CA_FILE=/path/to/ca.pem` in the daemon's environment. There is
+no switch that disables verification. Only desktop clients exist today; there
+is no browser client.
+
 ## Local use
 
 Build with the repository's Rust toolchain, then create a user interactively
@@ -33,7 +47,10 @@ cargo run -p trama-collab -- --db ./trama-auth.sqlite create-user --username <US
 cargo run -p trama-collab -- --db ./trama-auth.sqlite serve
 ```
 
-The default listener is `127.0.0.1:8787`. To automate provisioning, provide the
+The default listener is `127.0.0.1:8787`. Every option below can also be set
+through the environment: `TRAMA_COLLAB_DB` (`--db`), `TRAMA_COLLAB_BIND`
+(`--bind`), `TRAMA_COLLAB_BEHIND_PROXY`, `TRAMA_COLLAB_TRUSTED_PROXIES` and
+`TRAMA_COLLAB_FORWARDED_HEADER`. To automate provisioning, provide the
 password on standard input, never as an argument. `--password-stdin` refuses to
 run when stdin is an interactive terminal (the password would be echoed); run
 without the flag to get a hidden prompt instead:
@@ -54,6 +71,41 @@ Passwords must be at least 10 bytes and at most 1024 bytes; stdin input is
 capped at that length. Usernames are limited to at most 64 bytes of ASCII
 letters, digits, `.`, `_`, `-` and `@`. Do not paste credentials into shell
 commands, source control, logs, or shared documents.
+
+## Running behind a reverse proxy
+
+`serve --bind 0.0.0.0:8787 --behind-proxy` (or
+`TRAMA_COLLAB_BEHIND_PROXY=1`) is the only way to bind a non-loopback address.
+It is meant for a private network (a container network, or a host where only
+the proxy can reach the port) with a TLS terminating proxy in front. The
+listener is plain HTTP: anyone who can reach it directly can read passwords and
+bearer tokens, so never publish its port. A warning is printed at startup.
+
+Behind a proxy every TCP peer is the proxy, so login throttling needs the
+real client address. It is read from one forwarding header
+(`--forwarded-header x-forwarded-for`, the default, or `forwarded`), and only
+when the TCP peer is inside `--trusted-proxy` (comma separated CIDRs; default
+loopback, RFC 1918 and `fc00::/7`; networks that would match every address are
+refused). For a trusted peer, hops are examined from the right and the first
+one that is not a trusted proxy is the client; a header from any other peer,
+or a malformed one, is ignored. The address is used only for the login
+throttle. The proxy must overwrite the header rather than pass a client's
+value through (Caddy does by default). Without `--behind-proxy`, forwarding
+headers are never read.
+
+Operations:
+
+- `GET /healthz` returns `200 ok` with no data and no authentication;
+  `trama-collab healthcheck` probes it (used as the container health check).
+  Do not publish it through the proxy.
+- `create-user`, `create-runner`, `backup` and `restore` are safe to run
+  next to a live server (`docker compose exec`): unlike `serve`, they do not
+  mark runner claims ambiguous.
+- `trama-collab --db <file> backup --to <new file>` writes a consistent,
+  owner-only snapshot (never overwriting); `restore --from <snapshot>` verifies
+  it, keeps the replaced database as `<db>.before-restore-<time>` and installs
+  it. Stop the service before restoring.
+- `SIGTERM`/`SIGINT` stop accepting connections and exit within five seconds.
 
 ## Database file handling
 
@@ -93,10 +145,12 @@ token. Logout is idempotent: unknown and already-revoked tokens also return
 
 Unknown usernames and wrong passwords share one error response, and error
 bodies never echo submitted credentials. Login throttling is in-memory,
-per (lowercased username, peer IP) plus a per-peer total across all usernames,
+per (lowercased username, client IP) plus a per-IP total across all usernames,
 with a bounded key map (expired keys are pruned; a full map refuses new keys).
-It resets when the process restarts. Together with the loopback-only listener
-this is a local development control, not a production rate limiter.
+The client IP is the TCP peer, or the forwarded address behind a trusted proxy
+(see above). It resets when the process restarts and is per process: it is a
+brake on online guessing, not a distributed rate limiter. Accounts are created
+by an operator only; there is no signup and no command to disable a user yet.
 
 ### Error model
 

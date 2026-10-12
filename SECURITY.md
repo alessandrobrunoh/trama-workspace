@@ -72,15 +72,17 @@ Claude Code runs `trama-daemon approval-hook` (a `PermissionRequest` hook) and `
 
 ### Collaboration service (`trama-collab`)
 
-The service is development-only and **loopback-only today**: `serve` rejects non-loopback bind addresses. In scope:
+By default `serve` is loopback-only and rejects non-loopback bind addresses. Operators can run it behind a TLS reverse proxy on their own server with the stack in [`deploy/`](deploy/README.md) ([ADR 0014](docs/adr/0014-vps-deployment.md)); that opt-in (`--behind-proxy`) and the `deploy/` configuration are supported. Be aware that the operator of a server can read every shared thread (there is no end-to-end encryption). In scope:
 
 - authentication bypass, password or session token handling, login throttling;
 - runner tokens: a runner claiming, reporting or finishing a turn its own user did not author ([ADR 0008](docs/adr/0008-claude-subscription-and-multiplayer-turns.md));
 - thread access control: non-members reading events, link tokens surviving rotation or revocation, revoked members still receiving events ([ADR 0009](docs/adr/0009-collab-shared-threads.md));
 - one participant's prompt reaching another participant's Claude session;
-- database file permission handling.
+- database file permission handling;
+- the reverse-proxy trust model: a forwarding header honored from an untrusted peer, or a way to choose the throttle key from the trusted-proxy path;
+- the daemon's TLS client: certificate or host name verification that can be bypassed, a credential sent over plain `http://` to a non-loopback host, or tokens in logs or error text.
 
-Running the service on a non-loopback address is unsupported. A bypass of the loopback restriction is in scope; issues that only exist after you patch it out are not.
+Exposing the plain-HTTP listener directly to a network, without the proxy and `--behind-proxy`, is unsupported; a bypass of the default loopback restriction is in scope, issues that only exist after you patch it out are not.
 
 ### Credential files
 
@@ -117,7 +119,7 @@ Unless they result in a meaningful security impact, the following are generally 
 
 - attacks that require a process already running as your macOS user (it can read your files and your Claude login directly);
 - what an agent does inside its own checkout after you approved the tool call or chose a permissive permission mode;
-- issues that only exist when the collab service is exposed beyond loopback;
+- issues that only exist when the collab service's plain-HTTP listener is exposed directly to a network instead of behind a TLS proxy;
 - denial of service requiring unrealistic resources;
 - social engineering without a TramaWorkspace vulnerability;
 - vulnerabilities in Claude Code, Git or other third-party tools with no TramaWorkspace-specific impact;

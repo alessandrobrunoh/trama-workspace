@@ -1,6 +1,7 @@
 # ADR 0007: Standalone local authentication service
 
-- Status: Accepted for the first authentication increment
+- Status: Accepted for the first authentication increment; the loopback-only
+  rule is relaxed behind a TLS proxy by [ADR 0014](0014-vps-deployment.md)
 - Scope: FEAT-209 / DEV-29 first slice
 
 ## Context

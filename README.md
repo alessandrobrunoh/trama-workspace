@@ -59,7 +59,7 @@ Everything below exists on `main` today. Details are in [docs/how-it-works.md](d
 
 **Working together**
 
-- **Shared threads.** Share a thread by invite or link (⌘⇧S); others join it into their own project with their own checkouts. Messages, answers, comments and verdicts are mirrored; drafts ("*bob is typing*") and presence are live. Today this runs through a **local, loopback-only** collaboration service (`trama-collab`). See [Try sharing locally](#try-sharing-locally).
+- **Shared threads.** Share a thread by invite or link (⌘⇧S); others join it into their own project with their own checkouts. Messages, answers, comments and verdicts are mirrored; drafts ("*bob is typing*") and presence are live. It runs through a collaboration service (`trama-collab`) that you start locally or [deploy on your own VPS](deploy/README.md) behind HTTPS. See [Try sharing locally](#try-sharing-locally).
 
 ## How Claude Code is used
 
@@ -98,8 +98,10 @@ The app offers **Start daemon** when the sibling binary is installed and no daem
 
 ## Try sharing locally
 
-Two people on one Mac, each with their own daemon and app instance. The
-collaboration service only listens on loopback.
+Two people on one Mac, each with their own daemon and app instance. Started
+this way the collaboration service only listens on loopback. To share with
+people on other machines, run it on a server with [deploy/](deploy/README.md)
+(Docker Compose, automatic HTTPS) and connect with `https://<your domain>`.
 
 ```bash
 cargo build -p trama-collab -p trama-daemon -p trama-desktop
@@ -154,7 +156,7 @@ In each app:
    │  terminals, setup hooks        ▼
    │                            trama-daemon approval-hook / trama-daemon mcp
    │
-   └── HTTP + WebSocket ────────► trama-collab  (optional, loopback only)
+   └── HTTP + WebSocket ────────► trama-collab  (optional; loopback, or HTTPS behind a proxy)
                                    accounts, shared threads, runner claims
 ```
 
@@ -191,6 +193,7 @@ Invariants every change keeps:
 | [docs/build-and-space.md](docs/build-and-space.md) | Building on a small disk |
 | [docs/standalone-auth.md](docs/standalone-auth.md) | The collaboration service's authentication |
 | [apps/trama-collab/README.md](apps/trama-collab/README.md) | Collaboration service: provisioning and HTTP/WebSocket API |
+| [deploy/README.md](deploy/README.md) | Running the collaboration service on a VPS with Docker Compose and HTTPS |
 | [plans/delta-parity.md](plans/delta-parity.md) | Delta concepts mapped to TramaWorkspace, and what is next |
 
 **Architecture decision records**
@@ -208,12 +211,15 @@ Invariants every change keeps:
 | [0009](docs/adr/0009-collab-shared-threads.md) | Shared threads in the collaboration service |
 | [0010](docs/adr/0010-subagents-and-forks.md) | Subagents as threads, nested subthreads, fork at a message |
 | [0011](docs/adr/0011-turn-activity.md) | Store each turn's tool activity |
+| [0012](docs/adr/0012-copy-on-write-checkouts.md) | Copy-on-write checkouts, disk usage and archiving |
+| [0013](docs/adr/0013-shared-history-and-family.md) | Sharing a thread's full history and family |
+| [0014](docs/adr/0014-vps-deployment.md) | Running the collaboration service on a VPS: proxy trust and TLS client policy |
 
 ## Roadmap
 
 Not built yet:
 
-- **Hosted collaboration.** Running `trama-collab` on a server (for example a VPS) with TLS ingress, durable rate limiting, backups and retention. Today it only listens on loopback.
+- **Hosted collaboration, remaining pieces.** A [VPS deployment](deploy/README.md) exists (HTTPS through Caddy, built-in backup and restore). Still missing: durable and distributed rate limiting, retention policy, an admin command to disable users, and end-to-end encryption (the operator can read shared threads).
 - **Web client** for reading, commenting on and reviewing shared threads without a local runner.
 - **Remote execution.** The SSH `ExecutionRuntime` and the `trama-runner` daemon.
 - **Review loop.** Reverting conversation and files to a turn, and seen state synced between participants.
