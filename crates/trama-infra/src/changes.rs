@@ -770,7 +770,9 @@ mod tests {
             vec![0u8, 1, 2, 255, 0, 7]
         );
         assert!(!copy.path.join("gone.txt").exists());
-        assert!(!copy.path.join("token.secret").exists());
+        // Ignored files (build output, local secrets) are cloned
+        // copy-on-write from the parent.
+        assert!(copy.path.join("token.secret").exists());
         assert_eq!(
             resolve_commit(&copy.path, FORK_POINT_REF)
                 .unwrap()

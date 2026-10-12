@@ -41,11 +41,84 @@ pub enum CheckoutError {
     Nested { root: PathBuf, source_path: PathBuf },
 }
 
-/// Owns clones in `<root>/checkouts/<thread-id>/<repository-id>/<checkout-id>`.
+/// Owns clones in `<root>/checkouts/<thread-id>/<repository-id>/<checkout-id>`
+/// (legacy) and repo-local checkouts in `<source>/.trama/worktrees/`.
 #[derive(Clone, Debug)]
 pub struct CheckoutManager {
-    root: PathBuf,
+    pub(crate) root: PathBuf,
+    pub(crate) copy: CopyOptions,
 }
+
+/// How new repo-local checkouts are materialized (`config.json` `checkouts`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CopyOptions {
+    pub mode: CopyMode,
+    /// Repository-relative literal paths never copied into a new checkout
+    /// (ignored build output that must not be shared, caches, ...). A
+    /// single-component entry is skipped while cloning; a nested one is
+    /// removed from the fresh copy. Tracked paths are never removed.
+    pub exclude: Vec<String>,
+    /// Test hook: make every `clonefile` fail as on a volume without clones.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub simulate_clone_failure: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyMode {
+    /// Clone the whole working tree (ignored build output included) with
+    /// APFS `clonefile`, falling back to `git clone` where clones are not
+    /// supported.
+    #[default]
+    CopyOnWrite,
+    /// Always `git clone` (Git hardlinks the object store; ignored files are
+    /// not copied).
+    Git,
+}
+
+/// How a checkout's files were produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyMethod {
+    CopyOnWrite,
+    GitClone,
+}
+
+/// The working state of a removed checkout, saved as a Git bundle outside it
+/// (see [`CheckoutManager::archive_repo_local`]).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArchivedCheckout {
+    pub bundle: PathBuf,
+    /// Snapshot commit of the full working state (parent: the checkout's
+    /// `HEAD`), as `refs/trama/archive` in the bundle.
+    pub snapshot: String,
+    /// The branch `HEAD` was on, or `None` when detached.
+    pub head_ref: Option<String>,
+    pub base_revision: String,
+}
+
+/// What exists only in a checkout and would be lost with its directory.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemovalReport {
+    /// Paths with tracked changes or untracked non-ignored files (at most
+    /// [`REPORT_FILE_LIMIT`]).
+    pub changed_files: Vec<String>,
+    pub changed_file_count: usize,
+    /// Commits on the checkout's branches, tags or `HEAD` that the source
+    /// repository does not have.
+    pub commits_not_in_source: usize,
+}
+
+impl RemovalReport {
+    pub fn has_unsaved_work(&self) -> bool {
+        self.changed_file_count > 0 || self.commits_not_in_source > 0
+    }
+}
+
+pub const REPORT_FILE_LIMIT: usize = 50;
+/// Ref of the working-state snapshot inside an archive bundle.
+pub const ARCHIVE_REF: &str = "refs/trama/archive";
 
 #[derive(Clone, Debug)]
 pub struct ProvisionedCheckout {
@@ -74,7 +147,19 @@ pub struct InspectedWorktree {
 
 impl CheckoutManager {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            copy: CopyOptions::default(),
+        }
+    }
+
+    pub fn with_copy_options(mut self, copy: CopyOptions) -> Self {
+        self.copy = copy;
+        self
+    }
+
+    pub fn copy_options(&self) -> &CopyOptions {
+        &self.copy
     }
 
     /// Reject a managed root that lies inside a source repository (for example
@@ -204,14 +289,16 @@ impl CheckoutManager {
 
     /// Copy a parent thread's managed checkout for a subthread and publish it
     /// atomically under `<source>/.trama/worktrees/<thread>/<checkout>`, like
-    /// any repo-local checkout. The copy is a `--no-hardlinks` clone of the
-    /// parent checkout at the parent's `HEAD` (so commits the parent made are
-    /// included), with the parent's working-tree delta replayed on top:
-    /// tracked changes (binary included) and untracked non-ignored files.
-    /// Ignored files are never copied. The parent checkout and the source
-    /// repository working tree are only read (the source need not be clean);
-    /// the copy's `local` remote points at `source`. An existing copy is
-    /// validated and returned, never replaced.
+    /// any repo-local checkout. The copy is a copy-on-write clone of the
+    /// parent checkout (its ignored build output included; see
+    /// [`CopyOptions`]) at the parent's `HEAD` (so commits the parent made are
+    /// included) holding the parent's working state: tracked changes (binary
+    /// included) and untracked non-ignored files. Where clones are not
+    /// supported it is a `git clone` with the working-tree delta replayed and
+    /// no ignored files. The parent checkout and the source repository working
+    /// tree are only read (the source need not be clean); the copy's `local`
+    /// remote points at `source` and `origin` is the parent's. An existing
+    /// copy is validated and returned, never replaced.
     pub fn provision_copy(
         &self,
         parent_checkout: &Path,
@@ -308,60 +395,71 @@ impl CheckoutManager {
 
         let staging = destination_parent.join(format!(".staging-{}", ulid::Ulid::new()));
         let result = (|| {
-            git(
-                &parent,
-                [
-                    OsStr::new("clone"),
-                    OsStr::new("--quiet"),
-                    OsStr::new("--no-hardlinks"),
-                    OsStr::new("--"),
-                    parent.as_os_str(),
-                    staging.as_os_str(),
-                ],
-            )?;
-            if let Some(commit) = at {
-                // A local clone copies the whole object store, so this is a
-                // fallback for snapshots it did not bring along.
-                let spec = format!("{commit}^{{commit}}");
-                if git(&staging, ["cat-file", "-e", spec.as_str()]).is_err() {
-                    git(
-                        &staging,
-                        [
-                            OsStr::new("fetch"),
-                            OsStr::new("--quiet"),
-                            OsStr::new("--no-tags"),
-                            parent.as_os_str(),
-                            OsStr::new("+refs/trama/checkpoints/*:refs/trama/checkpoints/*"),
-                        ],
-                    )?;
+            let method = self.materialize(&parent, &staging)?;
+            match method {
+                CopyMethod::CopyOnWrite => {
+                    // The copy already holds the parent's files (build
+                    // output included) and its whole object store. Keep
+                    // them untouched when they are exactly the requested
+                    // state; otherwise reset to the base and replay.
+                    let head = git_text(&staging, ["rev-parse", "HEAD"])?;
+                    let exact = at.is_none()
+                        && head == base_revision
+                        && crate::changes::snapshot_tree(&staging)? == parent_tree;
+                    if !exact {
+                        git(&staging, ["reset", "--quiet", "--hard"])?;
+                        git(&staging, ["clean", "-fdq"])?;
+                        if head != base_revision {
+                            git(
+                                &staging,
+                                ["checkout", "--quiet", "--detach", base_revision.as_str()],
+                            )?;
+                        }
+                        if !patch.is_empty() {
+                            crate::changes::apply_patch(&staging, &patch)?;
+                        }
+                    }
+                    set_remote(&staging, "origin", origin.as_deref().map(OsStr::new))?;
+                    set_remote(&staging, "local", Some(source.as_os_str()))?;
+                    self.prune_copy(&staging)?;
+                }
+                CopyMethod::GitClone => {
+                    if let Some(commit) = at {
+                        // A local clone copies the whole object store, so
+                        // this is a fallback for snapshots it did not bring
+                        // along.
+                        let spec = format!("{commit}^{{commit}}");
+                        if git(&staging, ["cat-file", "-e", spec.as_str()]).is_err() {
+                            git(
+                                &staging,
+                                [
+                                    OsStr::new("fetch"),
+                                    OsStr::new("--quiet"),
+                                    OsStr::new("--no-tags"),
+                                    parent.as_os_str(),
+                                    OsStr::new(
+                                        "+refs/trama/checkpoints/*:refs/trama/checkpoints/*",
+                                    ),
+                                ],
+                            )?;
+                        }
+                    }
+                    if git_text(&staging, ["rev-parse", "HEAD"])? != base_revision {
+                        git(
+                            &staging,
+                            ["checkout", "--quiet", "--detach", base_revision.as_str()],
+                        )?;
+                    }
+                    set_remote(&staging, "origin", origin.as_deref().map(OsStr::new))?;
+                    set_remote(&staging, "local", Some(source.as_os_str()))?;
+                    if !patch.is_empty() {
+                        crate::changes::apply_patch(&staging, &patch)?;
+                    }
                 }
             }
-            if git_text(&staging, ["rev-parse", "HEAD"])? != base_revision {
-                git(
-                    &staging,
-                    ["checkout", "--quiet", "--detach", base_revision.as_str()],
-                )?;
-            }
-            match &origin {
-                Some(url) => {
-                    git(&staging, ["remote", "set-url", "origin", url.as_str()])?;
-                }
-                None => {
-                    git(&staging, ["remote", "remove", "origin"])?;
-                }
-            }
-            git(
-                &staging,
-                [
-                    OsStr::new("remote"),
-                    OsStr::new("add"),
-                    OsStr::new("local"),
-                    source.as_os_str(),
-                ],
-            )?;
-            if !patch.is_empty() {
-                crate::changes::apply_patch(&staging, &patch)?;
-            }
+            // The parent's own Trama refs (fork point, last turn,
+            // checkpoints) describe the parent, not this copy.
+            delete_trama_refs(&staging)?;
             fs::write(staging.join(".git/trama-base-commit"), &base_revision)?;
             let fork_commit = crate::changes::record_snapshot(
                 &staging,
@@ -375,7 +473,7 @@ impl CheckoutManager {
             fs::rename(&staging, &destination)?;
             Ok(fork_commit)
         })();
-        if result.is_err() && staging.exists() {
+        if result.is_err() && fs::symlink_metadata(&staging).is_ok() {
             // Only our unique unpublished staging directory is removed.
             let _ = fs::remove_dir_all(&staging);
         }
@@ -454,7 +552,7 @@ impl CheckoutManager {
     /// Validate and prepare `<source>/.trama/worktrees/<thread>/` (owner
     /// marker, local exclude) and return the canonical source plus the
     /// checkout destination, which may already exist.
-    fn prepare_repo_local(
+    pub(crate) fn prepare_repo_local(
         &self,
         source: &Path,
         thread: &ThreadId,
@@ -563,6 +661,16 @@ impl CheckoutManager {
         Ok((source, destination))
     }
 
+    /// Create the thread checkout `<source>/.trama/worktrees/<thread>/<checkout>`
+    /// of a clean source at its `HEAD` and publish it atomically. On APFS it
+    /// is a copy-on-write clone of the whole source working tree minus
+    /// `.trama/` and the configured excludes: ignored build output (`target/`,
+    /// `node_modules/`, ...) comes along at almost no disk cost and keeps its
+    /// timestamps, so the first build is incremental. The copy gets its own
+    /// `.git` (a clone too), `local` pointing at the source and `origin` at
+    /// the source's `origin`, and is reset to a clean tree. Elsewhere it is a
+    /// `git clone` (object files hardlinked, ignored files not copied). An
+    /// existing checkout is validated and returned, never replaced.
     pub fn provision_repo_local(
         &self,
         source: &Path,
@@ -588,25 +696,8 @@ impl CheckoutManager {
         }
         let staging = parent.join(format!(".staging-{}", ulid::Ulid::new()));
         let result = (|| {
-            git(
-                &source,
-                [
-                    OsStr::new("clone"),
-                    OsStr::new("--no-hardlinks"),
-                    OsStr::new("--"),
-                    source.as_os_str(),
-                    staging.as_os_str(),
-                ],
-            )?;
-            git(
-                &staging,
-                [
-                    OsStr::new("remote"),
-                    OsStr::new("add"),
-                    OsStr::new("local"),
-                    source.as_os_str(),
-                ],
-            )?;
+            let method = self.materialize(&source, &staging)?;
+            self.finish_source_copy(&source, &staging, method)?;
             if text(git(&staging, ["rev-parse", "HEAD"])?) != base_revision {
                 return Err(CheckoutError::Invalid(staging.clone()));
             }
@@ -614,7 +705,7 @@ impl CheckoutManager {
             fs::rename(&staging, &destination)?;
             Ok(())
         })();
-        if result.is_err() && staging.exists() {
+        if result.is_err() && fs::symlink_metadata(&staging).is_ok() {
             let _ = fs::remove_dir_all(&staging);
         }
         result?;
@@ -758,6 +849,308 @@ impl CheckoutManager {
         }
         Ok(())
     }
+}
+
+impl CheckoutManager {
+    /// Copy `origin` (a source repository or a parent checkout) to the new
+    /// directory `staging`: a copy-on-write clone of the whole working tree
+    /// when possible, else `git clone`. Never modifies `origin`; on error
+    /// nothing is left at `staging`.
+    pub(crate) fn materialize(
+        &self,
+        origin: &Path,
+        staging: &Path,
+    ) -> Result<CopyMethod, CheckoutError> {
+        if self.copy.mode == CopyMode::CopyOnWrite && cow_eligible(origin) {
+            fs::create_dir(staging)?;
+            let skip_trama = !trama_is_config_only(origin);
+            let excluded: Vec<&str> = self
+                .copy
+                .exclude
+                .iter()
+                .map(|entry| entry.trim().trim_end_matches('/'))
+                .filter(|entry| !entry.is_empty() && !entry.contains('/'))
+                .collect();
+            let skip = |name: &OsStr| {
+                (skip_trama && name == ".trama")
+                    || excluded.iter().any(|entry| OsStr::new(entry) == name)
+            };
+            let result = if self.copy.simulate_clone_failure {
+                Err(crate::cow::CloneError::Unsupported(std::io::Error::from(
+                    std::io::ErrorKind::Unsupported,
+                )))
+            } else {
+                crate::cow::clone_tree(origin, staging, &skip)
+            };
+            match result {
+                Ok(stats)
+                    if fs::symlink_metadata(staging.join(".git"))
+                        .is_ok_and(|metadata| metadata.is_dir())
+                        && !stats.skipped.iter().any(|path| path.starts_with(".git")) =>
+                {
+                    fixup_cow_git(staging)?;
+                    return Ok(CopyMethod::CopyOnWrite);
+                }
+                _ => {
+                    // Not APFS, another volume, or an unreadable `.git`:
+                    // fall back to Git below.
+                    fs::remove_dir_all(staging)?;
+                }
+            }
+        }
+        // Without `--no-hardlinks`: Git hardlinks the immutable object files
+        // of a local clone instead of duplicating history.
+        git(
+            origin,
+            [
+                OsStr::new("clone"),
+                OsStr::new("--quiet"),
+                OsStr::new("--"),
+                origin.as_os_str(),
+                staging.as_os_str(),
+            ],
+        )?;
+        Ok(CopyMethod::GitClone)
+    }
+
+    /// Make a fresh copy of `source` an independent checkout of the source's
+    /// `HEAD` with a clean tree (no tracked changes, no untracked non-ignored
+    /// files), `local` pointing at `source` and `origin` at the source's
+    /// `origin` (the source itself when it has none).
+    pub(crate) fn finish_source_copy(
+        &self,
+        source: &Path,
+        staging: &Path,
+        method: CopyMethod,
+    ) -> Result<(), CheckoutError> {
+        let source_origin = git_text(source, ["remote", "get-url", "origin"]).ok();
+        match method {
+            CopyMethod::GitClone => {
+                if source_origin.is_some() {
+                    // The clone's `origin/*` are the source's branches:
+                    // keep them as `local/*` and point `origin` upstream.
+                    git(staging, ["remote", "rename", "origin", "local"])?;
+                }
+                set_remote(staging, "local", Some(source.as_os_str()))?;
+                let origin = source_origin
+                    .as_deref()
+                    .map(OsStr::new)
+                    .unwrap_or(source.as_os_str());
+                set_remote(staging, "origin", Some(origin))?;
+            }
+            CopyMethod::CopyOnWrite => {
+                set_remote(staging, "local", Some(source.as_os_str()))?;
+                if source_origin.is_none() {
+                    set_remote(staging, "origin", Some(source.as_os_str()))?;
+                }
+                delete_trama_refs(staging)?;
+                clean_to_head(staging)?;
+                self.prune_copy(staging)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove from a copy-on-write copy what must not be cloned: paths the
+    /// repository links to the primary checkout (setup links them back) and
+    /// nested `exclude` entries. Only ignored, untracked paths are removed.
+    pub(crate) fn prune_copy(&self, staging: &Path) -> Result<(), CheckoutError> {
+        let mut entries = crate::setup::linked_entries(staging);
+        entries.extend(
+            self.copy
+                .exclude
+                .iter()
+                .map(|entry| entry.trim().trim_end_matches('/').to_owned())
+                .filter(|entry| entry.contains('/')),
+        );
+        for entry in entries {
+            let Some(path) = plain_child(staging, &entry) else {
+                continue;
+            };
+            if fs::symlink_metadata(&path).is_err() {
+                continue;
+            }
+            let tracked = git(staging, ["ls-files", "-z", "--", entry.as_str()])?;
+            if !tracked.stdout.is_empty() {
+                continue;
+            }
+            if git(staging, ["check-ignore", "-q", "--", entry.as_str()]).is_err() {
+                continue;
+            }
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&path)?,
+                Ok(_) => fs::remove_file(&path)?,
+                Err(_) => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `root/<entry>` when `entry` is a plain relative path outside `.git` and
+/// `.trama` whose parents inside `root` are real directories.
+fn plain_child(root: &Path, entry: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    if entry.is_empty() || entry.starts_with(':') || entry.contains(['*', '?', '[', '\\']) {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for component in Path::new(entry).components() {
+        match component {
+            Component::Normal(part) => parts.push(part),
+            _ => return None,
+        }
+    }
+    let first = parts.first()?;
+    if *first == ".trama" || parts.iter().any(|part| *part == ".git") {
+        return None;
+    }
+    let mut current = root.to_path_buf();
+    for part in &parts[..parts.len() - 1] {
+        current.push(part);
+        let metadata = fs::symlink_metadata(&current).ok()?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return None;
+        }
+    }
+    Some(root.join(entry))
+}
+
+/// A tree can be cloned whole only when its `.git` is a self-contained
+/// directory: not a gitfile (linked worktree, submodule), no `commondir`,
+/// no alternates (relative paths would break), no `core.worktree`.
+fn cow_eligible(origin: &Path) -> bool {
+    let dot_git = origin.join(".git");
+    fs::symlink_metadata(&dot_git).is_ok_and(|metadata| metadata.is_dir())
+        && fs::symlink_metadata(dot_git.join("commondir")).is_err()
+        && fs::symlink_metadata(dot_git.join("objects/info/alternates")).is_err()
+        && git(origin, ["config", "--local", "--get", "core.worktree"]).is_err()
+}
+
+/// True when `<dir>/.trama` holds only the tracked setup overrides, so it is
+/// part of the checkout rather than Trama's managed storage.
+fn trama_is_config_only(dir: &Path) -> bool {
+    let trama = dir.join(".trama");
+    if !fs::symlink_metadata(&trama).is_ok_and(|metadata| metadata.is_dir()) {
+        return false;
+    }
+    fs::read_dir(&trama).is_ok_and(|entries| {
+        entries.into_iter().all(|entry| {
+            entry.is_ok_and(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_file())
+                    && matches!(entry.file_name().to_str(), Some("prepare" | "linked"))
+            })
+        })
+    })
+}
+
+/// Drop state a cloned `.git` must not inherit: locks and operations in
+/// progress in the original, its linked-worktree registry (whose entries
+/// point at the original's worktrees), and Trama's per-checkout records.
+fn fixup_cow_git(staging: &Path) -> Result<(), CheckoutError> {
+    let git_dir = staging.join(".git");
+    for name in [
+        "worktrees",
+        "rebase-merge",
+        "rebase-apply",
+        "sequencer",
+        "MERGE_HEAD",
+        "MERGE_MODE",
+        "MERGE_MSG",
+        "AUTO_MERGE",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "BISECT_START",
+        "BISECT_TERMS",
+        "BISECT_EXPECTED_REV",
+        "BISECT_ANCESTORS_OK",
+        "BISECT_NAMES",
+        "gc.pid",
+        "trama-base-commit",
+        crate::setup::RECORD_FILE,
+        crate::setup::LOG_FILE,
+    ] {
+        let path = git_dir.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&path)?,
+            Ok(_) => fs::remove_file(&path)?,
+            Err(_) => {}
+        }
+    }
+    for entry in fs::read_dir(&git_dir)? {
+        let entry = entry?;
+        if entry.file_name().as_encoded_bytes().ends_with(b".lock") && entry.file_type()?.is_file()
+        {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Add, retarget or (with `None`) remove remote `name`.
+fn set_remote(checkout: &Path, name: &str, url: Option<&OsStr>) -> Result<(), CheckoutError> {
+    let remotes = git_text(checkout, ["remote"])?;
+    let exists = remotes.lines().any(|line| line.trim() == name);
+    match (url, exists) {
+        (Some(url), true) => {
+            git(
+                checkout,
+                [
+                    OsStr::new("remote"),
+                    OsStr::new("set-url"),
+                    OsStr::new(name),
+                    url,
+                ],
+            )?;
+        }
+        (Some(url), false) => {
+            git(
+                checkout,
+                [
+                    OsStr::new("remote"),
+                    OsStr::new("add"),
+                    OsStr::new(name),
+                    url,
+                ],
+            )?;
+        }
+        (None, true) => {
+            git(checkout, ["remote", "remove", name])?;
+        }
+        (None, false) => {}
+    }
+    Ok(())
+}
+
+/// Delete every `refs/trama/*` ref (objects stay until Git prunes them).
+pub(crate) fn delete_trama_refs(checkout: &Path) -> Result<(), CheckoutError> {
+    let refs = git_text(
+        checkout,
+        ["for-each-ref", "--format=%(refname)", "refs/trama/"],
+    )?;
+    for reference in refs.lines().filter(|line| !line.is_empty()) {
+        git(checkout, ["update-ref", "-d", reference])?;
+    }
+    Ok(())
+}
+
+/// Refresh the copied index (its stat data describes the original's files)
+/// without touching files, then make the tree exactly `HEAD` when anything
+/// differs: tracked changes reverted, untracked non-ignored files removed.
+/// Ignored files (build output) are kept, and unchanged files keep their
+/// modification times so incremental builds stay valid.
+pub(crate) fn clean_to_head(checkout: &Path) -> Result<(), CheckoutError> {
+    let _ = git(checkout, ["update-index", "-q", "--refresh"]);
+    let status = ["status", "--porcelain", "--untracked-files=all"];
+    if !git(checkout, status)?.stdout.is_empty() {
+        git(checkout, ["reset", "--quiet", "--hard"])?;
+        git(checkout, ["clean", "-fdq"])?;
+        if !git(checkout, status)?.stdout.is_empty() {
+            return Err(CheckoutError::Invalid(checkout.to_path_buf()));
+        }
+    }
+    Ok(())
 }
 
 /// Repository-tracked files allowed under `.trama` (see [`crate::setup`]).
@@ -1370,7 +1763,11 @@ mod tests {
             fs::read_to_string(source.join("same.txt")).unwrap(),
             "original\n"
         );
-        assert!(!a.path.join("ignored.local").exists());
+        // Ignored files are cloned copy-on-write into the checkout.
+        assert_eq!(
+            fs::read_to_string(a.path.join("ignored.local")).unwrap(),
+            "secret"
+        );
         assert_eq!(
             fs::read_to_string(source.join(".gitignore")).unwrap(),
             "ignored.local\n"

@@ -7,6 +7,7 @@
 pub mod changes;
 pub mod checkout;
 pub mod claude;
+pub mod cow;
 #[cfg(unix)]
 pub mod pty;
 pub mod setup;

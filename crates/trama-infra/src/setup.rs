@@ -226,6 +226,29 @@ fn running_as_root() -> bool {
     }
 }
 
+/// The entries of the checkout's linked file (override first), without
+/// validation. A copy-on-write checkout removes its cloned copies of these
+/// paths before setup links them back to the primary checkout.
+pub fn linked_entries(checkout: &Path) -> Vec<String> {
+    let Some(relative) = find_config(checkout, &LINKED_PATHS) else {
+        return Vec::new();
+    };
+    let file = checkout.join(relative);
+    if !fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_file()) {
+        return Vec::new();
+    }
+    fs::read_to_string(&file)
+        .map(|contents| {
+            contents
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The first configured path that exists in the checkout (even if invalid).
 fn find_config(checkout: &Path, candidates: &[&'static str]) -> Option<&'static str> {
     candidates
@@ -891,6 +914,8 @@ mod tests {
         let checkout = checkout(temp.path(), &source, "thread-1");
         let elsewhere = temp.path().join("elsewhere");
         fs::create_dir_all(&elsewhere).unwrap();
+        // The copy-on-write checkout cloned the ignored `link/` directory.
+        fs::remove_dir_all(checkout.join("link")).unwrap();
         std::os::unix::fs::symlink(&elsewhere, checkout.join("link")).unwrap();
         let record = run_checkout_setup(&request(&source, &checkout, "t"));
         assert!(record.linked[0].linked, "{record:?}");
