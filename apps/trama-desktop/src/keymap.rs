@@ -59,7 +59,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     },
     Shortcut {
         keys: &["cmd-r"],
-        label: "Toggle the Changes drawer",
+        label: "Toggle the Changes and Copies drawer",
     },
     Shortcut {
         keys: &["cmd-,"],

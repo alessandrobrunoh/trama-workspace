@@ -76,6 +76,9 @@ pub struct ChatPanel {
     /// Tool name of an approval the agent is waiting on. Approvals cannot be
     /// answered from this build yet; the thread is flagged instead.
     pending_approval: Option<String>,
+    /// Bumped whenever a turn reaches a terminal event; observers use it to
+    /// refresh views that depend on the checkout (the Changes drawer).
+    pub completed_turns: u64,
     last_failed: bool,
     scroll: ScrollHandle,
     _enter: Subscription,
@@ -109,6 +112,7 @@ impl ChatPanel {
             turns: None,
             model: None,
             pending_approval: None,
+            completed_turns: 0,
             last_failed: false,
             scroll: ScrollHandle::new(),
             _enter: enter,
@@ -570,6 +574,7 @@ impl ChatPanel {
     }
 
     fn finish_turn(&mut self) {
+        self.completed_turns += 1;
         self.lifecycle = terminal_transition(self.uses_daemon(), self.final_assistant_persisted);
         let waiting_for_assistant = self.lifecycle == TurnLifecycle::AwaitingAssistant;
         self.status = if waiting_for_assistant {

@@ -16,7 +16,7 @@ use gpui_kit::*;
 use trama_domain::ids::{ThreadId, WorkspaceId};
 use trama_protocol::{ClientMessage, DaemonMessage};
 
-use crate::changes::{ChangesPanel, DrawerTab, render_drawer};
+use crate::changes::{ChangesEvent, ChangesPanel, DrawerTab, render_drawer};
 use crate::chat::ChatPanel;
 use crate::copies::CopyPanel;
 use crate::keymap::{self, CONTEXT, fuzzy_rank};
@@ -52,6 +52,8 @@ pub struct Workspace {
     palette_query: String,
     drawer_open: bool,
     drawer_tab: DrawerTab,
+    /// `ChatPanel::completed_turns` last seen; a change refreshes Changes.
+    seen_completed_turns: u64,
     client: DaemonClient,
     connected: bool,
     _subscriptions: Vec<Subscription>,
@@ -83,7 +85,15 @@ impl Workspace {
                         cx.notify();
                     }
                 });
+                let turns = chat.read(cx).completed_turns;
+                if turns != this.seen_completed_turns {
+                    this.seen_completed_turns = turns;
+                    this.refresh_changes(cx);
+                }
                 cx.notify();
+            }),
+            cx.subscribe(&changes, |this, _, event, cx| match event {
+                ChangesEvent::Refresh => this.refresh_changes(cx),
             }),
             cx.observe(&sidebar, |_, _, cx| cx.notify()),
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
@@ -138,6 +148,7 @@ impl Workspace {
             palette_query: String::new(),
             drawer_open: crate::devhooks::from_env().is_some_and(|dev| dev.drawer),
             drawer_tab: DrawerTab::default(),
+            seen_completed_turns: 0,
             client,
             connected: false,
             _subscriptions: subscriptions,
@@ -147,18 +158,26 @@ impl Workspace {
         }
     }
 
-    /// Integration hook: show a repository's working-tree diff in the
-    /// Changes drawer once the daemon can provide `git diff` output.
-    #[allow(dead_code)]
-    pub fn set_changes(
-        &mut self,
-        repo_label: impl Into<String>,
-        unified_diff: &str,
-        cx: &mut Context<Self>,
-    ) {
-        self.changes.update(cx, |changes, cx| {
-            changes.set_diff(repo_label, unified_diff, cx)
-        });
+    /// Ask for the selected thread's changes when the Changes tab is
+    /// visible. Called on drawer open, thread switch, base change, and turn
+    /// completion.
+    fn refresh_changes(&mut self, cx: &mut Context<Self>) {
+        if !self.drawer_open || self.drawer_tab != DrawerTab::Changes || !self.connected {
+            return;
+        }
+        let Some(thread_id) = self.sidebar.read(cx).onboarding.selected_thread.clone() else {
+            self.changes.update(cx, |changes, cx| changes.clear(cx));
+            return;
+        };
+        let base = self.changes.read(cx).base();
+        let message = ClientMessage::GetChanges {
+            thread_id: thread_id.clone(),
+            base,
+        };
+        if self.client.send(message) == crate::net::SendStatus::Enqueued {
+            self.changes
+                .update(cx, |changes, cx| changes.begin_loading(thread_id, cx));
+        }
     }
 
     fn on_sidebar_event(
@@ -209,6 +228,7 @@ impl Workspace {
             chat.cost_usd_micros = None;
             chat.turns = None;
         });
+        self.refresh_changes(cx);
     }
 
     // -- overlays ---------------------------------------------------------
@@ -495,6 +515,7 @@ impl Workspace {
 
     fn toggle_drawer(&mut self, cx: &mut Context<Self>) {
         self.drawer_open = !self.drawer_open;
+        self.refresh_changes(cx);
         cx.notify();
     }
 
@@ -735,6 +756,22 @@ impl Workspace {
                     self.dispatch_request(request, cx);
                 }
             }
+            DaemonMessage::Changes {
+                thread_id,
+                base,
+                repos,
+            } => {
+                self.changes.update(cx, |changes, cx| {
+                    changes.set_changes(&thread_id, base, &repos, cx);
+                });
+            }
+            DaemonMessage::Error { message, .. }
+                if self
+                    .changes
+                    .update(cx, |changes, cx| changes.fail_loading(&message, cx)) =>
+            {
+                // The pending GetChanges failed (e.g. no last turn yet).
+            }
             DaemonMessage::Error { code, message } => {
                 self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.onboarding.note_error(&code, &message);
@@ -929,7 +966,7 @@ impl Workspace {
                                         IconName::PanelRightOpen
                                     })
                                     .toggled(drawer_open)
-                                    .tooltip("Changes (\u{2318}R)")
+                                    .tooltip("Changes and copies (\u{2318}R)")
                                     .on_click(cx.listener(|this, _, _, cx| this.toggle_drawer(cx))),
                             )
                             .child(
@@ -1054,6 +1091,16 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &keymap::CloseOverlay, window, cx| {
                 this.close_overlay(window, cx);
             }))
+            // Text inputs (the composer) handle Escape first; close the
+            // drawer on the way down so Esc works with the composer focused.
+            .capture_action(cx.listener(
+                |this, _: &gpui_kit::component::input::Escape, window, cx| {
+                    if this.drawer_open && !window.has_active_dialog(cx) {
+                        this.drawer_open = false;
+                        cx.notify();
+                    }
+                },
+            ))
             .size_full()
             .bg(p.bg)
             .text_color(p.text)
@@ -1108,6 +1155,7 @@ impl Render for Workspace {
                             move |tab, _, cx| {
                                 let _ = weak.update(cx, |this, cx| {
                                     this.drawer_tab = tab;
+                                    this.refresh_changes(cx);
                                     cx.notify();
                                 });
                             },
