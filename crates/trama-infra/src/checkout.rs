@@ -220,6 +220,23 @@ impl CheckoutManager {
         repository: &RepositoryId,
         checkout: &trama_domain::ids::CheckoutId,
     ) -> Result<ProvisionedCopy, CheckoutError> {
+        self.provision_copy_at(parent_checkout, source, thread, repository, checkout, None)
+    }
+
+    /// [`Self::provision_copy`], but with `at` set the copy materializes a
+    /// snapshot commit of the parent checkout (a turn checkpoint) instead of
+    /// the parent's current state: it starts at the snapshot's parent (the
+    /// parent's `HEAD` when it was taken) with the snapshot's working-state
+    /// delta replayed on top. The parent's current files are never read.
+    pub fn provision_copy_at(
+        &self,
+        parent_checkout: &Path,
+        source: &Path,
+        thread: &ThreadId,
+        repository: &RepositoryId,
+        checkout: &trama_domain::ids::CheckoutId,
+        at: Option<&str>,
+    ) -> Result<ProvisionedCopy, CheckoutError> {
         let parent = fs::canonicalize(parent_checkout)
             .map_err(|_| CheckoutError::Invalid(parent_checkout.to_path_buf()))?;
         let canonical_source = fs::canonicalize(source).map_err(|_| CheckoutError::Missing {
@@ -258,8 +275,22 @@ impl CheckoutManager {
             });
         }
 
-        let base_revision = git_text(&parent, ["rev-parse", "HEAD"])?;
-        let parent_tree = crate::changes::snapshot_tree(&parent)?;
+        let (base_revision, parent_tree) = match at {
+            None => (
+                git_text(&parent, ["rev-parse", "HEAD"])?,
+                crate::changes::snapshot_tree(&parent)?,
+            ),
+            Some(commit) => (
+                git_text(
+                    &parent,
+                    ["rev-parse", "--verify", &format!("{commit}^1^{{commit}}")],
+                )?,
+                git_text(
+                    &parent,
+                    ["rev-parse", "--verify", &format!("{commit}^{{tree}}")],
+                )?,
+            ),
+        };
         let patch = git(
             &parent,
             [
@@ -288,6 +319,23 @@ impl CheckoutManager {
                     staging.as_os_str(),
                 ],
             )?;
+            if let Some(commit) = at {
+                // A local clone copies the whole object store, so this is a
+                // fallback for snapshots it did not bring along.
+                let spec = format!("{commit}^{{commit}}");
+                if git(&staging, ["cat-file", "-e", spec.as_str()]).is_err() {
+                    git(
+                        &staging,
+                        [
+                            OsStr::new("fetch"),
+                            OsStr::new("--quiet"),
+                            OsStr::new("--no-tags"),
+                            parent.as_os_str(),
+                            OsStr::new("+refs/trama/checkpoints/*:refs/trama/checkpoints/*"),
+                        ],
+                    )?;
+                }
+            }
             if git_text(&staging, ["rev-parse", "HEAD"])? != base_revision {
                 git(
                     &staging,

@@ -19,6 +19,9 @@ use trama_domain::subthread::{FileChange, FileChangeStatus, PullFileOutcome, Pul
 pub const FORK_POINT_REF: &str = "refs/trama/fork-point";
 /// Snapshot of a thread's checkout taken when its latest agent turn started.
 pub const LAST_TURN_REF: &str = "refs/trama/last-turn";
+/// Turn checkpoints live under this prefix, one ref per checkpoint id, so
+/// their snapshot commits stay reachable.
+pub const CHECKPOINT_REF_PREFIX: &str = "refs/trama/checkpoints/";
 /// Diff text above this size is truncated (stats stay complete).
 pub const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
 
@@ -158,6 +161,25 @@ pub fn record_snapshot(
     let commit = text(commit);
     git(worktree, ["update-ref", reference, commit.as_str()])?;
     Ok(commit)
+}
+
+/// Snapshot the working state as turn checkpoint `id` (see
+/// [`record_snapshot`]); returns the commit and its tree.
+pub fn record_checkpoint(worktree: &Path, id: &str) -> Result<(String, String), CheckoutError> {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(CheckoutError::Invalid(worktree.join(id)));
+    }
+    let commit = record_snapshot(
+        worktree,
+        &format!("{CHECKPOINT_REF_PREFIX}{id}"),
+        "trama: turn checkpoint",
+    )?;
+    let tree = resolve_tree(worktree, &commit)?;
+    Ok((commit, tree))
 }
 
 /// Resolve `rev` to a commit id, or `None` when it does not exist.
@@ -793,6 +815,63 @@ mod tests {
 
     fn copy_again(fixture: &Fixture) -> crate::checkout::ProvisionedCopy {
         copy(fixture, "sub")
+    }
+
+    #[test]
+    fn copy_at_checkpoint_materializes_that_state_not_the_current_one() {
+        let fixture = fixture();
+        let (checkpoint, tree) = record_checkpoint(&fixture.parent, "ckpt-1").unwrap();
+        assert_eq!(
+            resolve_commit(&fixture.parent, &format!("{CHECKPOINT_REF_PREFIX}ckpt-1"))
+                .unwrap()
+                .as_deref(),
+            Some(checkpoint.as_str())
+        );
+        assert_eq!(tree, snapshot_tree(&fixture.parent).unwrap());
+        let parent_status = porcelain(&fixture.parent);
+        let checkpoint_head = head(&fixture.parent);
+        // The parent moves on: a new commit and new uncommitted edits.
+        fs::write(fixture.parent.join("same.txt"), "later\n").unwrap();
+        fs::write(fixture.parent.join("later.txt"), "later\n").unwrap();
+        sh_git(&fixture.parent, &["add", "later.txt"]);
+        sh_git(&fixture.parent, &["commit", "-m", "later work"]);
+        fs::write(fixture.parent.join("after.txt"), "after\n").unwrap();
+        assert!(record_checkpoint(&fixture.parent, "../escape").is_err());
+
+        let copy = fixture
+            .manager
+            .provision_copy_at(
+                &fixture.parent,
+                &fixture.source,
+                &ThreadId::from("forked"),
+                &RepositoryId::from("repo"),
+                &CheckoutId::from("forked-checkout"),
+                Some(&checkpoint),
+            )
+            .unwrap();
+        assert_eq!(copy.base_revision, checkpoint_head);
+        assert_eq!(head(&copy.path), checkpoint_head);
+        assert_eq!(resolve_tree(&copy.path, &copy.fork_commit).unwrap(), tree);
+        assert_eq!(
+            fs::read_to_string(copy.path.join("same.txt")).unwrap(),
+            "one\ntwo changed\nthree\n"
+        );
+        assert_eq!(
+            fs::read_to_string(copy.path.join("new/dir/untracked.txt")).unwrap(),
+            "untracked\n"
+        );
+        assert!(!copy.path.join("later.txt").exists());
+        assert!(!copy.path.join("after.txt").exists());
+        assert!(!copy.path.join("gone.txt").exists());
+        // Same changed paths (staging is not copied, like any copy).
+        let paths = |status: &str| -> Vec<String> {
+            status.lines().map(|line| line[3..].to_owned()).collect()
+        };
+        assert_eq!(paths(&porcelain(&copy.path)), paths(&parent_status));
+        fixture
+            .manager
+            .validate_repo_local(&fixture.source, &copy.path, &copy.base_revision)
+            .unwrap();
     }
 
     #[test]
