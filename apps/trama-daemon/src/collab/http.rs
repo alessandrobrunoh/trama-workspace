@@ -1,27 +1,35 @@
 //! Collab client transport: HTTP/1.1 requests and WebSocket upgrades to a
 //! `trama-collab` service.
 //!
-//! There is no TLS client here, so only loopback `http://` endpoints are
-//! accepted: bearer tokens never cross a network in clear text. Requests and
-//! errors never include a credential in their text.
+//! Transport policy (ADR 0014): `https://` (and `wss://`) endpoints are
+//! allowed for any host, with certificate chain and host name always
+//! verified (see `tls`); plain `http://` is accepted for loopback only, so
+//! bearer tokens never cross a network in clear text. Requests and errors
+//! never include a credential in their text.
 
 use bytes::Bytes;
 use http::header::{AUTHORIZATION, CONTENT_TYPE, HOST};
 use http::{Method, Request};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::rt::TokioIo;
+use rustls_pki_types::ServerName;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
+
+use super::tls;
 
 pub(crate) type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// TCP connect and TLS handshake together.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Above the service's 96 KiB frame limit, with room for envelopes.
@@ -84,16 +92,26 @@ fn status_error(status: u16, body: &[u8]) -> CollabError {
     }
 }
 
-/// A validated loopback `http://host:port` service address.
+trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
+
+/// A validated service address: `https://host[:port]` for any host, or
+/// `http://host:port` on this machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Endpoint {
-    /// Normalized `http://host:port`, the identity stored with links.
+    /// Normalized `scheme://host[:port]` (the default https port is
+    /// omitted), the identity stored with links.
     url: String,
-    /// `host:port` for the `Host` header and WebSocket URLs.
+    /// `host[:port]` for the `Host` header and WebSocket URLs.
     authority: String,
-    /// Host for `TcpStream::connect` (no IPv6 brackets).
+    /// Host for `TcpStream::connect` and certificate checks (no IPv6
+    /// brackets).
     connect_host: String,
     port: u16,
+    /// TLS (`https`/`wss`); otherwise plain loopback `http`/`ws`.
+    tls: bool,
+    /// Extra CA bundle from `TRAMA_COLLAB_CA_FILE`, read when connecting.
+    ca_file: Option<PathBuf>,
 }
 
 impl Endpoint {
@@ -102,12 +120,17 @@ impl Endpoint {
         let uri: http::Uri = raw
             .parse()
             .map_err(|_| "the collab server URL is not a valid URL".to_owned())?;
-        if uri.scheme_str() != Some("http") {
-            return Err(
-                "only http:// collab servers on this machine are supported (no TLS client yet)"
-                    .into(),
-            );
-        }
+        let tls = match uri.scheme_str() {
+            Some("https") => true,
+            Some("http") => false,
+            _ => {
+                return Err(
+                    "the collab server URL must start with https:// (or http:// \
+                            for a server on this machine)"
+                        .into(),
+                );
+            }
+        };
         if uri.path_and_query().is_some_and(|p| p.as_str() != "/") {
             return Err("the collab server URL must not have a path or query".into());
         }
@@ -119,22 +142,76 @@ impl Endpoint {
         }
         let host = authority.host();
         let bare = host.trim_start_matches('[').trim_end_matches(']');
-        let loopback = bare.eq_ignore_ascii_case("localhost")
-            || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
-        if !loopback {
-            return Err(
-                "the collab server must be on this machine (loopback); exposing it needs TLS"
-                    .into(),
-            );
+        if tls {
+            // Names and IP literals only; this is also what the certificate
+            // is checked against.
+            ServerName::try_from(bare.to_owned())
+                .map_err(|_| "the collab server URL has an invalid host name".to_owned())?;
+        } else {
+            let loopback = bare.eq_ignore_ascii_case("localhost")
+                || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+            if !loopback {
+                return Err("plain http:// is only allowed for a collab server on this \
+                            machine (loopback); use https:// for a remote server"
+                    .into());
+            }
         }
-        let port = authority.port_u16().unwrap_or(80);
+        let default_port = if tls { 443 } else { 80 };
+        let port = authority.port_u16().unwrap_or(default_port);
         let host = host.to_ascii_lowercase();
+        let scheme = if tls { "https" } else { "http" };
+        // The https default port is left out so `https://x` and
+        // `https://x:443` are one identity; plain http keeps its port.
+        let shown = if tls && port == 443 {
+            host
+        } else {
+            format!("{host}:{port}")
+        };
         Ok(Self {
-            url: format!("http://{host}:{port}"),
-            authority: format!("{host}:{port}"),
+            url: format!("{scheme}://{shown}"),
+            authority: shown,
             connect_host: bare.to_ascii_lowercase(),
             port,
+            tls,
+            ca_file: tls.then(tls::ca_file_from_env).flatten(),
         })
+    }
+
+    /// Trust `path` (a PEM CA bundle) in addition to the system roots.
+    #[cfg(test)]
+    pub(crate) fn with_ca_file(mut self, path: PathBuf) -> Self {
+        self.ca_file = Some(path);
+        self
+    }
+
+    /// Open the TCP connection and, for https, finish a verified handshake.
+    async fn connect_tcp(&self) -> Result<TcpStream, CollabError> {
+        tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            TcpStream::connect((self.connect_host.as_str(), self.port)),
+        )
+        .await
+        .map_err(|_| CollabError::Transport("connection timed out".into()))?
+        .map_err(|err| CollabError::Transport(err.to_string()))
+    }
+
+    fn tls_config(&self) -> Result<std::sync::Arc<rustls::ClientConfig>, CollabError> {
+        tls::client_config(self.ca_file.as_deref()).map_err(CollabError::Transport)
+    }
+
+    async fn connect(&self) -> Result<Box<dyn Io>, CollabError> {
+        let tcp = self.connect_tcp().await?;
+        if !self.tls {
+            return Ok(Box::new(tcp));
+        }
+        let name = ServerName::try_from(self.connect_host.clone())
+            .map_err(|_| CollabError::Transport("invalid host name".into()))?;
+        let connector = tokio_rustls::TlsConnector::from(self.tls_config()?);
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(name, tcp))
+            .await
+            .map_err(|_| CollabError::Transport("TLS handshake timed out".into()))?
+            .map_err(|err| CollabError::Transport(format!("TLS handshake failed: {err}")))?;
+        Ok(Box::new(stream))
     }
 
     pub(crate) fn url(&self) -> &str {
@@ -150,13 +227,7 @@ impl Endpoint {
         body: Option<&serde_json::Value>,
     ) -> Result<Bytes, CollabError> {
         let transport = |err: &dyn std::fmt::Display| CollabError::Transport(err.to_string());
-        let stream = tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            TcpStream::connect((self.connect_host.as_str(), self.port)),
-        )
-        .await
-        .map_err(|_| CollabError::Transport("connection timed out".into()))?
-        .map_err(|err| transport(&err))?;
+        let stream = self.connect().await?;
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .map_err(|err| transport(&err))?;
@@ -237,7 +308,8 @@ impl Endpoint {
 
     /// Open a WebSocket authenticated with `bearer`.
     pub(crate) async fn websocket(&self, path: &str, bearer: &str) -> Result<Ws, CollabError> {
-        let mut request = format!("ws://{}{path}", self.authority)
+        let scheme = if self.tls { "wss" } else { "ws" };
+        let mut request = format!("{scheme}://{}{path}", self.authority)
             .into_client_request()
             .map_err(|_| CollabError::Transport("invalid socket URL".into()))?;
         request.headers_mut().insert(
@@ -249,7 +321,18 @@ impl Endpoint {
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_WS_MESSAGE_BYTES))
             .max_frame_size(Some(MAX_WS_MESSAGE_BYTES));
-        let connect = tokio_tungstenite::connect_async_with_config(request, Some(config), true);
+        let tcp = self.connect_tcp().await?;
+        let connector = if self.tls {
+            Connector::Rustls(self.tls_config()?)
+        } else {
+            Connector::Plain
+        };
+        let connect = tokio_tungstenite::client_async_tls_with_config(
+            request,
+            tcp,
+            Some(config),
+            Some(connector),
+        );
         match tokio::time::timeout(REQUEST_TIMEOUT, connect).await {
             Err(_) => Err(CollabError::Transport("socket handshake timed out".into())),
             Ok(Ok((ws, _))) => Ok(ws),
@@ -283,7 +366,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_loopback_http_endpoints_are_accepted() {
+    fn plain_http_is_loopback_only_and_https_is_allowed_anywhere() {
         let endpoint = Endpoint::parse("http://127.0.0.1:8787/").unwrap();
         assert_eq!(endpoint.url(), "http://127.0.0.1:8787");
         assert_eq!(
@@ -294,14 +377,54 @@ mod tests {
             Endpoint::parse("http://[::1]:9").unwrap().url(),
             "http://[::1]:9"
         );
+        // https: any host, default port omitted from the identity.
+        assert_eq!(
+            Endpoint::parse("https://Collab.Example.com/")
+                .unwrap()
+                .url(),
+            "https://collab.example.com"
+        );
+        assert_eq!(
+            Endpoint::parse("https://collab.example.com:443")
+                .unwrap()
+                .url(),
+            "https://collab.example.com"
+        );
+        assert_eq!(
+            Endpoint::parse("https://collab.example.com:8443")
+                .unwrap()
+                .url(),
+            "https://collab.example.com:8443"
+        );
+        assert_eq!(
+            Endpoint::parse("https://203.0.113.7:8443").unwrap().url(),
+            "https://203.0.113.7:8443"
+        );
+        assert_eq!(
+            Endpoint::parse("https://[2001:db8::1]:8443").unwrap().url(),
+            "https://[2001:db8::1]:8443"
+        );
+        assert!(Endpoint::parse("https://127.0.0.1:8787").is_ok());
         for bad in [
-            "https://127.0.0.1:8787",
+            // Plain http to anything but this machine.
             "http://example.com:8787",
             "http://10.0.0.2:8787",
-            "http://user:pw@127.0.0.1:8787",
-            "http://127.0.0.1:8787/api",
+            "http://203.0.113.7",
+            "http://localhost.example.com",
+            // Other schemes and malformed URLs.
             "ws://127.0.0.1:8787",
+            "wss://example.com",
+            "ftp://example.com",
+            "example.com",
             "not a url",
+            // Credentials, paths and queries are never accepted.
+            "http://user:pw@127.0.0.1:8787",
+            "https://user:pw@example.com",
+            "http://127.0.0.1:8787/api",
+            "https://example.com/api",
+            "https://example.com/?x=1",
+            "https://",
+            "https://exa mple.com",
         ] {
             assert!(Endpoint::parse(bad).is_err(), "{bad} must be rejected");
         }

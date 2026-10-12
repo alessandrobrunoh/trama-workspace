@@ -108,7 +108,9 @@ fn parse_server(raw: &str) -> Result<String, String> {
     let rest = raw
         .strip_prefix("http://")
         .or_else(|| raw.strip_prefix("https://"))
-        .ok_or_else(|| "The join link must name an http:// server.".to_string())?;
+        .ok_or_else(|| {
+            "The join link must name an https:// (or local http://) server.".to_string()
+        })?;
     let ok = !rest.is_empty()
         && !rest.contains(['/', '@', '?', '#'])
         && !rest.chars().any(char::is_whitespace);

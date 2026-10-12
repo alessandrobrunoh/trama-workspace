@@ -50,6 +50,9 @@ mod runner;
 mod tests;
 #[cfg(test)]
 mod tests_history;
+#[cfg(test)]
+mod tests_tls;
+mod tls;
 
 use crate::error::{DaemonError, Result};
 use crate::session::SessionManager;
