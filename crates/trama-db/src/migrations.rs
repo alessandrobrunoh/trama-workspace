@@ -11,6 +11,8 @@ pub(crate) fn migrations() -> Migrations<'static> {
         M::up(include_str!("../migrations/0004_comments.sql")),
         M::up(include_str!("../migrations/0005_composer.sql")),
         M::up(include_str!("../migrations/0006_collab.sql")),
+        M::up(include_str!("../migrations/0007_message_claude_uuid.sql")),
+        M::up(include_str!("../migrations/0008_subagents_checkpoints.sql")),
     ])
 }
 

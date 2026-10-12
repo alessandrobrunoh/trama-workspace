@@ -965,7 +965,8 @@ impl ChatPanel {
             | AgentEvent::ApprovalResolved { .. }
             | AgentEvent::SubagentStarted { .. }
             | AgentEvent::SubagentFinished { .. }
-            | AgentEvent::CommandsReported { .. } => {}
+            | AgentEvent::CommandsReported { .. }
+            | AgentEvent::TranscriptEntry { .. } => {}
         }
     }
 

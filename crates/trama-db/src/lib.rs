@@ -7,6 +7,7 @@
 //! Open/migrate stay synchronous so a runtime is not required to construct
 //! the store. Concurrent async calls serialize on the mutex.
 
+mod agents;
 mod checkouts;
 mod codec;
 mod collab;
@@ -20,6 +21,7 @@ mod revision;
 mod store;
 mod subthreads;
 
+pub use agents::SubagentRecord;
 pub use checkouts::CheckoutLocation;
 pub use collab::{CollabLink, CollabTurn};
 pub use comments::CommentRecord;
@@ -338,6 +340,8 @@ mod tests {
                 text: "the narwhal baconates at midnight".into(),
             }],
             created_at: Utc::now(),
+            claude_uuid: None,
+            annotation: None,
         };
         db.append_message(&message).await.unwrap();
         let listed = db.list_messages_by_thread(&thread.id).await.unwrap();
@@ -727,6 +731,8 @@ mod tests {
                 text: "should roll back".into(),
             }],
             created_at: Utc::now(),
+            claude_uuid: None,
+            annotation: None,
         };
         let failure_event = EventRecord::new(
             Aggregate::Thread {
@@ -778,6 +784,8 @@ mod tests {
                 text: "migrated".into(),
             }],
             created_at: Utc::now(),
+            claude_uuid: None,
+            annotation: None,
         };
         let notice_event = EventRecord::new(
             Aggregate::Thread {
@@ -919,6 +927,8 @@ mod tests {
                 text: "migrated".into(),
             }],
             created_at: Utc::now(),
+            claude_uuid: None,
+            annotation: None,
         };
         let event = EventRecord::new(
             Aggregate::Thread {

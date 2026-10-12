@@ -2,6 +2,7 @@
 
 use async_channel::Sender;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,6 +15,10 @@ use trama_domain::{DomainError, Result};
 
 const DEFAULT_CHUNKS: &[&str] = &["Hello", " from ", "the mock ", "agent."];
 
+/// Runs in `send` before a turn's events: the session's cwd and the prompt.
+/// Tests use it to edit files the way an agent would.
+pub type OnSend = Arc<dyn Fn(&Path, &str) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct FakeAdapter {
     events: Arc<Vec<AgentEvent>>,
@@ -23,6 +28,9 @@ pub struct FakeAdapter {
     pub prompts: Arc<Mutex<Vec<String>>>,
     interrupt: Arc<AtomicBool>,
     senders: Arc<Mutex<HashMap<AgentSessionId, Sender<AgentEvent>>>>,
+    on_send: Option<OnSend>,
+    /// Turns whose prompt contains the marker wait for one permit first.
+    gate: Option<(String, Arc<tokio::sync::Semaphore>)>,
 }
 
 impl FakeAdapter {
@@ -35,7 +43,21 @@ impl FakeAdapter {
             prompts: Arc::new(Mutex::new(Vec::new())),
             interrupt: Arc::new(AtomicBool::new(false)),
             senders: Arc::new(Mutex::new(HashMap::new())),
+            on_send: None,
+            gate: None,
         }
+    }
+
+    /// Hold every turn whose prompt contains `marker` until the test adds a
+    /// permit to `gate` (one per turn).
+    pub fn with_gate(mut self, marker: &str, gate: Arc<tokio::sync::Semaphore>) -> Self {
+        self.gate = Some((marker.to_owned(), gate));
+        self
+    }
+
+    pub fn with_on_send(mut self, on_send: impl Fn(&Path, &str) + Send + Sync + 'static) -> Self {
+        self.on_send = Some(Arc::new(on_send));
+        self
     }
 
     pub fn scripted() -> Self {
@@ -127,10 +149,22 @@ impl AgentAdapter for FakeAdapter {
     }
 
     async fn send(&self, session: &AgentSession, prompt: AgentPrompt) -> Result<()> {
-        self.prompts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(prompt.text);
+        if let Some(on_send) = &self.on_send {
+            on_send(&session.cwd, &prompt.text);
+        }
+        let gate = self
+            .gate
+            .as_ref()
+            .filter(|(marker, _)| prompt.text.contains(marker.as_str()))
+            .map(|(_, gate)| Arc::clone(gate));
+        let turn = {
+            let mut prompts = self
+                .prompts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            prompts.push(prompt.text);
+            prompts.len()
+        };
         self.interrupt.store(false, Ordering::SeqCst);
         let tx = self
             .senders
@@ -139,10 +173,27 @@ impl AgentAdapter for FakeAdapter {
             .get(&session.id)
             .cloned()
             .ok_or_else(|| DomainError::NotFound(format!("agent session {}", session.id)))?;
-        let events = Arc::clone(&self.events);
+        // Transcript uuids are made unique per turn: `<uuid>-<turn>`.
+        let events: Arc<Vec<AgentEvent>> = Arc::new(
+            self.events
+                .iter()
+                .map(|event| match event {
+                    AgentEvent::TranscriptEntry { uuid } => AgentEvent::TranscriptEntry {
+                        uuid: format!("{uuid}-{turn}"),
+                    },
+                    other => other.clone(),
+                })
+                .collect(),
+        );
         let interrupt = Arc::clone(&self.interrupt);
         let delay = self.delay;
         tokio::spawn(async move {
+            if let Some(gate) = gate {
+                match gate.acquire().await {
+                    Ok(permit) => permit.forget(),
+                    Err(_) => return,
+                }
+            }
             for event in events.iter() {
                 if interrupt.load(Ordering::SeqCst) {
                     return;

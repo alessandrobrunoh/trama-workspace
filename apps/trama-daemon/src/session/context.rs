@@ -719,22 +719,41 @@ impl SessionManager {
             }
             None => line.push_str(". It has no reply yet. "),
         }
-        line.push_str(
-            "It is a separate Trama thread with its own session and checkouts; you cannot \
-             read or message it from here, so ask the user to relay anything you need from it.",
-        );
+        if self.agents_config.mcp.is_some() {
+            // The TramaWorkspace MCP tools reach any thread of the workspace.
+            line.push_str(&format!(
+                "It is a separate Trama thread with its own session and checkouts; use the \
+                 TramaWorkspace tools thread_status or send_to_thread with thread id {} to \
+                 read or message it.",
+                other.id
+            ));
+        } else {
+            line.push_str(
+                "It is a separate Trama thread with its own session and checkouts; you cannot \
+                 read or message it from here, so ask the user to relay anything you need from it.",
+            );
+        }
         Ok(line)
     }
 
-    /// Thread override, else the parent's (a subthread follows its parent).
+    /// Thread override, else the nearest ancestor's (a subthread, nested at
+    /// any depth, follows its parent).
     pub(super) async fn thread_model_override(&self, thread: &Thread) -> Result<Option<String>> {
         if let Some(model) = self.db.thread_model(&thread.id).await? {
             return Ok(Some(model));
         }
-        match &thread.parent_thread_id {
-            Some(parent) => Ok(self.db.thread_model(parent).await?),
-            None => Ok(None),
+        let Some(parent) = &thread.parent_thread_id else {
+            return Ok(None);
+        };
+        if let Some(model) = self.db.thread_model(parent).await? {
+            return Ok(Some(model));
         }
+        for ancestor in self.db.thread_ancestors(parent).await? {
+            if let Some(model) = self.db.thread_model(&ancestor).await? {
+                return Ok(Some(model));
+            }
+        }
+        Ok(None)
     }
 
     /// Persist the thread's model override and announce it. The next turn

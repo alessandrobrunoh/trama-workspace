@@ -37,6 +37,46 @@ impl Drop for CheckoutsGuard {
     }
 }
 
+/// Where a new child's files come from.
+pub(super) enum ForkFiles {
+    /// Copies of the parent's checkouts as they are now.
+    Current,
+    /// Copies materializing one of the parent's turn checkpoints.
+    AtCheckpoint(trama_domain::checkpoint::Checkpoint),
+    /// No copies: the child works in the parent's checkouts (scouts).
+    Shared,
+}
+
+/// Where a new child's conversation comes from.
+pub(super) enum ForkConversation {
+    /// The parent's conversation as it is now (forked on the first turn).
+    Inherit,
+    /// A truncated transcript copy, ending with `last_message`'s turn.
+    Transcript {
+        path: String,
+        last_message: MessageId,
+    },
+    /// A new conversation (subagents get only their task prompt).
+    Fresh,
+}
+
+pub(super) struct ForkRequest {
+    pub(super) kind: ThreadKind,
+    pub(super) title: String,
+    pub(super) files: ForkFiles,
+    pub(super) conversation: ForkConversation,
+    pub(super) allow_parent_turn: bool,
+    pub(super) spawned_by: Option<trama_domain::subagent::SpawnedBy>,
+    pub(super) forked_at: Option<(MessageId, Option<trama_domain::ids::CheckpointId>)>,
+}
+
+pub(super) struct ForkedChild {
+    pub(super) thread: Thread,
+    pub(super) snapshot: ThreadSnapshot,
+    pub(super) parent_checkouts: Vec<ResolvedCheckout>,
+    pub(super) copy_paths: Vec<PathBuf>,
+}
+
 /// One managed checkout of a thread, validated.
 pub(super) struct ResolvedCheckout {
     pub(super) repository_id: RepositoryId,
@@ -70,6 +110,9 @@ impl SessionManager {
 
     /// Validated managed checkouts of `thread`, in attachment order.
     pub(super) async fn resolve_checkouts(&self, thread: &Thread) -> Result<Vec<ResolvedCheckout>> {
+        // A scout's checkouts are its parent's.
+        let owner = self.checkout_owner(thread).await?;
+        let thread = &owner;
         let memberships = match &thread.workspace_id {
             Some(workspace) => self.db.list_memberships(workspace).await?,
             None => Vec::new(),
@@ -138,8 +181,13 @@ impl SessionManager {
         Ok(out)
     }
 
-    /// Thread snapshots with the latest verdict filled in for review threads.
+    /// Thread snapshots with the latest verdict filled in for review threads,
+    /// the nesting depth, and the subagent state of spawned threads.
     pub(super) async fn thread_snapshots(&self, threads: &[Thread]) -> Result<Vec<ThreadSnapshot>> {
+        let parents: HashMap<ThreadId, Option<ThreadId>> = threads
+            .iter()
+            .map(|thread| (thread.id.clone(), thread.parent_thread_id.clone()))
+            .collect();
         let mut out = Vec::with_capacity(threads.len());
         for thread in threads {
             let mut snapshot = thread_snapshot(thread);
@@ -151,35 +199,70 @@ impl SessionManager {
                     .await?
                     .map(|record| record.verdict);
             }
+            snapshot.depth = self.thread_depth(thread, &parents).await?;
+            snapshot.subagent = self.subagent_snapshot(&thread.id).await?;
             out.push(snapshot);
         }
         Ok(out)
     }
 
-    /// Parent messages a subthread inherited (up to its fork point), so a
-    /// subscriber sees the conversation it continues. They keep the parent's
-    /// `thread_id` inside the message.
-    pub(super) async fn inherited_messages(&self, thread_id: &ThreadId) -> Result<Vec<Message>> {
-        let Some(fork) = self.db.get_subthread_fork(thread_id).await? else {
-            return Ok(Vec::new());
-        };
-        let Some(last) = fork.fork_message_id else {
-            return Ok(Vec::new());
-        };
-        let mut messages = self
-            .db
-            .list_messages_by_thread(&fork.parent_thread_id)
-            .await?;
-        match messages.iter().position(|message| message.id == last) {
-            Some(index) => {
-                messages.truncate(index + 1);
-                Ok(messages)
+    /// Ancestors of `thread`, using `known` (id -> parent) before the
+    /// database. Cycle-safe.
+    async fn thread_depth(
+        &self,
+        thread: &Thread,
+        known: &HashMap<ThreadId, Option<ThreadId>>,
+    ) -> Result<u32> {
+        let mut depth = 0u32;
+        let mut seen = HashSet::from([thread.id.clone()]);
+        let mut parent = thread.parent_thread_id.clone();
+        while let Some(id) = parent {
+            if !seen.insert(id.clone()) {
+                break;
             }
-            None => Ok(Vec::new()),
+            depth += 1;
+            parent = match known.get(&id) {
+                Some(next) => next.clone(),
+                None => {
+                    let rest = self.db.thread_ancestors(&id).await?;
+                    return Ok(depth + rest.len() as u32);
+                }
+            };
         }
+        Ok(depth)
     }
 
-    /// The parent's agent session a subthread forks on its first turn.
+    /// Parent messages a subthread inherited (up to its fork point, through
+    /// every ancestor it inherited from), so a subscriber sees the
+    /// conversation it continues. They keep their own `thread_id`.
+    pub(super) async fn inherited_messages(&self, thread_id: &ThreadId) -> Result<Vec<Message>> {
+        // (parent, last inherited message), nearest first.
+        let mut links = Vec::new();
+        let mut seen = HashSet::from([thread_id.clone()]);
+        let mut current = thread_id.clone();
+        while let Some(fork) = self.db.get_subthread_fork(&current).await? {
+            let Some(last) = fork.fork_message_id else {
+                break;
+            };
+            if !seen.insert(fork.parent_thread_id.clone()) {
+                break;
+            }
+            current = fork.parent_thread_id.clone();
+            links.push((fork.parent_thread_id, last));
+        }
+        let mut messages = Vec::new();
+        for (parent, last) in links.into_iter().rev() {
+            messages.extend(self.db.list_messages_by_thread(&parent).await?);
+            match messages.iter().position(|message| message.id == last) {
+                Some(index) => messages.truncate(index + 1),
+                None => return Ok(Vec::new()),
+            }
+        }
+        Ok(messages)
+    }
+
+    /// The parent's agent session a subthread forks on its first turn: a
+    /// Claude session id, or the path of a truncated transcript copy.
     pub(super) async fn inherited_session(&self, thread: &Thread) -> Result<Option<String>> {
         if thread.parent_thread_id.is_none() {
             return Ok(None);
@@ -191,74 +274,158 @@ impl SessionManager {
             .and_then(|fork| fork.parent_external_session_id))
     }
 
-    pub async fn create_subthread(
+    /// What a child of `parent` inherits from the conversation as it is now:
+    /// the parent's own session, or (if it never ran) what the parent itself
+    /// inherited; and the last message of the parent's view.
+    async fn current_conversation(
         &self,
-        parent_thread_id: ThreadId,
-        kind: SubthreadKind,
-        title: Option<String>,
-        initial_prompt: Option<String>,
-    ) -> Result<ThreadSnapshot> {
-        let parent = self
+        parent: &Thread,
+    ) -> Result<(Option<String>, Option<MessageId>)> {
+        let fork = self.db.get_subthread_fork(&parent.id).await?;
+        let session = match self
             .db
-            .get_thread(&parent_thread_id)
+            .latest_agent_session_for_thread(&parent.id)
             .await?
-            .ok_or_else(|| DaemonError::NotFound(format!("thread {parent_thread_id}")))?;
-        let parent_title = parent.title.clone().unwrap_or_default();
-        let title = match title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-            Some(title) => validate_label(title, "subthread title")?,
-            None => default_subthread_title(kind, &parent_title),
+            .and_then(|session| session.external_session_id)
+        {
+            Some(id) => Some(id),
+            None => fork
+                .as_ref()
+                .and_then(|fork| fork.parent_external_session_id.clone()),
         };
-        let mut thread = Thread::new_subthread(&parent, kind.thread_kind(), Some(title))?;
-        let _reservation = self.reserve_checkouts(std::slice::from_ref(&parent.id))?;
-        let parent_checkouts = self.resolve_checkouts(&parent).await?;
+        let last = match self.db.list_messages_by_thread(&parent.id).await?.last() {
+            Some(message) => Some(message.id.clone()),
+            None => fork.and_then(|fork| fork.fork_message_id),
+        };
+        Ok((session, last))
+    }
+
+    /// Reserve `parent` for copying its checkouts. With `allow_parent_turn`,
+    /// a parent in an agent turn is copied without a reservation: the turn
+    /// itself asked for the child (a subagent spawn) or the copy reads only a
+    /// past checkpoint.
+    fn reserve_parent(
+        &self,
+        parent: &ThreadId,
+        allow_parent_turn: bool,
+    ) -> Result<Option<CheckoutsGuard>> {
+        if allow_parent_turn {
+            let in_turn = self
+                .lock()
+                .threads
+                .get(parent)
+                .is_some_and(|thread| thread.reservation == Some(Reservation::Turn));
+            if in_turn {
+                return Ok(None);
+            }
+        }
+        self.reserve_checkouts(std::slice::from_ref(parent))
+            .map(Some)
+    }
+
+    /// Create a child of `parent` (any depth): checkouts per `request.files`,
+    /// conversation per `request.conversation`, persisted atomically with its
+    /// events, and announced to the parent's subscribers. Does not start a
+    /// turn.
+    pub(super) async fn fork_child(
+        &self,
+        parent: &Thread,
+        request: ForkRequest,
+    ) -> Result<ForkedChild> {
+        let mut thread = Thread::new_subthread(parent, request.kind, Some(request.title))?;
+        let reservation = self.reserve_parent(&parent.id, request.allow_parent_turn)?;
+        let parent_checkouts = self.resolve_checkouts(parent).await?;
 
         let checkout_manager = self.checkout_manager.clone();
         let thread_id = thread.id.clone();
         let thread_title = thread.title.clone().unwrap_or_default();
-        let requests: Vec<_> = parent_checkouts
-            .iter()
-            .map(|checkout| {
-                (
-                    checkout.path.clone(),
-                    checkout.source.clone(),
-                    checkout.repository_id.clone(),
-                    CheckoutId::generate(),
-                    checkout.title.clone(),
-                )
-            })
-            .collect();
-        let copies = tokio::task::spawn_blocking(move || {
-            let mut copies = Vec::with_capacity(requests.len());
-            for (parent_path, source, repository_id, checkout_id, alias) in requests {
-                match checkout_manager.provision_copy(
-                    &parent_path,
-                    &source,
-                    &thread_id,
-                    &repository_id,
-                    &checkout_id,
-                ) {
-                    Ok(copy) => copies.push((repository_id, checkout_id, copy, (source, alias))),
-                    Err(error) => {
-                        remove_fresh_copies(&copies);
-                        return Err(error);
-                    }
+        let mut copies = Vec::new();
+        match &request.files {
+            ForkFiles::Shared => {
+                // Same checkout ids as the parent's (resolved through it).
+                let owner = self.checkout_owner(parent).await?;
+                for attachment in &mut thread.repo_attachments {
+                    let shared = owner
+                        .repo_attachments
+                        .iter()
+                        .find(|candidate| candidate.repository_id == attachment.repository_id)
+                        .ok_or_else(|| {
+                            DaemonError::Invalid(format!(
+                                "the parent has no checkout for repository {}",
+                                attachment.repository_id
+                            ))
+                        })?;
+                    attachment.checkout_id = shared.checkout_id.clone();
+                    attachment.base_revision = shared.base_revision.clone();
                 }
             }
-            // Project setup runs in each new copy, after all were created.
-            for (_, _, copy, (source, alias)) in &copies {
-                super::run_checkout_setup(
-                    source,
-                    &copy.path,
-                    &thread_id,
-                    &thread_title,
-                    Some(alias),
-                );
+            ForkFiles::Current | ForkFiles::AtCheckpoint(_) => {
+                let mut requests = Vec::with_capacity(parent_checkouts.len());
+                for checkout in &parent_checkouts {
+                    let at = match &request.files {
+                        ForkFiles::AtCheckpoint(checkpoint) => Some(
+                            checkpoint
+                                .repo_states
+                                .iter()
+                                .find(|state| state.repository_id == checkout.repository_id)
+                                .and_then(|state| state.commit.clone())
+                                .ok_or_else(|| {
+                                    DaemonError::Invalid(format!(
+                                        "the turn checkpoint has no state for {}",
+                                        checkout.title
+                                    ))
+                                })?,
+                        ),
+                        _ => None,
+                    };
+                    requests.push((
+                        checkout.path.clone(),
+                        checkout.source.clone(),
+                        checkout.repository_id.clone(),
+                        CheckoutId::generate(),
+                        checkout.title.clone(),
+                        at,
+                    ));
+                }
+                copies = tokio::task::spawn_blocking(move || {
+                    let mut copies = Vec::with_capacity(requests.len());
+                    for (parent_path, source, repository_id, checkout_id, alias, at) in requests {
+                        match checkout_manager.provision_copy_at(
+                            &parent_path,
+                            &source,
+                            &thread_id,
+                            &repository_id,
+                            &checkout_id,
+                            at.as_deref(),
+                        ) {
+                            Ok(copy) => {
+                                copies.push((repository_id, checkout_id, copy, (source, alias)))
+                            }
+                            Err(error) => {
+                                remove_fresh_copies(&copies);
+                                return Err(error);
+                            }
+                        }
+                    }
+                    // Project setup runs in each new copy, after all were created.
+                    for (_, _, copy, (source, alias)) in &copies {
+                        super::run_checkout_setup(
+                            source,
+                            &copy.path,
+                            &thread_id,
+                            &thread_title,
+                            Some(alias),
+                        );
+                    }
+                    Ok(copies)
+                })
+                .await
+                .map_err(|error| {
+                    DaemonError::Invalid(format!("subthread copy task failed: {error}"))
+                })?
+                .map_err(checkout_to_invalid)?;
             }
-            Ok(copies)
-        })
-        .await
-        .map_err(|error| DaemonError::Invalid(format!("subthread copy task failed: {error}")))?
-        .map_err(checkout_to_invalid)?;
+        }
 
         let mut locations = Vec::with_capacity(copies.len());
         let mut repos = Vec::with_capacity(copies.len());
@@ -278,17 +445,13 @@ impl SessionManager {
                 fork_commit: copy.fork_commit.clone(),
             });
         }
-        let parent_external_session_id = self
-            .db
-            .latest_agent_session_for_thread(&parent.id)
-            .await?
-            .and_then(|session| session.external_session_id);
-        let fork_message_id = self
-            .db
-            .list_messages_by_thread(&parent.id)
-            .await?
-            .last()
-            .map(|message| message.id.clone());
+        let (parent_external_session_id, fork_message_id) = match &request.conversation {
+            ForkConversation::Inherit => self.current_conversation(parent).await?,
+            ForkConversation::Transcript { path, last_message } => {
+                (Some(path.clone()), Some(last_message.clone()))
+            }
+            ForkConversation::Fresh => (None, None),
+        };
         let fork = SubthreadFork {
             thread_id: thread.id.clone(),
             parent_thread_id: parent.id.clone(),
@@ -299,30 +462,48 @@ impl SessionManager {
         let aggregate = Aggregate::Thread {
             id: thread.id.clone(),
         };
-        let events = [
-            EventRecord::new(
-                aggregate.clone(),
-                Actor::System,
-                DomainEvent::ThreadCreated {
-                    thread: thread.clone(),
-                },
-                vec![],
-            )?,
-            EventRecord::new(
-                aggregate,
-                Actor::System,
-                DomainEvent::SubthreadForked {
-                    thread_id: thread.id.clone(),
-                    parent_thread_id: parent.id.clone(),
-                    repos,
-                    parent_external_session_id,
-                },
-                vec![],
-            )?,
+        let mut domain_events = vec![
+            DomainEvent::ThreadCreated {
+                thread: thread.clone(),
+            },
+            DomainEvent::SubthreadForked {
+                thread_id: thread.id.clone(),
+                parent_thread_id: parent.id.clone(),
+                repos,
+                parent_external_session_id,
+            },
         ];
+        let subagent = request.spawned_by.map(|spawned_by| {
+            domain_events.push(DomainEvent::SubagentSpawned {
+                thread_id: thread.id.clone(),
+                parent_thread_id: parent.id.clone(),
+                profile: spawned_by.profile,
+                tool_use_id: spawned_by.tool_use_id.clone(),
+            });
+            trama_db::SubagentRecord {
+                thread_id: thread.id.clone(),
+                spawned_by,
+                status: trama_domain::subagent::SubagentStatus::Queued,
+                detail: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }
+        });
+        if let Some(at) = request.forked_at {
+            domain_events.push(DomainEvent::ThreadForkedAtMessage {
+                thread_id: thread.id.clone(),
+                parent_thread_id: parent.id.clone(),
+                at_message_id: at.0,
+                checkpoint_id: at.1,
+            });
+        }
+        let events = domain_events
+            .into_iter()
+            .map(|event| EventRecord::new(aggregate.clone(), Actor::System, event, vec![]))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         if let Err(error) = self
             .db
-            .create_subthread(&thread, &fork, &locations, &events)
+            .create_subthread_with(&thread, &fork, &locations, &events, subagent.as_ref())
             .await
         {
             // The copies were just created and never recorded: no user work.
@@ -330,25 +511,92 @@ impl SessionManager {
             let _ = tokio::task::spawn_blocking(move || remove_fresh_copies(&copies)).await;
             return Err(error.into());
         }
-        drop(_reservation);
-        let snapshot = thread_snapshot(&thread);
+        drop(reservation);
+        let snapshot = self
+            .thread_snapshots(std::slice::from_ref(&thread))
+            .await?
+            .remove(0);
         self.broadcast(
             &parent.id,
             DaemonMessage::SubthreadCreated(snapshot.clone()),
         );
+        Ok(ForkedChild {
+            thread,
+            snapshot,
+            parent_checkouts,
+            copy_paths: copies
+                .iter()
+                .map(|(_, _, copy, _)| copy.path.clone())
+                .collect(),
+        })
+    }
 
+    pub async fn create_subthread(
+        &self,
+        parent_thread_id: ThreadId,
+        kind: SubthreadKind,
+        title: Option<String>,
+        initial_prompt: Option<String>,
+    ) -> Result<ThreadSnapshot> {
+        self.create_child(
+            parent_thread_id,
+            kind,
+            title,
+            initial_prompt,
+            ForkFiles::Current,
+            ForkConversation::Inherit,
+            None,
+        )
+        .await
+    }
+
+    /// Create a subthread and start its first turn as its kind requires.
+    pub(super) async fn create_child(
+        &self,
+        parent_thread_id: ThreadId,
+        kind: SubthreadKind,
+        title: Option<String>,
+        initial_prompt: Option<String>,
+        files: ForkFiles,
+        conversation: ForkConversation,
+        forked_at: Option<(MessageId, Option<trama_domain::ids::CheckpointId>)>,
+    ) -> Result<ThreadSnapshot> {
+        let parent = self
+            .db
+            .get_thread(&parent_thread_id)
+            .await?
+            .ok_or_else(|| DaemonError::NotFound(format!("thread {parent_thread_id}")))?;
+        let parent_title = parent.title.clone().unwrap_or_default();
+        let title = match title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            Some(title) => validate_label(title, "subthread title")?,
+            None => default_subthread_title(kind, &parent_title),
+        };
+        // A fork at a past message reads only its checkpoint, so a running
+        // parent turn does not block it.
+        let allow_parent_turn = matches!(files, ForkFiles::AtCheckpoint(_));
+        let child = self
+            .fork_child(
+                &parent,
+                ForkRequest {
+                    kind: kind.thread_kind(),
+                    title,
+                    files,
+                    conversation,
+                    allow_parent_turn,
+                    spawned_by: None,
+                    forked_at,
+                },
+            )
+            .await?;
         let first_prompt = match kind {
             SubthreadKind::Plain => initial_prompt.filter(|text| !text.trim().is_empty()),
             SubthreadKind::Review => Some(review_prompt(
                 &parent_title,
-                &parent_checkouts,
+                &child.parent_checkouts,
                 initial_prompt.as_deref(),
             )),
             SubthreadKind::Land => {
-                let copies: Vec<_> = copies
-                    .iter()
-                    .map(|(_, _, copy, _)| copy.path.clone())
-                    .collect();
+                let copies = child.copy_paths.clone();
                 let skill = tokio::task::spawn_blocking(move || {
                     copies.iter().find_map(|p| find_land_skill(p))
                 })
@@ -357,22 +605,22 @@ impl SessionManager {
                 .flatten();
                 Some(land_prompt(
                     &parent_title,
-                    &parent_checkouts,
+                    &child.parent_checkouts,
                     skill.as_deref(),
                     initial_prompt.as_deref(),
                 ))
             }
         };
         if let Some(text) = first_prompt {
-            if let Err(error) = self.send_prompt(thread.id.clone(), text).await {
+            if let Err(error) = self.send_prompt(child.thread.id.clone(), text).await {
                 self.append_system_notice(
-                    &thread.id,
+                    &child.thread.id,
                     format!("The subthread's first prompt was not run: {error}"),
                 )
                 .await;
             }
         }
-        Ok(snapshot)
+        Ok(child.snapshot)
     }
 
     pub async fn list_subthreads(
@@ -453,6 +701,17 @@ impl SessionManager {
         &self,
         subthread_id: &ThreadId,
     ) -> Result<(ThreadId, Vec<RepoPullResult>)> {
+        self.pull_changes_with(subthread_id, false).await
+    }
+
+    /// [`Self::pull_changes`]. With `into_running_parent`, a parent in an
+    /// agent turn is written without a reservation: its agent is blocked in
+    /// a Trama tool call waiting for this subagent.
+    pub(super) async fn pull_changes_with(
+        &self,
+        subthread_id: &ThreadId,
+        into_running_parent: bool,
+    ) -> Result<(ThreadId, Vec<RepoPullResult>)> {
         let sub = self
             .db
             .get_thread(subthread_id)
@@ -471,7 +730,18 @@ impl SessionManager {
             .get_thread(&parent_id)
             .await?
             .ok_or_else(|| DaemonError::NotFound(format!("thread {parent_id}")))?;
-        let _reservation = self.reserve_checkouts(&[parent.id.clone(), sub.id.clone()])?;
+        let parent_in_turn = into_running_parent
+            && self
+                .lock()
+                .threads
+                .get(&parent.id)
+                .is_some_and(|thread| thread.reservation == Some(Reservation::Turn));
+        let reserved = if parent_in_turn {
+            vec![sub.id.clone()]
+        } else {
+            vec![parent.id.clone(), sub.id.clone()]
+        };
+        let _reservation = self.reserve_checkouts(&reserved)?;
         let sub_checkouts = self.resolve_checkouts(&sub).await?;
         let parent_checkouts = self.resolve_checkouts(&parent).await?;
         let mut requests = Vec::with_capacity(sub_checkouts.len());
@@ -666,6 +936,11 @@ impl SessionManager {
         let Ok(Some(thread)) = self.db.get_thread(thread_id).await else {
             return;
         };
+        // A scout shares its parent's checkouts; the parent's last-turn
+        // baseline must not move under it.
+        if !matches!(self.checkout_owner(&thread).await, Ok(owner) if owner.id == thread.id) {
+            return;
+        }
         // `send_prompt` validated these checkouts (session_config) before the
         // turn was accepted, so only their recorded paths are needed here.
         let mut paths = Vec::with_capacity(thread.repo_attachments.len());
@@ -776,7 +1051,7 @@ fn remove_fresh_copies(
     }
 }
 
-fn system_message(thread_id: &ThreadId, text: String) -> Message {
+pub(super) fn system_message(thread_id: &ThreadId, text: String) -> Message {
     Message {
         id: MessageId::generate(),
         thread_id: thread_id.clone(),
@@ -785,6 +1060,8 @@ fn system_message(thread_id: &ThreadId, text: String) -> Message {
         role: Role::System,
         content: vec![ContentBlock::Text { text }],
         created_at: Utc::now(),
+        claude_uuid: None,
+        annotation: None,
     }
 }
 
@@ -830,7 +1107,7 @@ fn repo_lines(checkouts: &[ResolvedCheckout]) -> String {
         .join("\n")
 }
 
-fn review_prompt(
+pub(super) fn review_prompt(
     parent_title: &str,
     checkouts: &[ResolvedCheckout],
     extra: Option<&str>,
@@ -1201,12 +1478,17 @@ mod tests {
             "one\nTWO\nthree\n"
         );
 
-        // No nesting.
+        // Nesting is allowed; the grandchild copies the subthread's state.
         let nested = mgr
             .create_subthread(sub.id.clone(), SubthreadKind::Plain, None, None)
             .await
-            .unwrap_err();
-        assert_eq!(nested.code(), "invalid");
+            .unwrap();
+        assert_eq!(nested.parent_thread_id.as_ref(), Some(&sub.id));
+        assert_eq!(nested.depth, 2);
+        assert_eq!(
+            std::fs::read_to_string(checkout(&mgr, &nested.id).await.join("same.txt")).unwrap(),
+            "sub only\n"
+        );
 
         // Subscribing replays the inherited parent conversation first.
         let (tx, mut rx) = mpsc::unbounded_channel();

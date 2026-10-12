@@ -64,6 +64,9 @@ pub struct AssistantLine {
     pub session_id: Option<String>,
     #[serde(default)]
     pub parent_tool_use_id: Option<String>,
+    /// The entry's uuid in the session transcript (`uuid` in the JSONL).
+    #[serde(default)]
+    pub uuid: Option<String>,
     #[serde(default)]
     pub message: ClaudeMessage,
 }

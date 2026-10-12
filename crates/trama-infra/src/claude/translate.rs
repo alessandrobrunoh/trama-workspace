@@ -192,6 +192,13 @@ fn translate_assistant(
         events.push(usage_event(usage, state));
     }
 
+    // Main-chain entries only: a forked conversation is cut after one.
+    if asst.parent_tool_use_id.as_deref().is_none_or(str::is_empty) {
+        if let Some(uuid) = asst.uuid.as_ref().filter(|uuid| !uuid.is_empty()) {
+            events.push(AgentEvent::TranscriptEntry { uuid: uuid.clone() });
+        }
+    }
+
     state.streamed_text = false;
     state.streamed_thinking = false;
 }
@@ -336,6 +343,23 @@ mod tests {
         assert!(message.starts_with("Claude Code is not logged in"));
         assert!(message.contains("TRAMA_DATA_DIR"));
         assert!(message.ends_with("Claude Code said: Not logged in · Please run /login"));
+    }
+
+    #[test]
+    fn top_level_assistant_uuid_becomes_a_transcript_entry() {
+        let ndjson = r#"
+{"type":"assistant","uuid":"u-main","session_id":"s","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}
+{"type":"assistant","uuid":"u-side","parent_tool_use_id":"toolu_task","message":{"role":"assistant","content":[{"type":"text","text":"sub"}]}}
+"#;
+        let lines = parse_ndjson(ndjson).unwrap();
+        let entries: Vec<_> = translate_lines(&lines)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::TranscriptEntry { uuid } => Some(uuid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(entries, vec!["u-main".to_string()]);
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub mod ids;
 pub mod message;
 pub mod revision;
 pub mod runtime;
+pub mod subagent;
 pub mod subthread;
 pub mod thread;
 pub mod workspace;

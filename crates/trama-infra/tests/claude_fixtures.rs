@@ -52,6 +52,7 @@ fn simple_text_turn() {
                     "cache_write_tokens": 0
                 }
             },
+            { "type": "transcript_entry", "uuid": "u-1" },
             {
                 "type": "usage_reported",
                 "report": {

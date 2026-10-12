@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ThreadKind {
     Top,
-    /// Plain subthread of a top-level thread.
+    /// Plain subthread (also a subagent spawned through Trama's MCP tools).
     Sub,
     /// Subthread that writes a change guide for, then reviews, its parent.
     Review,
@@ -17,8 +17,8 @@ pub enum ThreadKind {
 }
 
 impl ThreadKind {
-    /// Kinds that are children of a top-level thread. Subthreads cannot have
-    /// subthreads of their own.
+    /// Kinds that are children of another thread. Any thread (subthreads
+    /// included) can have children, at any depth.
     pub fn is_subthread(self) -> bool {
         matches!(self, Self::Sub | Self::Review | Self::Land)
     }
@@ -85,20 +85,16 @@ impl Thread {
         }
     }
 
-    /// A child of a top-level `parent`. The attachment list is copied from
-    /// the parent (not re-read from the workspace); checkout metadata is left
-    /// empty because the subthread gets its own managed copies. Nesting is
-    /// rejected: a subthread cannot have subthreads.
+    /// A child of `parent`, which may itself be a subthread (nesting has no
+    /// depth limit). The attachment list is copied from the parent (not
+    /// re-read from the workspace); checkout metadata is left empty because
+    /// the subthread gets its own managed copies. The child gets a fresh id,
+    /// so the parent chain can never form a cycle.
     pub fn new_subthread(parent: &Thread, kind: ThreadKind, title: Option<String>) -> Result<Self> {
         if !kind.is_subthread() {
             return Err(DomainError::Invalid(format!(
                 "{kind:?} is not a subthread kind"
             )));
-        }
-        if parent.parent_thread_id.is_some() || parent.kind != ThreadKind::Top {
-            return Err(DomainError::Invalid(
-                "subthreads cannot have subthreads; create it from the top-level thread".into(),
-            ));
         }
         Ok(Self {
             id: ThreadId::generate(),
@@ -195,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn subthreads_copy_parent_attachments_and_cannot_nest() {
+    fn subthreads_copy_parent_attachments_and_nest_at_any_depth() {
         let workspace = Workspace::new("demo");
         let repo = Repository::new(None, None, None);
         let memberships = vec![membership(&workspace, repo.id.clone(), true)];
@@ -213,7 +209,14 @@ mod tests {
         assert!(review.repo_attachments[0].checkout_id.is_none());
         assert!(review.repo_attachments[0].base_revision.is_none());
 
-        assert!(Thread::new_subthread(&review, ThreadKind::Sub, None).is_err());
+        let mut chain = vec![parent.clone(), review.clone()];
+        for depth in 2..6 {
+            let child =
+                Thread::new_subthread(chain.last().unwrap(), ThreadKind::Sub, None).unwrap();
+            assert_eq!(child.parent_thread_id.as_ref(), Some(&chain[depth - 1].id));
+            assert!(chain.iter().all(|ancestor| ancestor.id != child.id));
+            chain.push(child);
+        }
         assert!(Thread::new_subthread(&parent, ThreadKind::Top, None).is_err());
         assert!(Thread::new_subthread(&parent, ThreadKind::Fork, None).is_err());
         assert!(ThreadKind::Land.is_subthread());

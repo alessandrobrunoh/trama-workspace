@@ -1,4 +1,4 @@
-use crate::ids::{CheckpointId, RepositoryId, ThreadId};
+use crate::ids::{CheckpointId, MessageId, RepositoryId, ThreadId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -37,4 +37,7 @@ pub struct Checkpoint {
     pub label: CheckpointLabel,
     pub repo_states: Vec<RepoState>,
     pub created_at: DateTime<Utc>,
+    /// For turn checkpoints: the assistant message that ended the turn.
+    #[serde(default)]
+    pub message_id: Option<MessageId>,
 }

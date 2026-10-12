@@ -56,8 +56,24 @@ fn base_name(name: &str) -> &str {
     }
 }
 
+/// MCP server names of Trama's own tools: the daemon's `trama-daemon mcp`
+/// helper registers `trama-workspace`; `trama` is accepted as well.
+const TRAMA_MCP_SERVERS: &[&str] = &["trama-workspace", "trama"];
+
+/// `spawn_subagent` / `send_to_thread` of a Trama MCP server.
+fn is_trama_subthread_tool(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("mcp__") else {
+        return false;
+    };
+    TRAMA_MCP_SERVERS.iter().any(|server| {
+        rest.strip_prefix(server)
+            .and_then(|tool| tool.strip_prefix("__"))
+            .is_some_and(|tool| matches!(tool, "spawn_subagent" | "send_to_thread"))
+    })
+}
+
 pub fn tool_kind(name: &str) -> ToolKind {
-    if name.starts_with("mcp__") && matches!(base_name(name), "spawn_subagent" | "send_to_thread") {
+    if is_trama_subthread_tool(name) {
         return ToolKind::Subthread;
     }
     match name {
@@ -1697,6 +1713,19 @@ mod tests {
         assert_eq!(tool_kind("Bash"), ToolKind::Command);
         assert_eq!(tool_kind("mcp__trama__spawn_subagent"), ToolKind::Subthread);
         assert_eq!(tool_kind("mcp__trama__send_to_thread"), ToolKind::Subthread);
+        assert_eq!(
+            tool_kind("mcp__trama-workspace__spawn_subagent"),
+            ToolKind::Subthread
+        );
+        assert_eq!(
+            tool_kind("mcp__trama-workspace__send_to_thread"),
+            ToolKind::Subthread
+        );
+        assert_ne!(tool_kind("mcp__other__spawn_subagent"), ToolKind::Subthread);
+        assert_ne!(
+            tool_kind("mcp__trama-workspace__list_threads"),
+            ToolKind::Subthread
+        );
         assert_eq!(tool_kind("Grep"), ToolKind::Minor(Activity::Search));
         assert_eq!(tool_kind("Task"), ToolKind::Minor(Activity::Subagent));
         assert_eq!(
@@ -1951,6 +1980,18 @@ mod tests {
         );
         assert_eq!(unknown.thread, None);
         assert_eq!(unknown.title, "Elsewhere");
+
+        // The daemon's own MCP server (`trama-workspace`) answers in prose.
+        let daemon = subthread_link(
+            "mcp__trama-workspace__spawn_subagent",
+            &json!({"title": "Scout the parser", "profile": "scout"}),
+            Some(
+                &json!([{"type": "text", "text": "Spawned scout subagent thread 01ABC (Scout the parser). It runs on its own."}]),
+            ),
+            &threads,
+        );
+        assert_eq!(daemon.thread, Some(ThreadId::from("01ABC")));
+        assert!(!daemon.message);
     }
 
     #[test]

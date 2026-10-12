@@ -2,9 +2,12 @@ use crate::agent::ApprovalDecision;
 use crate::checkpoint::Checkpoint;
 use crate::checkpoint::RepoState;
 use crate::comment::Comment;
-use crate::ids::{AgentSessionId, CommentId, MessageId, RepositoryId, ThreadId, WorkspaceId};
+use crate::ids::{
+    AgentSessionId, CheckpointId, CommentId, MessageId, RepositoryId, ThreadId, WorkspaceId,
+};
 use crate::message::{Actor, Message};
 use crate::revision::FileRevision;
+use crate::subagent::{SubagentProfile, SubagentStatus};
 use crate::subthread::{LandOutcome, RepoForkPoint, RepoPullResult, ReviewVerdict};
 use crate::thread::Thread;
 use crate::workspace::Workspace;
@@ -192,6 +195,38 @@ pub enum DomainEvent {
         outcome: LandOutcome,
         summary: String,
     },
+    /// The thread `thread_id` was spawned by its parent's agent through the
+    /// Trama MCP tools. Recorded on the child aggregate after its fork.
+    SubagentSpawned {
+        thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        profile: SubagentProfile,
+        tool_use_id: Option<String>,
+    },
+    /// A subagent's task changed state. Recorded on the child aggregate.
+    SubagentStatusChanged {
+        thread_id: ThreadId,
+        status: SubagentStatus,
+        detail: Option<String>,
+    },
+    /// One thread's agent sent a message to another thread's agent.
+    /// Recorded on the sender; the receiver gets the prompt as a
+    /// `MessageAdded` on its own aggregate when it is delivered.
+    AgentMessageSent {
+        from_thread_id: ThreadId,
+        to_thread_id: ThreadId,
+        message_id: MessageId,
+    },
+    /// A subthread was forked at a message of its parent rather than at the
+    /// parent's current state: its conversation ends with `at_message_id`
+    /// and its files are the parent's turn checkpoint `checkpoint_id`.
+    /// Recorded on the child aggregate after `SubthreadForked`.
+    ThreadForkedAtMessage {
+        thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        at_message_id: MessageId,
+        checkpoint_id: Option<CheckpointId>,
+    },
 }
 
 impl DomainEvent {
@@ -217,6 +252,10 @@ impl DomainEvent {
             Self::ReviewVerdictRecorded { .. } => "review.verdict_recorded",
             Self::ChangesPulled { .. } => "changes.pulled",
             Self::LandResultRecorded { .. } => "land.result_recorded",
+            Self::SubagentSpawned { .. } => "subagent.spawned",
+            Self::SubagentStatusChanged { .. } => "subagent.status_changed",
+            Self::AgentMessageSent { .. } => "agent.message_sent",
+            Self::ThreadForkedAtMessage { .. } => "thread.forked_at_message",
         }
     }
 }
@@ -327,6 +366,7 @@ mod tests {
                 working_changes: WorkingChanges::Clean,
             }],
             created_at: Utc::now(),
+            message_id: Some(MessageId::from("m9")),
         }
     }
 
@@ -529,13 +569,51 @@ mod tests {
             ),
             (
                 DomainEvent::LandResultRecorded {
-                    land_thread_id: sub,
+                    land_thread_id: sub.clone(),
                     parent_thread_id: th.id.clone(),
                     outcome: LandOutcome::Landed,
                     summary: "merged".into(),
                 },
-                Aggregate::Thread { id: th.id },
+                Aggregate::Thread { id: th.id.clone() },
                 "land.result_recorded",
+            ),
+            (
+                DomainEvent::SubagentSpawned {
+                    thread_id: sub.clone(),
+                    parent_thread_id: th.id.clone(),
+                    profile: SubagentProfile::Worker,
+                    tool_use_id: Some("toolu_1".into()),
+                },
+                Aggregate::Thread { id: sub.clone() },
+                "subagent.spawned",
+            ),
+            (
+                DomainEvent::SubagentStatusChanged {
+                    thread_id: sub.clone(),
+                    status: SubagentStatus::WaitingToSync,
+                    detail: None,
+                },
+                Aggregate::Thread { id: sub.clone() },
+                "subagent.status_changed",
+            ),
+            (
+                DomainEvent::AgentMessageSent {
+                    from_thread_id: th.id.clone(),
+                    to_thread_id: sub.clone(),
+                    message_id: MessageId::from("m5"),
+                },
+                Aggregate::Thread { id: th.id.clone() },
+                "agent.message_sent",
+            ),
+            (
+                DomainEvent::ThreadForkedAtMessage {
+                    thread_id: sub.clone(),
+                    parent_thread_id: th.id.clone(),
+                    at_message_id: MessageId::from("m4"),
+                    checkpoint_id: Some(CheckpointId::from("c1")),
+                },
+                Aggregate::Thread { id: sub },
+                "thread.forked_at_message",
             ),
         ]
     }

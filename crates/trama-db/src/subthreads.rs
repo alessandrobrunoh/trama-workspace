@@ -46,13 +46,31 @@ impl TramaDb {
         locations: &[crate::CheckoutLocation],
         events: &[EventRecord],
     ) -> Result<()> {
+        self.create_subthread_with(thread, fork, locations, events, None)
+            .await
+    }
+
+    /// [`Self::create_subthread`], also recording the child as a subagent
+    /// in the same transaction when `subagent` is set.
+    pub async fn create_subthread_with(
+        &self,
+        thread: &Thread,
+        fork: &SubthreadFork,
+        locations: &[crate::CheckoutLocation],
+        events: &[EventRecord],
+        subagent: Option<&crate::SubagentRecord>,
+    ) -> Result<()> {
         let thread = thread.clone();
         let fork = fork.clone();
         let locations = locations.to_vec();
         let events = events.to_vec();
+        let subagent = subagent.cloned();
         self.blocking_mut(move |conn| {
             let tx = conn.transaction().map_err(sql_err)?;
             insert_thread(&tx, &thread)?;
+            if let Some(subagent) = &subagent {
+                crate::agents::insert_subagent(&tx, subagent)?;
+            }
             crate::checkouts::insert_locations(
                 &tx,
                 &thread.id.to_string(),

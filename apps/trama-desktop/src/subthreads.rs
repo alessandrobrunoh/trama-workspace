@@ -683,6 +683,8 @@ mod tests {
             kind,
             review_verdict: None,
             model: None,
+            depth: 0,
+            subagent: None,
         }
     }
 

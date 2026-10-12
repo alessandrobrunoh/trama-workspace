@@ -1,9 +1,15 @@
 //! Persistent session manager: TramaDB + injected `AgentAdapter`.
 
+mod agents;
+#[cfg(test)]
+mod agents_tests;
 mod comments;
 #[cfg(test)]
 mod composer_tests;
 mod context;
+mod forks;
+#[cfg(test)]
+mod forks_tests;
 #[cfg(test)]
 mod setup_tests;
 mod skills;
@@ -12,6 +18,8 @@ mod terminal;
 
 pub(crate) use context::model_choices;
 pub use context::{NoCollaborators, PeopleSource, Person, PromptContext};
+
+pub use agents::SubagentSettings;
 
 use crate::approval::{self, ApprovalHookSettings, HookDecision};
 
@@ -78,6 +86,8 @@ struct ThreadRuntime {
     /// User prompt of the in-flight turn that delivered comments; taken when
     /// the turn ends to link (or return) them.
     comments_delivered_with: Option<MessageId>,
+    /// Transcript uuid of the in-flight turn's last assistant entry.
+    last_claude_uuid: Option<String>,
 }
 
 /// A permission request blocking a Claude Code hook process. The hook's
@@ -160,6 +170,10 @@ pub struct SessionManager {
     approval_hook: Option<Arc<ApprovalHookSettings>>,
     /// Mentions, skills, model selection and terminals.
     composer: Arc<context::ComposerState>,
+    /// Subagent limits, the Trama MCP server, and where transcripts live.
+    agents_config: Arc<agents::AgentsConfig>,
+    /// Subagent tasks, MCP tokens, waiters and agent-message mailboxes.
+    agents: Arc<agents::AgentsRuntime>,
 }
 
 impl SessionManager {
@@ -174,9 +188,12 @@ impl SessionManager {
         adapter: Arc<dyn AgentAdapter>,
         root: impl Into<PathBuf>,
     ) -> Self {
+        let root = root.into();
         Self {
             db,
             adapter,
+            agents_config: Arc::new(agents::AgentsConfig::new(root.clone())),
+            agents: Arc::default(),
             checkout_manager: trama_infra::checkout::CheckoutManager::new(root),
             inner: Arc::new(Mutex::new(Inner {
                 next_sub: 1,
@@ -294,8 +311,11 @@ impl SessionManager {
             Some(workspace) => self.db.list_memberships(workspace).await?,
             None => Vec::new(),
         };
+        // A scout shows (and works in) its parent's checkouts.
+        let thread = self.checkout_owner(&thread).await?;
+        let thread_id = &thread.id;
         let mut rows = Vec::with_capacity(thread.repo_attachments.len());
-        for attachment in thread.repo_attachments {
+        for attachment in thread.repo_attachments.clone() {
             let repository = self
                 .db
                 .get_repository(&attachment.repository_id)
@@ -759,6 +779,8 @@ impl SessionManager {
                 text: MIGRATION_NOTICE.into(),
             }],
             created_at: Utc::now(),
+            claude_uuid: None,
+            annotation: None,
         };
         let event = EventRecord::new(
             Aggregate::Thread {
@@ -955,6 +977,20 @@ impl SessionManager {
         comments_only: bool,
         attached: PromptContext,
     ) -> Result<Message> {
+        self.start_turn_with(thread_id, text, comments_only, attached, None)
+            .await
+    }
+
+    /// [`Self::start_turn`]; `origin` attributes the stored prompt to another
+    /// thread's agent instead of the local user.
+    async fn start_turn_with(
+        &self,
+        thread_id: ThreadId,
+        text: String,
+        comments_only: bool,
+        attached: PromptContext,
+        origin: Option<agents::PromptOrigin>,
+    ) -> Result<Message> {
         if self.db.get_thread(&thread_id).await?.is_none() {
             return Err(DaemonError::NotFound(format!("thread {thread_id}")));
         }
@@ -968,6 +1004,7 @@ impl SessionManager {
             thread.interrupt_requested = false;
             thread.acc_text.clear();
             thread.comments_delivered_with = None;
+            thread.last_claude_uuid = None;
         }
         // Reject a prompt that cannot run before it is stored, so a failed send
         // is not replayed or started later without another user action. The
@@ -1009,7 +1046,12 @@ impl SessionManager {
             delivery.as_ref().map(|delivery| delivery.block.as_str()),
             &text,
         );
-        let message = Message::new_user(thread_id.clone(), comments::LOCAL_USER, prompt.clone());
+        let mut message =
+            Message::new_user(thread_id.clone(), comments::LOCAL_USER, prompt.clone());
+        if let Some(origin) = origin {
+            message.actor = origin.actor;
+            message.annotation = Some(origin.annotation);
+        }
         let delivered_ids = match &delivery {
             None => {
                 if let Err(err) = self.db.append_message(&message).await {
@@ -1495,6 +1537,8 @@ impl SessionManager {
             role: Role::System,
             content: vec![ContentBlock::Text { text }],
             created_at: Utc::now(),
+            claude_uuid: None,
+            annotation: None,
         };
         if let Err(err) = self.db.append_message(&message).await {
             crate::log::warn(format!("failed to persist system message: {err}"));
@@ -1563,6 +1607,10 @@ impl SessionManager {
                 message: failure.error.to_string(),
             },
         );
+        self.after_turn(
+            thread_id,
+            agents::TurnEnd::Failed(failure.error.to_string()),
+        );
     }
 
     async fn run_turn(
@@ -1597,6 +1645,10 @@ impl SessionManager {
             let _ = self.adapter.interrupt(&session).await;
             self.return_undelivered_comments(&thread_id).await;
             self.release_turn(&thread_id);
+            self.after_turn(
+                &thread_id,
+                agents::TurnEnd::Failed("interrupted before it started".into()),
+            );
             return Ok(());
         }
         let session_id = session.id.clone();
@@ -1646,11 +1698,13 @@ impl SessionManager {
         let mut config = self.session_config(thread_id).await?;
         let started_model = config.model.clone();
         let token = self.attach_approval_hook(thread_id, &mut config);
+        self.attach_trama_tools(thread_id, &mut config).await;
         let (tx, rx) = async_channel::unbounded();
         let session = match self.adapter.start(config, tx).await {
             Ok(session) => session,
             Err(err) => {
                 self.drop_approval_token(thread_id, token);
+                self.drop_trama_tools(thread_id);
                 return Err(DaemonError::Agent(format!(
                     "{err}. Install Claude Code or set CLAUDE_BIN to the `claude` binary."
                 )));
@@ -1662,6 +1716,7 @@ impl SessionManager {
             .await
         {
             self.drop_approval_token(thread_id, token);
+            self.drop_trama_tools(thread_id);
             return Err(err.into());
         }
         {
@@ -1700,9 +1755,11 @@ impl SessionManager {
                     .into(),
             ));
         }
-        let mut paths = Vec::with_capacity(thread.repo_attachments.len());
+        // A scout works in its parent's checkouts.
+        let owner = self.checkout_owner(&thread).await?;
+        let mut paths = Vec::with_capacity(owner.repo_attachments.len());
         let mut validations = Vec::new();
-        for attachment in &thread.repo_attachments {
+        for attachment in &owner.repo_attachments {
             let repository = self
                 .db
                 .get_repository(&attachment.repository_id)
@@ -1728,7 +1785,7 @@ impl SessionManager {
                         DaemonError::Invalid("managed checkout has no recorded base commit".into())
                     })?;
                     let (path, repo_local) =
-                        self.checkout_path(&thread.id, attachment, &source).await?;
+                        self.checkout_path(&owner.id, attachment, &source).await?;
                     validations.push((
                         source.clone(),
                         path.clone(),
@@ -1825,6 +1882,13 @@ impl SessionManager {
     }
 
     async fn on_agent_event(&self, thread_id: &ThreadId, event: AgentEvent) {
+        if let AgentEvent::TranscriptEntry { uuid } = event {
+            // Kept for the turn's stored answer (fork point); not for clients.
+            if let Some(thread) = self.lock().threads.get_mut(thread_id) {
+                thread.last_claude_uuid = Some(uuid);
+            }
+            return;
+        }
         if let AgentEvent::SessionStarted {
             external_session_id,
             model,
@@ -1963,6 +2027,7 @@ impl SessionManager {
             text.push_str(&partial);
         }
         self.append_system_notice(thread_id, text).await;
+        self.after_turn(thread_id, agents::TurnEnd::Failed(failure.to_owned()));
     }
 
     async fn finish_turn(
@@ -1971,27 +2036,33 @@ impl SessionManager {
         num_turns: u32,
         cost_usd_micros: Option<u64>,
     ) {
-        let (text, session) = {
+        let (text, session, claude_uuid) = {
             let mut inner = self.lock();
             match inner.threads.get_mut(thread_id) {
                 Some(thread) => (
                     std::mem::take(&mut thread.acc_text),
                     thread.live_session.clone(),
+                    thread.last_claude_uuid.take(),
                 ),
                 None => return,
             }
         };
         let Some(session) = session else {
             self.release_turn(thread_id);
+            self.after_turn(
+                thread_id,
+                agents::TurnEnd::Failed("the agent session ended before the turn".into()),
+            );
             return;
         };
         let land_result = subthreads::parse_land_result(&text);
 
-        let assistant = Message::new_assistant(
+        let mut assistant = Message::new_assistant(
             thread_id.clone(),
             session.id.clone(),
             vec![ContentBlock::Text { text }],
         );
+        assistant.claude_uuid = claude_uuid;
         let persisted = self.db.append_message(&assistant).await;
         if let Err(err) = &persisted {
             crate::log::warn(format!("failed to persist assistant message: {err}"));
@@ -2011,6 +2082,10 @@ impl SessionManager {
         }
 
         let answer_id = assistant.id.clone();
+        if persisted.is_ok() {
+            // Before the turn is released: no other turn can edit meanwhile.
+            self.record_turn_checkpoint(thread_id, &answer_id).await;
+        }
         self.broadcast(
             thread_id,
             DaemonMessage::MessageAppended {
@@ -2066,6 +2141,7 @@ impl SessionManager {
         if let Some((outcome, summary)) = land_result {
             self.record_land_result(thread_id, outcome, summary).await;
         }
+        self.after_turn(thread_id, agents::TurnEnd::Completed);
     }
 
     /// The adapter event stream closed. If a turn was still in flight it never
@@ -2105,6 +2181,7 @@ impl SessionManager {
             false,
         )
         .await;
+        self.drop_trama_tools(thread_id);
         if !in_flight {
             return;
         }
@@ -2123,6 +2200,10 @@ impl SessionManager {
                     message: "The agent session ended unexpectedly.".into(),
                 },
             },
+        );
+        self.after_turn(
+            thread_id,
+            agents::TurnEnd::Failed("the agent session ended unexpectedly".into()),
         );
     }
 }
@@ -2341,6 +2422,8 @@ fn thread_snapshot(thread: &Thread) -> ThreadSnapshot {
         kind: thread.kind,
         review_verdict: None,
         model: None,
+        depth: 0,
+        subagent: None,
     }
 }
 

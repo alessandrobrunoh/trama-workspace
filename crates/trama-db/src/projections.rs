@@ -219,25 +219,8 @@ impl TramaDb {
 
     pub async fn append_message(&self, message: &Message) -> Result<()> {
         let message = message.clone();
-        self.blocking(move |conn| {
-            conn.execute(
-                "INSERT INTO messages
-                    (id, thread_id, parent_id, actor_json, role, content_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    message.id.to_string(),
-                    message.thread_id.to_string(),
-                    message.parent_id.as_ref().map(|id| id.to_string()),
-                    to_json(&message.actor)?,
-                    enum_text(&message.role)?,
-                    to_json(&message.content)?,
-                    rfc3339(message.created_at),
-                ],
-            )
-            .map_err(sql_err)?;
-            Ok(())
-        })
-        .await
+        self.blocking(move |conn| insert_message(conn, &message))
+            .await
     }
 
     pub async fn list_messages_by_thread(&self, thread_id: &ThreadId) -> Result<Vec<Message>> {
@@ -245,7 +228,8 @@ impl TramaDb {
         self.blocking(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, thread_id, parent_id, actor_json, role, content_json, created_at
+                    "SELECT id, thread_id, parent_id, actor_json, role, content_json, created_at,
+                            claude_uuid, annotation_json
                      FROM messages
                      WHERE thread_id = ?1
                      ORDER BY created_at ASC, id ASC",
@@ -269,7 +253,7 @@ impl TramaDb {
             let mut stmt = conn
                 .prepare(
                     "SELECT m.id, m.thread_id, m.parent_id, m.actor_json, m.role,
-                            m.content_json, m.created_at
+                            m.content_json, m.created_at, m.claude_uuid, m.annotation_json
                      FROM messages_fts
                      JOIN messages m ON m.id = messages_fts.message_id
                      WHERE messages_fts MATCH ?1
@@ -425,9 +409,13 @@ type MessageTuple = (
     String,
     String,
     String,
+    Option<String>,
+    Option<String>,
 );
 
-fn message_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageTuple> {
+/// Columns: id, thread_id, parent_id, actor_json, role, content_json,
+/// created_at, claude_uuid, annotation_json.
+pub(crate) fn message_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageTuple> {
     Ok((
         row.get(0)?,
         row.get(1)?,
@@ -436,10 +424,12 @@ fn message_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageTuple> {
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
     ))
 }
 
-fn rows_to_messages(
+pub(crate) fn rows_to_messages(
     rows: rusqlite::MappedRows<
         '_,
         impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<MessageTuple>,
@@ -447,8 +437,17 @@ fn rows_to_messages(
 ) -> Result<Vec<Message>> {
     let mut out = Vec::new();
     for row in rows {
-        let (id, thread_id, parent_id, actor_json, role, content_json, created_at) =
-            row.map_err(sql_err)?;
+        let (
+            id,
+            thread_id,
+            parent_id,
+            actor_json,
+            role,
+            content_json,
+            created_at,
+            claude_uuid,
+            annotation_json,
+        ) = row.map_err(sql_err)?;
         out.push(Message {
             id: MessageId::from(id),
             thread_id: ThreadId::from(thread_id),
@@ -457,6 +456,9 @@ fn rows_to_messages(
             role: enum_from_text(&role)?,
             content: from_json(&content_json)?,
             created_at: parse_rfc3339(&created_at)?,
+            claude_uuid,
+            // An annotation this build cannot read is dropped, not fatal.
+            annotation: annotation_json.and_then(|raw| from_json(&raw).ok()),
         });
     }
     Ok(out)
@@ -1034,11 +1036,16 @@ fn fs_canonicalize_exists(path: &Path) -> Option<PathBuf> {
     std::fs::canonicalize(path).ok()
 }
 
-pub(crate) fn insert_message(tx: &rusqlite::Transaction<'_>, message: &Message) -> Result<()> {
-    tx.execute(
+pub(crate) fn insert_message(conn: &rusqlite::Connection, message: &Message) -> Result<()> {
+    let annotation = match &message.annotation {
+        Some(annotation) => Some(to_json(annotation)?),
+        None => None,
+    };
+    conn.execute(
         "INSERT INTO messages
-            (id, thread_id, parent_id, actor_json, role, content_json, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (id, thread_id, parent_id, actor_json, role, content_json, created_at,
+             claude_uuid, annotation_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             message.id.to_string(),
             message.thread_id.to_string(),
@@ -1047,6 +1054,8 @@ pub(crate) fn insert_message(tx: &rusqlite::Transaction<'_>, message: &Message) 
             enum_text(&message.role)?,
             to_json(&message.content)?,
             rfc3339(message.created_at),
+            message.claude_uuid,
+            annotation,
         ],
     )
     .map_err(sql_err)?;

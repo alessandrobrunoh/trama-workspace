@@ -26,13 +26,17 @@
 //! ([`ClientMessage::ApprovalHook`], [`DaemonMessage::ApprovalHookDecision`])
 //! and the `session_info` / `approval_resolved` agent events. **5** added
 //! subthreads, changes, pull changes, review verdicts and land results. **6**
-//! adds anchored comments (create, list, reply, resolve, reopen, delete, send)
-//! and delivers pending comments with `SendPrompt`. **7** adds the composer
+//! added anchored comments (create, list, reply, resolve, reopen, delete, send)
+//! and delivers pending comments with `SendPrompt`. **7** added the composer
 //! backend: `@` mentionables, `/` skills, per-thread model selection, inline
-//! terminals, and `SendPrompt.mentions` / `SendPrompt.terminals`. **8** adds
+//! terminals, and `SendPrompt.mentions` / `SendPrompt.terminals`. **8** added
 //! shared threads through a `trama-collab` service (connect, share, join, list,
-//! drafts, presence, mirrored remote activity). Each bump is transport-only.
-//! Persisted domain ids and SQLite rows are not rewritten.
+//! drafts, presence, mirrored remote activity). **9** adds Trama subagents (the
+//! MCP helper's [`ClientMessage::McpToolCall`] /
+//! [`DaemonMessage::McpToolResult`], [`DaemonMessage::SubagentStatusChanged`],
+//! `depth` and `subagent` in thread snapshots, message annotations), nesting
+//! at any depth, and [`ClientMessage::ForkThread`] at a message. Each bump is
+//! transport-only. Persisted domain ids and SQLite rows are not rewritten.
 //!
 //! A version mismatch fails the handshake (`Welcome.accepted = false`). Extra object
 //! fields inside a known payload are ignored (serde default). Bump [`PROTOCOL_VERSION`]
@@ -45,7 +49,8 @@ use std::path::PathBuf;
 pub use trama_domain::agent::{AgentEvent, ApprovalDecision, BillingSource, UsageReport};
 pub use trama_domain::comment::{AnchorStatus, CodeAnchor, CommentDelivery, CommentTarget};
 pub use trama_domain::ids::{CommentId, MessageId, RepositoryId, ThreadId, WorkspaceId};
-pub use trama_domain::message::{Actor, Message};
+pub use trama_domain::message::{Actor, Message, MessageAnnotation};
+pub use trama_domain::subagent::{SpawnedBy, SubagentProfile, SubagentStatus};
 pub use trama_domain::subthread::{
     FileChange, FileChangeStatus, LandOutcome, PullFileOutcome, PullFileResult, RepoPullResult,
     ReviewVerdict,
@@ -61,7 +66,12 @@ pub use trama_collab_protocol::{
 
 /// Wire protocol version carried in `Hello` / `Welcome`.
 ///
-/// Version 8 adds shared threads: `ConnectCollab`, `DisconnectCollab`,
+/// Version 9 adds subagents spawned through Trama's MCP tools
+/// (`McpToolCall`, `McpToolResult`, `SubagentStatusChanged`, `depth` and
+/// `subagent` in `ThreadSnapshot`, `Message::annotation`), subthreads of
+/// subthreads at any depth, and `ForkThread` (fork at a message: the
+/// conversation up to it and the files of that turn's checkpoint).
+/// Version 8 added shared threads: `ConnectCollab`, `DisconnectCollab`,
 /// `GetCollabStatus`, `ShareThread`, `GetSharedThread`,
 /// `RemoveSharedThreadMember`, `JoinSharedThread`, `ListSharedThreads`,
 /// `UnlinkSharedThread`, `SetCollabDraft`, `SetCollabPresence`, and the
@@ -73,7 +83,7 @@ pub use trama_collab_protocol::{
 /// `TerminalInput`, `ResizeTerminal`, `CloseTerminal`, `ListTerminals`,
 /// `ReplayTerminal`), `ThreadSnapshot.model`, and `SendPrompt` mentions and
 /// terminal attachments.
-/// Version 6 adds anchored comments: `CreateComment`, `ListComments`,
+/// Version 6 added anchored comments: `CreateComment`, `ListComments`,
 /// `ResolveComment`, `ReopenComment`, `DeleteComment`, `SendComments`, and
 /// `SendPrompt` now delivers the thread's pending comments with the prompt.
 /// Version 5 added subthreads (create/list, parent and kind in thread
@@ -81,7 +91,7 @@ pub use trama_collab_protocol::{
 /// Version 4 added the Claude approval channel and 3 thread checkout
 /// discovery. It does not migrate stored data; peers with a different version
 /// are rejected at handshake time.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Environment variable that relocates the whole app-data directory (socket,
 /// database, config, legacy checkouts). Use it for isolated test instances
@@ -189,8 +199,8 @@ pub enum ClientMessage {
         tool_name: String,
         tool_input: serde_json::Value,
     },
-    /// Fork a subthread from a top-level thread: copies of the parent's
-    /// checkouts (uncommitted and untracked changes included) and, when the
+    /// Fork a subthread from any thread (subthreads included): copies of the
+    /// parent's checkouts (uncommitted and untracked changes included) and, when the
     /// parent has an agent session, its conversation. Review and land
     /// subthreads start their first turn immediately; a plain subthread only
     /// when `initial_prompt` is set. Answered with `SubthreadCreated`.
@@ -394,6 +404,39 @@ pub enum ClientMessage {
         thread_id: ThreadId,
         state: CollabPresenceState,
     },
+    /// Fork a child of `thread_id`. Without `at_message_id` this is
+    /// `CreateSubthread` (current files and conversation). With it, the
+    /// child's conversation is the parent's transcript up to the end of the
+    /// turn that message belongs to (an assistant message ends its own
+    /// turn; for any other message, the last turn completed before it), and
+    /// its files are that turn's checkpoint, not the parent's current state.
+    /// The message must be the thread's own (not inherited). Answered with
+    /// `SubthreadCreated` (also broadcast to the parent's subscribers).
+    ForkThread {
+        thread_id: ThreadId,
+        #[serde(default)]
+        at_message_id: Option<MessageId>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        initial_prompt: Option<String>,
+        #[serde(default = "plain_kind")]
+        kind: SubthreadKind,
+    },
+    /// Sent only by the `trama-daemon mcp` helper that Claude Code runs as a
+    /// stdio MCP server. `token` identifies the calling agent session (from
+    /// the helper's environment); every tool acts on that session's thread.
+    /// `tool_use_id` is Claude's id for the call when the CLI sent it. The
+    /// daemon answers once with [`DaemonMessage::McpToolResult`]; closing the
+    /// connection first cancels a waiting call. UI clients never send this.
+    McpToolCall {
+        token: String,
+        tool: String,
+        #[serde(default)]
+        arguments: serde_json::Value,
+        #[serde(default)]
+        tool_use_id: Option<String>,
+    },
     Shutdown,
 }
 
@@ -538,6 +581,10 @@ pub struct TerminalSnapshot {
     pub last_seq: u64,
     /// `None` while running.
     pub exit_status: Option<TerminalExitStatus>,
+}
+
+fn plain_kind() -> SubthreadKind {
+    SubthreadKind::Plain
 }
 
 /// Where a comment is in its lifecycle. Serialized with a `kind` tag.
@@ -824,6 +871,20 @@ pub enum DaemonMessage {
     CollabAccessRevoked {
         thread_id: ThreadId,
     },
+    /// Reply to [`ClientMessage::McpToolCall`], sent only on that helper's
+    /// connection. `text` is the tool result shown to the agent.
+    McpToolResult {
+        is_error: bool,
+        text: String,
+    },
+    /// A subagent's task changed state. Sent to the subscribers of the
+    /// subagent and of its parent.
+    SubagentStatusChanged {
+        thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        status: SubagentStatus,
+        detail: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -870,10 +931,26 @@ pub struct ThreadSnapshot {
     /// The thread's model override; `None` uses the workspace default.
     #[serde(default)]
     pub model: Option<String>,
+    /// Number of ancestors (0 for a top-level thread). Nesting has no limit;
+    /// `parent_thread_id` alone is enough to rebuild the tree.
+    #[serde(default)]
+    pub depth: u32,
+    /// Set for threads spawned by another thread's agent (Trama subagents).
+    #[serde(default)]
+    pub subagent: Option<SubagentSnapshot>,
 }
 
 fn top_kind() -> ThreadKind {
     ThreadKind::Top
+}
+
+/// How a subagent thread was spawned and where its task is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentSnapshot {
+    pub spawned_by: SpawnedBy,
+    pub status: SubagentStatus,
+    /// Failure reason, or what the last sync into the parent did.
+    pub detail: Option<String>,
 }
 
 /// One workspace membership. `title` is the membership alias when set.
@@ -949,6 +1026,8 @@ mod tests {
             kind: ThreadKind::Top,
             review_verdict: None,
             model: None,
+            depth: 0,
+            subagent: None,
         }
     }
 
@@ -1192,7 +1271,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&DaemonMessage::ThreadMigrated(snapshot_th())).unwrap(),
             format!(
-                r#"{{"type":"thread_migrated","payload":{{"id":"{thread}","title":"Fix auth","repo_count":1,"parent_thread_id":null,"kind":"top","review_verdict":null,"model":null}}}}"#
+                r#"{{"type":"thread_migrated","payload":{{"id":"{thread}","title":"Fix auth","repo_count":1,"parent_thread_id":null,"kind":"top","review_verdict":null,"model":null,"depth":0,"subagent":null}}}}"#
             )
         );
         roundtrip_eq(&repo);
@@ -1258,8 +1337,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_eight() {
-        assert_eq!(PROTOCOL_VERSION, 8);
+    fn protocol_version_is_nine() {
+        assert_eq!(PROTOCOL_VERSION, 9);
     }
 
     #[test]
@@ -1682,6 +1761,8 @@ mod tests {
             kind: ThreadKind::Review,
             review_verdict: Some(ReviewVerdict::Approve),
             model: Some("claude-opus-5-5".into()),
+            depth: 1,
+            subagent: None,
         };
         let daemon = [
             DaemonMessage::SubthreadCreated(child.clone()),
@@ -1747,6 +1828,117 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.kind, ThreadKind::Top);
         assert!(legacy.parent_thread_id.is_none());
+        assert_eq!(legacy.depth, 0);
+        assert!(legacy.subagent.is_none());
+    }
+
+    #[test]
+    fn subagent_and_fork_contract_shapes() {
+        let parent = thread_id();
+        let child = ThreadId::from("01hchild00000000000000000001");
+        let fork = ClientMessage::ForkThread {
+            thread_id: parent.clone(),
+            at_message_id: Some(MessageId::from("m7")),
+            title: Some("Try B".into()),
+            initial_prompt: None,
+            kind: SubthreadKind::Plain,
+        };
+        roundtrip_eq(&fork);
+        roundtrip_json(&fork);
+        assert_eq!(
+            serde_json::to_value(&fork).unwrap(),
+            serde_json::json!({"type":"fork_thread","payload":{
+                "thread_id": parent.to_string(), "at_message_id":"m7",
+                "title":"Try B","initial_prompt":null,"kind":"plain"}})
+        );
+        // Only the thread id is required.
+        let minimal: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type":"fork_thread","payload":{"thread_id": parent.to_string()}}))
+        .unwrap();
+        assert_eq!(
+            minimal,
+            ClientMessage::ForkThread {
+                thread_id: parent.clone(),
+                at_message_id: None,
+                title: None,
+                initial_prompt: None,
+                kind: SubthreadKind::Plain,
+            }
+        );
+        let call = ClientMessage::McpToolCall {
+            token: "tok".into(),
+            tool: "spawn_subagent".into(),
+            arguments: serde_json::json!({"title":"t","prompt":"p"}),
+            tool_use_id: Some("toolu_1".into()),
+        };
+        roundtrip_eq(&call);
+        assert_eq!(
+            serde_json::to_value(&call).unwrap(),
+            serde_json::json!({"type":"mcp_tool_call","payload":{"token":"tok",
+                "tool":"spawn_subagent","arguments":{"title":"t","prompt":"p"},
+                "tool_use_id":"toolu_1"}})
+        );
+        let result = DaemonMessage::McpToolResult {
+            is_error: false,
+            text: "ok".into(),
+        };
+        roundtrip_json(&result);
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::json!({"type":"mcp_tool_result","payload":{"is_error":false,"text":"ok"}})
+        );
+        let status = DaemonMessage::SubagentStatusChanged {
+            thread_id: child.clone(),
+            parent_thread_id: parent.clone(),
+            status: SubagentStatus::WaitingToSync,
+            detail: None,
+        };
+        roundtrip_json(&status);
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["payload"]["status"],
+            "waiting_to_sync"
+        );
+        let snapshot = ThreadSnapshot {
+            id: child.clone(),
+            title: "Worker".into(),
+            repo_count: 1,
+            parent_thread_id: Some(parent.clone()),
+            kind: ThreadKind::Sub,
+            review_verdict: None,
+            model: None,
+            depth: 3,
+            subagent: Some(SubagentSnapshot {
+                spawned_by: SpawnedBy {
+                    parent_thread_id: parent.clone(),
+                    tool_use_id: Some("toolu_1".into()),
+                    profile: SubagentProfile::Worker,
+                },
+                status: SubagentStatus::Running,
+                detail: None,
+            }),
+        };
+        roundtrip_eq(&snapshot);
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["depth"], 3);
+        assert_eq!(
+            json["subagent"],
+            serde_json::json!({"spawned_by":{"parent_thread_id": parent.to_string(),
+                "tool_use_id":"toolu_1","profile":"worker"},"status":"running","detail":null})
+        );
+        let mut message = Message::new_user(child.clone(), "agent", "hi");
+        message.annotation = Some(MessageAnnotation::AgentMessageReceived {
+            from_thread_id: parent.clone(),
+            from_title: "Main".into(),
+        });
+        let appended = DaemonMessage::MessageAppended {
+            thread_id: child,
+            message,
+        };
+        roundtrip_json(&appended);
+        assert_eq!(
+            serde_json::to_value(&appended).unwrap()["payload"]["message"]["annotation"]["kind"],
+            "agent_message_received"
+        );
     }
 
     #[test]

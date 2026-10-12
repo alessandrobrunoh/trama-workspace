@@ -223,6 +223,8 @@ fn remote_message(thread_id: &ThreadId, author: &str, role: Role, text: String) 
         role,
         content: vec![ContentBlock::Text { text }],
         created_at: Utc::now(),
+        claude_uuid: None,
+        annotation: None,
     }
 }
 

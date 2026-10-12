@@ -7,6 +7,7 @@ mod config;
 mod connection;
 mod error;
 mod log;
+pub mod mcp;
 mod session;
 
 #[cfg(test)]
@@ -16,7 +17,9 @@ mod testing;
 
 pub use collab::CollabService;
 pub use error::{DaemonError, Result};
-pub use session::{NoCollaborators, PeopleSource, Person, PromptContext, SessionManager};
+pub use session::{
+    NoCollaborators, PeopleSource, Person, PromptContext, SessionManager, SubagentSettings,
+};
 
 use crate::approval::ApprovalHookSettings;
 use crate::claude::ProductionAdapter;
@@ -57,7 +60,8 @@ pub async fn bootstrap_sessions() -> Result<SessionManager> {
     seed_from_config(&db, &config).await?;
     Ok(
         SessionManager::with_checkout_root(db, Arc::new(ProductionAdapter::new()), dir)
-            .with_billing(config.billing),
+            .with_billing(config.billing)
+            .with_subagent_settings(config.subagents),
     )
 }
 
@@ -68,7 +72,8 @@ pub async fn run() -> Result<()> {
 pub async fn run_on_socket(socket_path: &Path) -> Result<()> {
     let sessions = bootstrap_sessions()
         .await?
-        .with_approval_hook(ApprovalHookSettings::for_current_exe(socket_path)?);
+        .with_approval_hook(ApprovalHookSettings::for_current_exe(socket_path)?)
+        .with_mcp(mcp::McpSettings::for_current_exe(socket_path)?);
     // Shared threads: credentials and the runner live beside the database.
     let collab = CollabService::new(sessions.clone(), &default_app_dir()?);
     collab.start().await?;

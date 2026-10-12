@@ -195,6 +195,13 @@ pub enum AgentEvent {
         #[serde(default)]
         skills: Vec<String>,
     },
+    /// Claude Code's transcript uuid of a completed top-level assistant
+    /// message (`uuid` on stream-json `assistant` lines). The daemon keeps
+    /// the last one of a turn on the stored assistant message so a thread
+    /// can later be forked at that point. Not forwarded to clients.
+    TranscriptEntry {
+        uuid: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,6 +373,12 @@ mod tests {
                 message: "boom".into(),
             },
             r#"{"type":"failed","message":"boom"}"#,
+        );
+        assert_stable(
+            &AgentEvent::TranscriptEntry {
+                uuid: "6f1c".into(),
+            },
+            r#"{"type":"transcript_entry","uuid":"6f1c"}"#,
         );
     }
 

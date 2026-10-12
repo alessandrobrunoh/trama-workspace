@@ -682,6 +682,22 @@ async fn restart_catches_up_from_the_stored_cursor_without_duplicates() {
         .await;
 
     let session = server.login("bob").await;
+    // `TurnCompleted` precedes the stored answer (the turn checkpoint is
+    // recorded first), so wait until the runner reported and finished both
+    // turns before taking the log head.
+    eventually("alice's runner finished both turns", || async {
+        let turns: Vec<_> = server
+            .commands(&session, &collab_thread)
+            .await
+            .into_iter()
+            .filter(|c| c.kind == trama_collab_protocol::CommandKind::Turn)
+            .collect();
+        turns.len() == 2
+            && turns
+                .iter()
+                .all(|c| matches!(c.state, CommandState::Completed | CommandState::Failed))
+    })
+    .await;
     let remote_count = |messages: &[Message]| {
         messages
             .iter()

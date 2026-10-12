@@ -840,6 +840,8 @@ mod tests {
             kind: trama_protocol::ThreadKind::Top,
             review_verdict: None,
             model: None,
+            depth: 0,
+            subagent: None,
         }
     }
 

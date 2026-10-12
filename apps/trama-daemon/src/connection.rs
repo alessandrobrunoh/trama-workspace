@@ -75,6 +75,26 @@ where
                             .await?;
                             break;
                         }
+                        if let Ok(ClientMessage::McpToolCall {
+                            token,
+                            tool,
+                            arguments,
+                            tool_use_id,
+                        }) = decode_json_line::<ClientMessage>(&line)
+                        {
+                            // A helper connection carries exactly one call.
+                            serve_mcp_tool(
+                                &sessions,
+                                &mut lines,
+                                &mut writer,
+                                &token,
+                                &tool,
+                                arguments,
+                                tool_use_id,
+                            )
+                            .await?;
+                            break;
+                        }
                         match handle_line(
                             &line,
                             &sessions,
@@ -177,6 +197,29 @@ where
         },
     )
     .await
+}
+
+/// Run one Trama MCP tool call and write its single result. If the helper
+/// hangs up first (the agent cancelled the call), a waiting tool stops
+/// waiting; what the call already changed stays.
+async fn serve_mcp_tool<R, W>(
+    sessions: &SessionManager,
+    lines: &mut tokio::io::Lines<R>,
+    writer: &mut W,
+    token: &str,
+    tool: &str,
+    arguments: serde_json::Value,
+    tool_use_id: Option<String>,
+) -> Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let (is_error, text) = tokio::select! {
+        outcome = sessions.mcp_tool_call(token, tool, arguments, tool_use_id) => outcome,
+        _ = hook_gone(lines) => return Ok(()),
+    };
+    write_msg(writer, &DaemonMessage::McpToolResult { is_error, text }).await
 }
 
 /// Resolves when the hook side closes or errors. Extra lines are ignored.
@@ -398,6 +441,25 @@ async fn handle_line(
                 review_thread_id,
                 parent_thread_id,
                 verdict,
+            });
+        }
+        ClientMessage::ForkThread {
+            thread_id,
+            at_message_id,
+            title,
+            initial_prompt,
+            kind,
+        } => {
+            let snapshot = sessions
+                .fork_thread(thread_id, at_message_id, title, initial_prompt, kind)
+                .await?;
+            let _ = out_tx.send(DaemonMessage::SubthreadCreated(snapshot));
+        }
+        ClientMessage::McpToolCall { .. } => {
+            // Intercepted by `handle_connection` before reaching here.
+            let _ = out_tx.send(DaemonMessage::Error {
+                code: "protocol".into(),
+                message: "mcp_tool_call is only accepted from the Trama MCP helper".into(),
             });
         }
         ClientMessage::SendComments { thread_id } => {

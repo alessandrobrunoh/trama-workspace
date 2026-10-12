@@ -20,6 +20,10 @@ pub struct FileConfig {
     /// `"api_key"` is the explicit opt-in to API billing.
     #[serde(default)]
     pub billing: BillingMode,
+    /// Trama subagents: limits and whether Claude Code's built-in subagent
+    /// tool stays available.
+    #[serde(default)]
+    pub subagents: crate::session::SubagentSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
