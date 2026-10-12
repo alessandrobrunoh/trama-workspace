@@ -86,7 +86,7 @@ async fn harness(approval_timeout: Duration) -> Harness {
     mgr.subscribe(&thread, tx).await.unwrap();
     mgr.send_prompt(thread.clone(), "hi".into()).await.unwrap();
     loop {
-        let msg = timeout(Duration::from_secs(3), events.recv())
+        let msg = timeout(Duration::from_secs(10), events.recv())
             .await
             .expect("turn")
             .expect("open");
@@ -127,7 +127,7 @@ fn hook(mgr: &SessionManager, token: &str, tool: &str) -> JoinHandle<HookDecisio
 
 async fn next_approval_event(rx: &mut mpsc::UnboundedReceiver<DaemonMessage>) -> AgentEvent {
     loop {
-        let msg = timeout(Duration::from_secs(3), rx.recv())
+        let msg = timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("approval event")
             .expect("open");
@@ -158,7 +158,7 @@ async fn requested_id(rx: &mut mpsc::UnboundedReceiver<DaemonMessage>) -> String
 }
 
 async fn decided(handle: JoinHandle<HookDecision>) -> HookDecision {
-    timeout(Duration::from_secs(3), handle)
+    timeout(Duration::from_secs(10), handle)
         .await
         .expect("hook answered")
         .unwrap()

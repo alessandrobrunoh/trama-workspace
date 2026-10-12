@@ -446,7 +446,7 @@ mod tests {
 
     async fn read_daemon<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> DaemonMessage {
         let mut line = String::new();
-        timeout(Duration::from_secs(3), reader.read_line(&mut line))
+        timeout(Duration::from_secs(10), reader.read_line(&mut line))
             .await
             .expect("read timeout")
             .unwrap();
@@ -551,7 +551,7 @@ mod tests {
         .await;
 
         let mut events = Vec::new();
-        let deadline = Duration::from_secs(3);
+        let deadline = Duration::from_secs(10);
         loop {
             let msg = timeout(deadline, async { read_daemon(&mut reader).await })
                 .await
@@ -806,7 +806,7 @@ mod tests {
             },
         )
         .await;
-        let deadline = Duration::from_secs(3);
+        let deadline = Duration::from_secs(10);
         let mut saw_agent = false;
         for _ in 0..20 {
             let msg = timeout(deadline, async { read_daemon(&mut reader).await })

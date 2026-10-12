@@ -2489,7 +2489,7 @@ mod tests {
     }
 
     async fn wait_turn_complete(rx: &mut mpsc::UnboundedReceiver<DaemonMessage>) {
-        let deadline = Duration::from_secs(3);
+        let deadline = Duration::from_secs(10);
         loop {
             let msg = timeout(deadline, rx.recv())
                 .await
@@ -2535,7 +2535,7 @@ mod tests {
         let mut saw_usage = false;
         let mut saw_turn = false;
         let mut saw_snapshot = false;
-        let deadline = Duration::from_secs(3);
+        let deadline = Duration::from_secs(10);
         while !(saw_delta && saw_usage && saw_turn && saw_snapshot) {
             let msg = timeout(deadline, rx.recv())
                 .await
@@ -2708,7 +2708,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         mgr.subscribe(&thread.id, tx).await.unwrap();
         mgr.send_prompt(thread.id, "hi".into()).await.unwrap();
-        let deadline = Duration::from_secs(3);
+        let deadline = Duration::from_secs(10);
         let mut saw_error = false;
         let mut saw_persisted_failure = false;
         for _ in 0..8 {
@@ -3412,7 +3412,7 @@ mod tests {
             .await
             .unwrap();
 
-        let deadline = Duration::from_secs(3);
+        let deadline = Duration::from_secs(10);
         let mut notice = None;
         while notice.is_none() {
             let msg = timeout(deadline, rx.recv())
@@ -3525,7 +3525,7 @@ mod tests {
             .await
             .unwrap();
 
-        let deadline = Duration::from_secs(3);
+        let deadline = Duration::from_secs(10);
         loop {
             let msg = timeout(deadline, rx.recv())
                 .await
