@@ -14,8 +14,26 @@ pub enum PlanError {
     MissingZedCli,
 }
 
+/// Zed release channels, in preference order. Each ships its CLI inside the
+/// bundle at `Contents/MacOS/cli`.
+const ZED_BUNDLES: [&str; 3] = ["Zed.app", "Zed Preview.app", "Zed Nightly.app"];
+
 /// Build a launch plan only for an existing checkout directory.
 pub fn zed_plan(path: &Path, path_env: Option<&std::ffi::OsStr>) -> Result<LaunchPlan, PlanError> {
+    let mut app_dirs = vec![PathBuf::from("/Applications")];
+    if let Some(home) = std::env::var_os("HOME") {
+        app_dirs.push(PathBuf::from(home).join("Applications"));
+    }
+    zed_plan_in(path, path_env, &app_dirs)
+}
+
+/// `zed` on PATH first, then the CLI of an installed Zed bundle (any channel),
+/// then `open -a <bundle>` when a bundle has no usable CLI.
+fn zed_plan_in(
+    path: &Path,
+    path_env: Option<&std::ffi::OsStr>,
+    app_dirs: &[PathBuf],
+) -> Result<LaunchPlan, PlanError> {
     let checkout = canonical_checkout(path)?;
     if let Some(cli) = find_executable("zed", path_env) {
         return Ok(LaunchPlan {
@@ -23,17 +41,29 @@ pub fn zed_plan(path: &Path, path_env: Option<&std::ffi::OsStr>) -> Result<Launc
             args: vec![checkout],
         });
     }
-    #[cfg(target_os = "macos")]
+    let bundles: Vec<PathBuf> = ZED_BUNDLES
+        .iter()
+        .flat_map(|name| app_dirs.iter().map(move |dir| dir.join(name)))
+        .filter(|bundle| bundle.is_dir())
+        .collect();
+    if let Some(cli) = bundles
+        .iter()
+        .map(|bundle| bundle.join("Contents/MacOS/cli"))
+        .find(|cli| cli.is_file() && is_executable(cli))
     {
-        let open = PathBuf::from("/usr/bin/open");
-        if open.is_file() {
-            return Ok(LaunchPlan {
-                program: open,
-                args: vec![PathBuf::from("-a"), PathBuf::from("Zed"), checkout],
-            });
-        }
+        return Ok(LaunchPlan {
+            program: cli,
+            args: vec![checkout],
+        });
     }
-    Err(PlanError::MissingZedCli)
+    let open = PathBuf::from("/usr/bin/open");
+    match bundles.into_iter().next() {
+        Some(bundle) if open.is_file() => Ok(LaunchPlan {
+            program: open,
+            args: vec![PathBuf::from("-a"), bundle, checkout],
+        }),
+        _ => Err(PlanError::MissingZedCli),
+    }
 }
 
 pub fn finder_plan(path: &Path) -> Result<LaunchPlan, PlanError> {
@@ -131,6 +161,61 @@ mod tests {
             finder_plan(&missing),
             Err(PlanError::MissingDirectory(missing))
         );
+    }
+
+    fn fake_bundle(apps: &Path, name: &str, with_cli: bool) -> PathBuf {
+        let macos = apps.join(name).join("Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        if with_cli {
+            use std::os::unix::fs::PermissionsExt;
+            let cli = macos.join("cli");
+            std::fs::write(&cli, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        apps.join(name)
+    }
+
+    #[test]
+    fn zed_preview_bundle_cli_is_used_without_zed_on_path() {
+        let directory = test_directory("preview");
+        let apps = directory.join("Applications");
+        let checkout = directory.join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let bundle = fake_bundle(&apps, "Zed Preview.app", true);
+        let plan = zed_plan_in(&checkout, Some(OsStr::new("")), &[apps.clone()]).unwrap();
+        assert_eq!(plan.program, bundle.join("Contents/MacOS/cli"));
+        assert_eq!(plan.args, vec![checkout.canonicalize().unwrap()]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stable_zed_is_preferred_and_bundle_without_cli_opens_by_path() {
+        let directory = test_directory("stable");
+        let apps = directory.join("Applications");
+        let checkout = directory.join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let stable = fake_bundle(&apps, "Zed.app", false);
+        fake_bundle(&apps, "Zed Preview.app", false);
+        let plan = zed_plan_in(&checkout, Some(OsStr::new("")), &[apps.clone()]).unwrap();
+        assert_eq!(plan.program, PathBuf::from("/usr/bin/open"));
+        assert_eq!(plan.args[..2], [PathBuf::from("-a"), stable]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn no_zed_install_is_reported() {
+        let directory = test_directory("none");
+        let checkout = directory.join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        assert_eq!(
+            zed_plan_in(
+                &checkout,
+                Some(OsStr::new("")),
+                &[directory.join("Applications")]
+            ),
+            Err(PlanError::MissingZedCli)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
