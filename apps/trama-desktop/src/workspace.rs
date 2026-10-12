@@ -2,35 +2,62 @@ use std::path::PathBuf;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, Sizable as _, TitleBar,
+    Disableable as _, Icon, Sizable as _, TitleBar, WindowExt as _,
     button::{Button, ButtonVariants as _},
+    command::{Command, CommandGroup, CommandItem, CommandState},
     h_flex,
-    input::{Input, InputEvent, InputState},
-    scroll::ScrollableElement as _,
-    status_bar::StatusBar,
+    kbd::Kbd,
+    theme::ThemeMode,
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use trama_domain::ids::{ThreadId, WorkspaceId};
-use trama_protocol::{ClientMessage, DaemonMessage, WorkspaceSnapshot};
+use trama_protocol::{ClientMessage, DaemonMessage};
 
-use crate::chat::{AgentStatus, ChatPanel};
+use crate::changes::{ChangesPanel, DrawerTab, render_drawer};
+use crate::chat::ChatPanel;
 use crate::copies::CopyPanel;
+use crate::keymap::{self, CONTEXT, fuzzy_rank};
 use crate::net::{DaemonClient, NetEvent};
-use crate::onboarding::{Feedback, Link, Onboarding, OnboardingRequest};
+use crate::onboarding::{Link, OnboardingRequest};
+use crate::projects::{NewThreadEvent, NewThreadView, ProjectsEvent, ProjectsPanel};
+use crate::sidebar::{SidebarEvent, SidebarPanel, status_dot};
 use crate::startup::{DaemonLocate, DaemonStart};
+use crate::theme::{self, Palette};
+
+/// What a palette row does when confirmed.
+#[derive(Debug, Clone, PartialEq)]
+enum PaletteTarget {
+    Thread(ThreadId),
+    Workspace(WorkspaceId),
+    NewThread,
+    ToggleDrawer,
+    ManageProjects,
+    PrepareCheckout,
+    ToggleAppearance,
+    Shortcuts,
+}
 
 pub struct Workspace {
+    focus_handle: FocusHandle,
     chat: Entity<ChatPanel>,
     copies: Entity<CopyPanel>,
     sidebar: Entity<SidebarPanel>,
+    projects: Entity<ProjectsPanel>,
+    new_thread: Entity<NewThreadView>,
+    changes: Entity<ChangesPanel>,
+    palette: Entity<CommandState>,
+    palette_query: String,
+    drawer_open: bool,
+    drawer_tab: DrawerTab,
     client: DaemonClient,
     connected: bool,
-    _observe_chat: Subscription,
-    _sidebar_events: Subscription,
+    _subscriptions: Vec<Subscription>,
     _net_events: Task<()>,
     _daemon_start: Option<Task<()>>,
+    dev: Option<crate::devhooks::DevScript>,
 }
 
 impl Workspace {
@@ -41,12 +68,42 @@ impl Workspace {
         let chat_client = client.clone();
         let chat = cx.new(|cx| ChatPanel::new(window, cx, chat_client));
         let copies = cx.new(|_| CopyPanel::new());
-        let sidebar = cx.new(|cx| SidebarPanel::new(window, cx));
+        let sidebar = cx.new(|_| SidebarPanel::new());
+        let projects = cx.new(|cx| ProjectsPanel::new(sidebar.clone(), window, cx));
+        let new_thread = cx.new(|cx| NewThreadView::new(sidebar.clone(), window, cx));
+        let changes = cx.new(|_| ChangesPanel::new());
+        let palette = cx.new(|cx| CommandState::new(window, cx));
 
-        let observe_chat = cx.observe(&chat, |_, _, cx| cx.notify());
-        let sidebar_events = cx.subscribe(&sidebar, |this, _sidebar, event, cx| {
-            this.on_sidebar_event(event, cx);
-        });
+        let subscriptions = vec![
+            cx.observe(&chat, |this, chat, cx| {
+                let status = chat.read(cx).thread_status();
+                this.sidebar.update(cx, |sidebar, cx| {
+                    if sidebar.selected_status != status {
+                        sidebar.selected_status = status;
+                        cx.notify();
+                    }
+                });
+                cx.notify();
+            }),
+            cx.observe(&sidebar, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+                this.on_sidebar_event(event, window, cx);
+            }),
+            cx.subscribe(&projects, |this, _, event, cx| match event {
+                ProjectsEvent::StartDaemon => this.start_daemon(cx),
+            }),
+            cx.subscribe_in(&new_thread, window, |this, _, event, window, cx| {
+                window.close_dialog(cx);
+                if let NewThreadEvent::ManageProjects = event {
+                    this.open_projects(window, cx);
+                }
+            }),
+            cx.observe_window_appearance(window, |_, window, cx| {
+                if crate::devhooks::appearance().is_none() {
+                    theme::apply(theme::mode_for(window.appearance()), cx);
+                }
+            }),
+        ];
 
         let inbound = events.into_receiver();
         let net_events = cx.spawn(async move |this, cx| {
@@ -60,27 +117,65 @@ impl Workspace {
             }
         });
 
+        if let Some(dev) = crate::devhooks::from_env() {
+            if let Some((label, diff)) = &dev.diff {
+                changes.update(cx, |changes, cx| changes.set_diff(label.clone(), diff, cx));
+            }
+        }
+
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
+
         Self {
+            focus_handle,
             chat,
             copies,
             sidebar,
+            projects,
+            new_thread,
+            changes,
+            palette,
+            palette_query: String::new(),
+            drawer_open: crate::devhooks::from_env().is_some_and(|dev| dev.drawer),
+            drawer_tab: DrawerTab::default(),
             client,
             connected: false,
-            _observe_chat: observe_chat,
-            _sidebar_events: sidebar_events,
+            _subscriptions: subscriptions,
             _net_events: net_events,
             _daemon_start: None,
+            dev: crate::devhooks::from_env(),
         }
     }
 
-    fn on_sidebar_event(&mut self, event: &SidebarEvent, cx: &mut Context<Self>) {
+    /// Integration hook: show a repository's working-tree diff in the
+    /// Changes drawer once the daemon can provide `git diff` output.
+    #[allow(dead_code)]
+    pub fn set_changes(
+        &mut self,
+        repo_label: impl Into<String>,
+        unified_diff: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.changes.update(cx, |changes, cx| {
+            changes.set_diff(repo_label, unified_diff, cx)
+        });
+    }
+
+    fn on_sidebar_event(
+        &mut self,
+        event: &SidebarEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             SidebarEvent::Requests(requests) => {
                 for request in requests.clone() {
                     self.dispatch_request(request, cx);
                 }
             }
-            SidebarEvent::StartDaemon => self.start_daemon(cx),
+            SidebarEvent::NewThread => self.open_new_thread(window, cx),
+            SidebarEvent::ManageProjects => self.open_projects(window, cx),
+            SidebarEvent::QuickSwitch => self.open_palette(window, cx),
         }
         cx.notify();
     }
@@ -116,6 +211,316 @@ impl Workspace {
         });
     }
 
+    // -- overlays ---------------------------------------------------------
+
+    fn open_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.connected {
+            return;
+        }
+        if self
+            .sidebar
+            .read(cx)
+            .onboarding
+            .selected_workspace
+            .is_none()
+        {
+            self.open_projects(window, cx);
+            return;
+        }
+        window.close_all_dialogs(cx);
+        self.new_thread
+            .update(cx, |view, cx| view.reset(window, cx));
+        let view = self.new_thread.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title("New thread").w(px(520.)).child(view.clone())
+        });
+    }
+
+    fn open_projects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.close_all_dialogs(cx);
+        let view = self.projects.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Manage projects")
+                .w(px(600.))
+                .child(view.clone())
+        });
+        self.projects
+            .update(cx, |projects, cx| projects.focus_first(window, cx));
+    }
+
+    fn open_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.close_all_dialogs(cx);
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let p = theme::palette(cx);
+            dialog.title("Keyboard shortcuts").w(px(460.)).child(
+                v_flex()
+                    .gap(px(2.))
+                    .pb(theme::sp(1.))
+                    .children(keymap::SHORTCUTS.iter().map(|shortcut| {
+                        h_flex()
+                            .h(px(30.))
+                            .items_center()
+                            .text_size(theme::text_ui())
+                            .text_color(p.text)
+                            .child(div().flex_1().child(shortcut.label))
+                            .children(
+                                shortcut
+                                    .keys
+                                    .iter()
+                                    .filter_map(|keys| Keystroke::parse(keys).ok().map(Kbd::new)),
+                            )
+                    })),
+            )
+        });
+    }
+
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            window.close_all_dialogs(cx);
+        }
+        self.palette_query.clear();
+        self.palette
+            .update(cx, |state, cx| state.set_query("", window, cx));
+        let workspace = cx.weak_entity();
+        let state = self.palette.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let Some(this) = workspace.upgrade() else {
+                return dialog;
+            };
+            let (groups, targets) = this.read(cx).palette_groups(cx);
+            let on_query = workspace.clone();
+            let on_confirm = workspace.clone();
+            let mut command = Command::new(&state)
+                .bordered(false)
+                .filterable(false)
+                .placeholder("Jump to a thread or run a command…")
+                .max_h(px(380.))
+                .on_query(move |query, _, cx| {
+                    let _ = on_query.update(cx, |this, cx| {
+                        this.palette_query = query.to_string();
+                        cx.notify();
+                    });
+                })
+                .on_confirm(move |index, window, cx| {
+                    let target = targets
+                        .get(index.section)
+                        .and_then(|group| group.get(index.row))
+                        .cloned();
+                    window.close_dialog(cx);
+                    if let Some(target) = target {
+                        let workspace = on_confirm.clone();
+                        window.defer(cx, move |window, cx| {
+                            let _ = workspace.update(cx, |this, cx| {
+                                this.run_palette_target(target, window, cx);
+                            });
+                        });
+                    }
+                })
+                .empty(|_, _, cx| {
+                    let p = theme::palette(cx);
+                    div()
+                        .p(theme::sp(4.))
+                        .text_size(theme::text_ui())
+                        .text_color(p.text_faint)
+                        .child("No matching threads or commands")
+                });
+            for group in groups {
+                command = command.group(group);
+            }
+            dialog
+                .close_button(false)
+                .w(px(560.))
+                .margin_top(px(96.))
+                .p_0()
+                .child(command)
+        });
+        self.palette.update(cx, |state, cx| state.focus(window, cx));
+    }
+
+    fn palette_groups(&self, cx: &App) -> (Vec<CommandGroup>, Vec<Vec<PaletteTarget>>) {
+        let query = self.palette_query.trim().to_string();
+        let sidebar = self.sidebar.read(cx);
+        let onboarding = &sidebar.onboarding;
+        let selected_thread = onboarding.selected_thread.clone();
+        let selected_workspace = onboarding.selected_workspace.clone();
+        let connected = onboarding.connected();
+        let mut groups = Vec::new();
+        let mut targets = Vec::new();
+
+        let thread_titles: Vec<&str> = onboarding
+            .threads
+            .iter()
+            .map(|thread| thread.title.as_str())
+            .collect();
+        let ranked = fuzzy_rank(&query, thread_titles.iter().copied());
+        if !ranked.is_empty() {
+            let mut group = CommandGroup::new().label("Threads");
+            let mut rows = Vec::new();
+            for index in ranked {
+                let thread = &onboarding.threads[index];
+                group = group.item(
+                    CommandItem::new()
+                        .label(thread.title.clone())
+                        .icon(IconName::MessageSquare)
+                        .checked(selected_thread.as_ref() == Some(&thread.id)),
+                );
+                rows.push(PaletteTarget::Thread(thread.id.clone()));
+            }
+            groups.push(group);
+            targets.push(rows);
+        }
+
+        let workspace_titles: Vec<&str> = onboarding
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.title.as_str())
+            .collect();
+        let ranked = fuzzy_rank(&query, workspace_titles.iter().copied());
+        if !ranked.is_empty() && onboarding.workspaces.len() > 1 {
+            let mut group = CommandGroup::new().label("Projects");
+            let mut rows = Vec::new();
+            for index in ranked {
+                let workspace = &onboarding.workspaces[index];
+                group = group.item(
+                    CommandItem::new()
+                        .label(workspace.title.clone())
+                        .icon(IconName::FolderGit2)
+                        .checked(selected_workspace.as_ref() == Some(&workspace.id)),
+                );
+                rows.push(PaletteTarget::Workspace(workspace.id.clone()));
+            }
+            groups.push(group);
+            targets.push(rows);
+        }
+
+        let commands: Vec<(&str, IconName, PaletteTarget, bool)> = vec![
+            (
+                "New thread",
+                IconName::SquarePen,
+                PaletteTarget::NewThread,
+                connected,
+            ),
+            (
+                if self.drawer_open {
+                    "Hide changes drawer"
+                } else {
+                    "Show changes drawer"
+                },
+                IconName::FileDiff,
+                PaletteTarget::ToggleDrawer,
+                true,
+            ),
+            (
+                "Manage projects",
+                IconName::Settings,
+                PaletteTarget::ManageProjects,
+                true,
+            ),
+            (
+                "Prepare isolated checkout for this thread",
+                IconName::GitBranch,
+                PaletteTarget::PrepareCheckout,
+                onboarding.can_prepare_checkout(),
+            ),
+            (
+                if cx.theme_is_dark() {
+                    "Switch to light appearance"
+                } else {
+                    "Switch to dark appearance"
+                },
+                if cx.theme_is_dark() {
+                    IconName::Sun
+                } else {
+                    IconName::Moon
+                },
+                PaletteTarget::ToggleAppearance,
+                true,
+            ),
+            (
+                "Keyboard shortcuts",
+                IconName::Keyboard,
+                PaletteTarget::Shortcuts,
+                true,
+            ),
+        ];
+        let available: Vec<_> = commands.into_iter().filter(|c| c.3).collect();
+        let ranked = fuzzy_rank(&query, available.iter().map(|c| c.0));
+        if !ranked.is_empty() {
+            let mut group = CommandGroup::new().label("Commands");
+            let mut rows = Vec::new();
+            for index in ranked {
+                let (label, icon, target, _) = &available[index];
+                group = group.item(CommandItem::new().label(label.to_string()).icon(*icon));
+                rows.push(target.clone());
+            }
+            groups.push(group);
+            targets.push(rows);
+        }
+        (groups, targets)
+    }
+
+    fn run_palette_target(
+        &mut self,
+        target: PaletteTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            PaletteTarget::Thread(id) => {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.select_thread(id, cx));
+            }
+            PaletteTarget::Workspace(id) => {
+                let requests = self.sidebar.update(cx, |sidebar, cx| {
+                    let requests = sidebar.onboarding.select_workspace(id);
+                    cx.notify();
+                    requests
+                });
+                for request in requests {
+                    self.dispatch_request(request, cx);
+                }
+            }
+            PaletteTarget::NewThread => self.open_new_thread(window, cx),
+            PaletteTarget::ToggleDrawer => self.toggle_drawer(cx),
+            PaletteTarget::ManageProjects => self.open_projects(window, cx),
+            PaletteTarget::PrepareCheckout => {
+                crate::projects::open_prepare_confirm(self.sidebar.clone(), window, cx);
+            }
+            PaletteTarget::ToggleAppearance => self.toggle_appearance(cx),
+            PaletteTarget::Shortcuts => self.open_shortcuts(window, cx),
+        }
+        cx.notify();
+    }
+
+    fn toggle_drawer(&mut self, cx: &mut Context<Self>) {
+        self.drawer_open = !self.drawer_open;
+        cx.notify();
+    }
+
+    fn toggle_appearance(&mut self, cx: &mut Context<Self>) {
+        let mode = if cx.theme_is_dark() {
+            ThemeMode::Light
+        } else {
+            ThemeMode::Dark
+        };
+        theme::apply(mode, cx);
+        cx.notify();
+    }
+
+    fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            window.close_dialog(cx);
+        } else if self.drawer_open {
+            self.drawer_open = false;
+            cx.notify();
+        } else {
+            cx.propagate();
+        }
+    }
+
+    // -- daemon -----------------------------------------------------------
+
     fn on_net_event(&mut self, event: NetEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             NetEvent::Connected { .. } => {
@@ -146,7 +551,7 @@ impl Workspace {
                 });
             }
             NetEvent::OutboundRejected(message) => self.on_outbound_rejected(message, window, cx),
-            NetEvent::Message(message) => self.on_daemon_message(message, cx),
+            NetEvent::Message(message) => self.on_daemon_message(message, window, cx),
         }
         cx.notify();
     }
@@ -245,7 +650,12 @@ impl Workspace {
         }));
     }
 
-    fn on_daemon_message(&mut self, message: DaemonMessage, cx: &mut Context<Self>) {
+    fn on_daemon_message(
+        &mut self,
+        message: DaemonMessage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match message {
             DaemonMessage::ThreadCheckouts {
                 thread_id,
@@ -300,6 +710,7 @@ impl Workspace {
                     sidebar.onboarding.apply_threads(list);
                     cx.notify();
                 });
+                self.run_dev_script(window, cx);
             }
             DaemonMessage::ThreadCreated(snapshot) => {
                 let requests = self.sidebar.update(cx, |sidebar, cx| {
@@ -311,6 +722,8 @@ impl Workspace {
                 for request in requests {
                     self.dispatch_request(request, cx);
                 }
+                self.chat
+                    .update(cx, |chat, cx| chat.focus_composer(window, cx));
             }
             DaemonMessage::ThreadMigrated(snapshot) => {
                 let requests = self.sidebar.update(cx, |sidebar, cx| {
@@ -339,6 +752,51 @@ impl Workspace {
         }
     }
 
+    fn run_dev_script(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dev) = self.dev.take() else {
+            return;
+        };
+        if let Some(needle) = &dev.select_thread {
+            let found = self
+                .sidebar
+                .read(cx)
+                .onboarding
+                .threads
+                .iter()
+                .find(|thread| thread.title.contains(needle.as_str()))
+                .map(|thread| thread.id.clone());
+            if let Some(id) = found {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.select_thread(id, cx));
+            }
+        }
+        if let Some(index) = dev.expand_tool {
+            let chat = self.chat.clone();
+            cx.spawn(async move |_, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(800))
+                    .await;
+                let _ = chat.update(cx, |chat, cx| chat.expand_tool_call(index, cx));
+            })
+            .detach();
+        }
+        match dev.overlay.as_deref() {
+            Some(overlay) if overlay.starts_with("palette") => {
+                self.open_palette(window, cx);
+                if let Some(query) = overlay.strip_prefix("palette:") {
+                    self.palette_query = query.to_string();
+                    self.palette.update(cx, |state, cx| {
+                        state.set_query(query.to_string(), window, cx)
+                    });
+                }
+            }
+            Some("projects") => self.open_projects(window, cx),
+            Some("new-thread") => self.open_new_thread(window, cx),
+            Some("shortcuts") => self.open_shortcuts(window, cx),
+            _ => {}
+        }
+    }
+
     fn maybe_select_default_workspace(&mut self, cx: &mut Context<Self>) {
         let first = {
             let onboarding = &self.sidebar.read(cx).onboarding;
@@ -358,67 +816,270 @@ impl Workspace {
             }
         }
     }
+
+    // -- chrome -----------------------------------------------------------
+
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = theme::palette(cx);
+        let sidebar = self.sidebar.read(cx);
+        let link = sidebar.onboarding.link().clone();
+        let thread_title = sidebar.selected_thread_title();
+        let project = sidebar.selected_workspace_title();
+        let repos: Vec<String> = sidebar
+            .onboarding
+            .repositories
+            .iter()
+            .filter(|repo| repo.default_enabled)
+            .map(|repo| repo.title.clone())
+            .collect();
+        let status = sidebar.selected_status;
+        let (link_color, link_label): (Hsla, SharedString) = match &link {
+            Link::Online => (p.success, "Daemon connected".into()),
+            Link::Offline => (p.warning, "Daemon offline, reconnecting".into()),
+            Link::ProtocolMismatch { daemon_protocol } => (
+                p.danger,
+                format!("Protocol mismatch (daemon v{daemon_protocol}); restart both").into(),
+            ),
+        };
+        let drawer_open = self.drawer_open;
+
+        TitleBar::new()
+            .h(theme::title_bar_height())
+            .bg(p.panel)
+            .border_color(p.border)
+            .child(
+                h_flex()
+                    .size_full()
+                    .items_center()
+                    .child(
+                        // Sidebar column: traffic lights live here.
+                        div().w(theme::sidebar_width() - px(80.)).flex_shrink_0(),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(theme::sp(2.))
+                            .px(theme::sp(3.))
+                            .items_center()
+                            .text_size(theme::text_ui())
+                            .when_some(thread_title.clone(), |this, _| {
+                                this.child(status_dot(status, &p))
+                            })
+                            .child(
+                                div()
+                                    .flex_shrink(1.)
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(if thread_title.is_some() {
+                                        p.text
+                                    } else {
+                                        p.text_faint
+                                    })
+                                    .child(thread_title.unwrap_or_else(|| "No thread".into())),
+                            )
+                            .when_some(project, |this, project| {
+                                this.child(
+                                    h_flex()
+                                        .flex_shrink_0()
+                                        .gap(theme::sp(1.5))
+                                        .items_center()
+                                        .text_size(theme::text_sm())
+                                        .text_color(p.text_faint)
+                                        .child("/")
+                                        .child(Icon::new(IconName::FolderGit2).with_size(px(12.)))
+                                        .child(project)
+                                        .when(!repos.is_empty(), |this| {
+                                            this.child(
+                                                Icon::new(IconName::GitBranch).with_size(px(12.)),
+                                            )
+                                            .child(repos.join(", "))
+                                        }),
+                                )
+                            }),
+                    )
+                    .child(
+                        // Collaborator avatars will go here once sharing exists.
+                        h_flex().id("collaborators").flex_shrink_0(),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .px(theme::sp(2.))
+                            .gap(theme::sp(1.))
+                            .items_center()
+                            .child(
+                                Button::new("titlebar-palette")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Search)
+                                    .tooltip("Jump to thread (\u{2318}K)")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_palette(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("titlebar-drawer")
+                                    .ghost()
+                                    .small()
+                                    .icon(if drawer_open {
+                                        IconName::PanelRightClose
+                                    } else {
+                                        IconName::PanelRightOpen
+                                    })
+                                    .toggled(drawer_open)
+                                    .tooltip("Changes (\u{2318}R)")
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_drawer(cx))),
+                            )
+                            .child(
+                                div()
+                                    .id("titlebar-link")
+                                    .p(theme::sp(2.))
+                                    .child(div().size(px(7.)).rounded_full().bg(link_color))
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(link_label.clone()).build(window, cx)
+                                    }),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_status_bar(&self, cx: &App) -> impl IntoElement {
+        let p = theme::palette(cx);
+        let sidebar = self.sidebar.read(cx);
+        let onboarding = &sidebar.onboarding;
+        let (color, label) = match onboarding.link() {
+            Link::Online => (p.success, "Connected"),
+            Link::Offline => (p.warning, "Offline"),
+            Link::ProtocolMismatch { .. } => (p.danger, "Restart required"),
+        };
+        let counts = if onboarding.connected() {
+            format!(
+                "{} project{} · {} thread{}",
+                onboarding.workspaces.len(),
+                if onboarding.workspaces.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                onboarding.threads.len(),
+                if onboarding.threads.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            )
+        } else {
+            String::new()
+        };
+        h_flex()
+            .h(theme::status_bar_height())
+            .flex_shrink_0()
+            .px(theme::sp(3.))
+            .gap(theme::sp(3.))
+            .items_center()
+            .bg(p.panel)
+            .border_t_1()
+            .border_color(p.border)
+            .text_size(theme::text_xs())
+            .text_color(p.text_faint)
+            .child(
+                h_flex()
+                    .gap(theme::sp(1.5))
+                    .items_center()
+                    .child(div().size(px(6.)).rounded_full().bg(color))
+                    .child(label),
+            )
+            .child(counts)
+            .child(div().flex_1())
+            .child("\u{2318}K jump · \u{2318}N new · \u{2318}R changes · \u{2318}/ shortcuts")
+    }
+}
+
+trait ThemeIsDark {
+    fn theme_is_dark(&self) -> bool;
+}
+
+impl ThemeIsDark for App {
+    fn theme_is_dark(&self) -> bool {
+        use gpui_kit::component::ActiveTheme as _;
+        self.theme().is_dark()
+    }
 }
 
 impl Render for Workspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let onboarding_banner = self.sidebar.read(cx).onboarding.banner();
-        let alert = self.sidebar.read(cx).onboarding.alert().map(str::to_string);
+        let p = theme::palette(cx);
         let link = self.sidebar.read(cx).onboarding.link().clone();
-        let banner_color = match link {
-            Link::Online => cx.theme().success,
-            Link::Offline => cx.theme().warning,
-            Link::ProtocolMismatch { .. } => cx.theme().danger,
+        let alert = self.sidebar.read(cx).onboarding.alert().map(str::to_string);
+        let can_start = self.sidebar.read(cx).onboarding.can_start_daemon();
+        let daemon_feedback = self.sidebar.read(cx).onboarding.daemon_feedback.clone();
+
+        let center = if matches!(link, Link::Online) {
+            self.chat.clone().into_any_element()
+        } else {
+            connection_panel(
+                &p,
+                matches!(link, Link::ProtocolMismatch { .. }),
+                can_start,
+                daemon_feedback.map(|feedback| feedback.text().to_string()),
+                cx.listener(|this, _, _, cx| this.start_daemon(cx)),
+            )
+            .into_any_element()
         };
 
-        let thread_title = self
-            .sidebar
-            .read(cx)
-            .selected_thread_title()
-            .unwrap_or_else(|| "Seleziona un thread".into());
-        let start_daemon = cx.listener(|this, _, _, cx| this.start_daemon(cx));
-
         v_flex()
+            .id("workspace")
+            .key_context(CONTEXT)
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &keymap::NewThread, window, cx| {
+                this.open_new_thread(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::ToggleDrawer, _, cx| {
+                this.toggle_drawer(cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::QuickSwitch, window, cx| {
+                this.open_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::ShowShortcuts, window, cx| {
+                this.open_shortcuts(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::ManageProjects, window, cx| {
+                this.open_projects(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::ToggleAppearance, _, cx| {
+                this.toggle_appearance(cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::CloseOverlay, window, cx| {
+                this.close_overlay(window, cx);
+            }))
             .size_full()
-            .bg(rgb(0x191b1d))
-            .text_color(rgb(0xe3e5e8))
-            .child(
-                TitleBar::new().h(px(32.)).child(
-                    h_flex()
-                        .w_full()
-                        .justify_between()
-                        .gap_2()
-                        .items_center()
-                        .px_3()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    Icon::new(IconName::MessageSquare)
-                                        .with_size(px(13.))
-                                        .text_color(cx.theme().muted_foreground),
-                                )
-                                .child(div().text_sm().child(thread_title)),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(banner_color)
-                                .child(onboarding_banner),
-                        ),
-                ),
-            )
+            .bg(p.bg)
+            .text_color(p.text)
+            .font_family(theme::UI_FONT)
+            .text_size(theme::text_ui())
+            .child(self.render_title_bar(cx))
             .when_some(alert, |this, alert| {
                 this.child(
-                    div()
+                    h_flex()
                         .w_full()
-                        .px_3()
-                        .py_1()
-                        .bg(cx.theme().danger.opacity(0.15))
-                        .text_xs()
-                        .text_color(cx.theme().danger)
-                        .child(alert),
+                        .flex_shrink_0()
+                        .px(theme::sp(3.))
+                        .py(theme::sp(1.5))
+                        .gap(theme::sp(2.))
+                        .items_center()
+                        .bg(p.danger.opacity(0.10))
+                        .border_b_1()
+                        .border_color(p.danger.opacity(0.25))
+                        .text_size(theme::text_sm())
+                        .text_color(p.text)
+                        .child(
+                            Icon::new(IconName::TriangleAlert)
+                                .with_size(px(13.))
+                                .text_color(p.danger),
+                        )
+                        .child(div().flex_1().child(alert)),
                 )
             })
             .child(
@@ -427,772 +1088,118 @@ impl Render for Workspace {
                     .min_h_0()
                     .child(
                         div()
-                            .w(px(320.))
+                            .w(theme::sidebar_width())
                             .h_full()
                             .flex_shrink_0()
                             .border_r_1()
-                            .border_color(rgb(0x34373a))
+                            .border_color(p.border)
                             .child(self.sidebar.clone()),
                     )
-                    .child(div().flex_1().min_w_0().h_full().child({
-                        if matches!(link, Link::Online) {
-                            v_flex()
-                                .h_full()
-                                .w_full()
-                                .min_h_0()
-                                .child(self.copies.clone())
-                                .child(div().flex_1().min_h_0().child(self.chat.clone()))
-                                .into_any_element()
-                        } else {
-                            connection_panel(
-                                matches!(link, Link::ProtocolMismatch { .. }),
-                                start_daemon,
-                            )
-                            .into_any_element()
-                        }
-                    })),
+                    .child(div().flex_1().min_w_0().h_full().child(center))
+                    .when(self.drawer_open, |this| {
+                        let body: AnyView = match self.drawer_tab {
+                            DrawerTab::Changes => self.changes.clone().into(),
+                            DrawerTab::Copies => self.copies.clone().into(),
+                        };
+                        let weak = cx.weak_entity();
+                        this.child(render_drawer(
+                            self.drawer_tab,
+                            body,
+                            move |tab, _, cx| {
+                                let _ = weak.update(cx, |this, cx| {
+                                    this.drawer_tab = tab;
+                                    cx.notify();
+                                });
+                            },
+                            cx.listener(|this, _, _, cx| this.toggle_drawer(cx)),
+                            cx,
+                        ))
+                    }),
             )
-            .child(render_status_bar(&self.chat, self.connected, cx))
+            .child(self.render_status_bar(cx))
+    }
+}
+
+impl Focusable for Workspace {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
 fn connection_panel(
+    p: &Palette,
     mismatch: bool,
+    can_start: bool,
+    feedback: Option<String>,
     start_daemon: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     v_flex()
         .size_full()
-        .bg(rgb(0x191b1d))
+        .bg(p.bg)
         .items_center()
         .justify_center()
-        .px_10()
-        .gap_3()
+        .px(theme::sp(10.))
+        .gap(theme::sp(3.))
         .child(
-            div().text_sm().child(if mismatch {
-                "The daemon refused the handshake."
-            } else {
-                "The local daemon is not connected."
-            }),
+            div()
+                .size(px(44.))
+                .rounded(theme::radius_lg())
+                .border_1()
+                .border_color(p.border)
+                .bg(p.elevated)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Icon::new(if mismatch {
+                        IconName::TriangleAlert
+                    } else {
+                        IconName::HardDrive
+                    })
+                    .with_size(px(20.))
+                    .text_color(if mismatch { p.danger } else { p.text_muted }),
+                ),
         )
-        .child(div().text_xs().text_color(rgb(0x9aa0a6)).child(if mismatch {
-            "Quit and restart both TramaWorkspace and the daemon. Do not start a second copy. Stored threads are not migrated. Send stays disabled."
-        } else {
-            "This is not a demo. Send stays disabled until a real daemon accepts the connection. Start one below, or run `cargo run -p trama-daemon` yourself. Nothing is downloaded."
-        }))
+        .child(
+            div()
+                .text_size(theme::text_title())
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(if mismatch {
+                    "The daemon refused the handshake"
+                } else {
+                    "The local daemon is not connected"
+                }),
+        )
+        .child(
+            div()
+                .max_w(px(460.))
+                .text_center()
+                .text_size(theme::text_ui())
+                .line_height(relative(1.5))
+                .text_color(p.text_muted)
+                .child(if mismatch {
+                    "Quit and restart both TramaWorkspace and the daemon. Do not start a second copy. Stored threads are not migrated. Send stays disabled."
+                } else {
+                    "Send stays disabled until a real daemon accepts the connection. Start one here, or run `cargo run -p trama-daemon` yourself. Nothing is downloaded."
+                }),
+        )
         .child(
             Button::new("start-daemon-main")
+                .primary()
                 .label(if mismatch {
                     "Restart required"
                 } else {
                     "Start daemon"
                 })
-                .disabled(mismatch)
+                .disabled(mismatch || !can_start)
                 .on_click(start_daemon),
         )
-}
-
-fn render_status_bar(chat: &Entity<ChatPanel>, connected: bool, cx: &App) -> impl IntoElement {
-    let chat = chat.read(cx);
-    let status = match chat.status {
-        AgentStatus::Idle => "idle",
-        AgentStatus::Running => "running",
-    };
-    let usage = if connected { chat.usage.as_ref() } else { None };
-    let tokens = match usage {
-        Some(u) => format!(
-            "in {}  out {}  cache {}/{}",
-            format_tokens(u.input_tokens),
-            format_tokens(u.output_tokens),
-            format_tokens(u.cache_read_tokens),
-            format_tokens(u.cache_write_tokens),
-        ),
-        None => "in --  out --  cache --".to_string(),
-    };
-    let cost = if connected {
-        chat.cost_usd_micros
-            .map(format_cost)
-            .unwrap_or_else(|| "$--".into())
-    } else {
-        "$--".into()
-    };
-    let model = if connected {
-        chat.model.clone().unwrap_or_else(|| "no model".into())
-    } else {
-        "no model".into()
-    };
-    let badge = match chat.turns {
-        Some(n) => format!("turn {n} · {status}"),
-        None => status.to_string(),
-    };
-
-    StatusBar::new()
-        .left(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .px_2()
-                .child(status_dot(matches!(chat.status, AgentStatus::Running), cx))
-                .child(div().text_xs().child(badge)),
-        )
-        .child(
+        .children(feedback.map(|text| {
             div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(tokens),
-        )
-        .right(
-            h_flex()
-                .gap_3()
-                .items_center()
-                .px_2()
-                .child(
-                    div()
-                        .text_xs()
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .child(cost),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(model),
-                ),
-        )
+                .max_w(px(460.))
+                .text_center()
+                .text_size(theme::text_sm())
+                .text_color(p.text_faint)
+                .child(text)
+        }))
 }
-
-fn status_dot(running: bool, cx: &App) -> impl IntoElement {
-    let color = if running {
-        cx.theme().warning
-    } else {
-        cx.theme().success
-    };
-    div().size(px(8.)).rounded_full().bg(color)
-}
-
-fn format_tokens(n: u64) -> String {
-    if n >= 10_000 {
-        format!("{:.1}k", n as f64 / 1000.0)
-    } else if n >= 1000 {
-        format!("{:.1}k", n as f64 / 1000.0)
-    } else {
-        n.to_string()
-    }
-}
-
-fn format_cost(micros: u64) -> String {
-    format!("${:.4}", micros as f64 / 1_000_000.0)
-}
-
-pub enum SidebarEvent {
-    Requests(Vec<OnboardingRequest>),
-    StartDaemon,
-}
-
-struct SidebarPanel {
-    onboarding: Onboarding,
-    workspace_name: Entity<InputState>,
-    repo_path: Entity<InputState>,
-    repo_alias: Entity<InputState>,
-    new_thread: Entity<InputState>,
-    clear_workspace_name: bool,
-    clear_repo_fields: bool,
-    clear_thread_title: bool,
-    editing_workspace: bool,
-    editing_repository: bool,
-    picker_open: bool,
-    _picker: Option<Task<()>>,
-    _workspace_enter: Subscription,
-    _repo_enter: Subscription,
-    _thread_enter: Subscription,
-}
-
-impl SidebarPanel {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let workspace_name =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Nome del workspace"));
-        let repo_path = cx
-            .new(|cx| InputState::new(window, cx).placeholder("Percorso del repository originale"));
-        let repo_alias = cx.new(|cx| InputState::new(window, cx).placeholder("Alias"));
-        let new_thread = cx.new(|cx| InputState::new(window, cx).placeholder("Titolo del thread"));
-        let workspace_enter =
-            cx.subscribe_in(&workspace_name, window, |this, _, event, window, cx| {
-                if let InputEvent::PressEnter { shift: false, .. } = event {
-                    this.submit_workspace(window, cx);
-                }
-            });
-        let repo_enter = cx.subscribe_in(&repo_alias, window, |this, _, event, window, cx| {
-            if let InputEvent::PressEnter { shift: false, .. } = event {
-                this.submit_repository(window, cx);
-            }
-        });
-        let thread_enter = cx.subscribe_in(&new_thread, window, |this, _, event, window, cx| {
-            if let InputEvent::PressEnter { shift: false, .. } = event {
-                this.submit_thread(window, cx);
-            }
-        });
-        Self {
-            onboarding: Onboarding::new(),
-            workspace_name,
-            repo_path,
-            repo_alias,
-            new_thread,
-            clear_workspace_name: false,
-            clear_repo_fields: false,
-            clear_thread_title: false,
-            editing_workspace: false,
-            editing_repository: false,
-            picker_open: false,
-            _picker: None,
-            _workspace_enter: workspace_enter,
-            _repo_enter: repo_enter,
-            _thread_enter: thread_enter,
-        }
-    }
-
-    fn set_link(&mut self, link: Link, cx: &mut Context<Self>) {
-        self.onboarding.set_link(link);
-        cx.notify();
-    }
-
-    fn mark_workspace_saved(&mut self) {
-        self.clear_workspace_name = true;
-        self.editing_workspace = false;
-    }
-
-    fn mark_repository_saved(&mut self) {
-        self.clear_repo_fields = true;
-        self.editing_repository = false;
-    }
-
-    fn mark_thread_saved(&mut self) {
-        self.clear_thread_title = true;
-    }
-
-    fn selected_thread_title(&self) -> Option<String> {
-        let id = self.onboarding.selected_thread.as_ref()?;
-        self.onboarding
-            .threads
-            .iter()
-            .find(|thread| &thread.id == id)
-            .map(|thread| thread.title.clone())
-    }
-
-    fn emit_requests(&mut self, requests: Vec<OnboardingRequest>, cx: &mut Context<Self>) {
-        if !requests.is_empty() {
-            cx.emit(SidebarEvent::Requests(requests));
-        }
-    }
-
-    fn submit_workspace(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        let name = self.workspace_name.read(cx).value().to_string();
-        if let Some(request) = self.onboarding.submit_workspace(&name) {
-            self.emit_requests(vec![request], cx);
-        }
-        cx.notify();
-    }
-
-    fn submit_repository(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        let path = self.repo_path.read(cx).value().to_string();
-        let alias = self.repo_alias.read(cx).value().to_string();
-        if let Some(request) = self.onboarding.submit_repository(&path, &alias) {
-            self.emit_requests(vec![request], cx);
-        }
-        cx.notify();
-    }
-
-    fn submit_thread(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        let title = self.new_thread.read(cx).value().to_string();
-        if let Some(request) = self.onboarding.submit_thread(&title) {
-            self.emit_requests(vec![request], cx);
-        }
-        cx.notify();
-    }
-
-    fn choose_folder(&mut self, cx: &mut Context<Self>) {
-        if self.picker_open {
-            return;
-        }
-        self.picker_open = true;
-        let outcome = crate::dialog::prompt_for_repository_directory(cx);
-        self._picker = Some(cx.spawn(async move |this, cx| {
-            let outcome = outcome.await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.picker_open = false;
-                match outcome {
-                    crate::dialog::PickerOutcome::Picked(Some(path)) => {
-                        let text = path.display().to_string();
-                        this.repo_path.update(cx, |input, cx| {
-                            input.set_value(text, window, cx);
-                        });
-                    }
-                    crate::dialog::PickerOutcome::Failed(message) => {
-                        this.onboarding.note_picker_failure(message);
-                    }
-                    crate::dialog::PickerOutcome::Picked(None)
-                    | crate::dialog::PickerOutcome::Cancelled => {}
-                }
-                cx.notify();
-            });
-        }));
-    }
-
-    fn open_prepare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.onboarding.can_prepare_checkout() {
-            return;
-        }
-        let panel = cx.weak_entity();
-        crate::dialog::open_migration_confirm(window, cx, move |_window, cx| {
-            let _ = panel.update(cx, |this, cx| {
-                if let Some(request) = this.onboarding.confirm_migration() {
-                    cx.emit(SidebarEvent::Requests(vec![request]));
-                }
-                cx.notify();
-            });
-        });
-    }
-
-    fn flush_cleared_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.clear_workspace_name {
-            self.clear_workspace_name = false;
-            self.workspace_name
-                .update(cx, |input, cx| input.set_value("", window, cx));
-        }
-        if self.clear_repo_fields {
-            self.clear_repo_fields = false;
-            self.repo_path
-                .update(cx, |input, cx| input.set_value("", window, cx));
-            self.repo_alias
-                .update(cx, |input, cx| input.set_value("", window, cx));
-        }
-        if self.clear_thread_title {
-            self.clear_thread_title = false;
-            self.new_thread
-                .update(cx, |input, cx| input.set_value("", window, cx));
-        }
-    }
-}
-
-impl Render for SidebarPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.flush_cleared_inputs(window, cx);
-        let connected = self.onboarding.connected();
-        let mismatch = matches!(self.onboarding.link(), Link::ProtocolMismatch { .. });
-        let detail = self.onboarding.status_detail();
-        let workspaces = self.onboarding.workspaces.clone();
-        let selected_workspace = self.onboarding.selected_workspace.clone();
-        let repositories = self.onboarding.repositories.clone();
-        let show_workspace_form = self.editing_workspace || workspaces.is_empty();
-        let show_repo_form =
-            self.editing_repository || (selected_workspace.is_some() && repositories.is_empty());
-        let repos_loaded = self.onboarding.repositories_loaded();
-        let threads = self.onboarding.threads.clone();
-        let selected_thread = self.onboarding.selected_thread.clone();
-        let can_workspace = self.onboarding.can_create_workspace();
-        let can_repo = self.onboarding.can_add_repository();
-        let can_thread = self.onboarding.can_create_thread();
-        let can_prepare = self.onboarding.can_prepare_checkout();
-        let can_start = self.onboarding.can_start_daemon();
-        let workspace_feedback = self.onboarding.workspace_feedback.clone();
-        let repo_feedback = self.onboarding.repo_feedback.clone();
-        let thread_feedback = self.onboarding.thread_feedback.clone();
-        let migration_feedback = self.onboarding.migration_feedback.clone();
-        let daemon_feedback = self.onboarding.daemon_feedback.clone();
-        let workspace_rows: Vec<_> = workspaces
-            .iter()
-            .map(|workspace| {
-                (
-                    workspace.clone(),
-                    self.onboarding.displayed_repo_count(workspace),
-                )
-            })
-            .collect();
-
-        v_flex()
-            .size_full()
-            .bg(rgb(0x202225))
-            .text_color(rgb(0xe3e5e8))
-            .px_3()
-            .py_3()
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .gap_4()
-                    .overflow_y_scrollbar()
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(section_label("Workspace", cx))
-                            .when(!detail.is_empty(), |this| {
-                                this.child(feedback_line(
-                                    &Feedback::Error(detail.clone()),
-                                    cx,
-                                ))
-                            })
-                            .when(can_start, |this| {
-                                this.child(
-                                    Button::new("start-daemon")
-                                        .ghost()
-                                        .label("Start daemon")
-                                        .on_click(cx.listener(|_, _, _, cx| {
-                                            cx.emit(SidebarEvent::StartDaemon);
-                                        })),
-                                )
-                            })
-                            .when(mismatch, |this| {
-                                this.child(
-                                    Button::new("start-daemon-blocked")
-                                        .ghost()
-                                        .label("Restart required")
-                                        .disabled(true),
-                                )
-                            })
-                            .children(daemon_feedback.clone().map(|feedback| {
-                                feedback_line(&feedback, cx).into_any_element()
-                            }))
-                            .when(connected && workspaces.is_empty(), |this| {
-                                this.child(
-                                    div()
-                                        .px_2()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("Nessun workspace. Usa «Nuovo workspace» per iniziare."),
-                                )
-                            })
-                            .children(workspace_rows.into_iter().map(|(ws, count)| {
-                                let selected = selected_workspace.as_ref() == Some(&ws.id);
-                                let id = ws.id.clone();
-                                let title = ws.title.clone();
-                                div()
-                                    .id(SharedString::from(format!("ws-{}", ws.id)))
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(cx.theme().radius)
-                                    .cursor_pointer()
-                                    .when(selected, |this| {
-                                        this.bg(cx.theme().sidebar_accent)
-                                            .text_color(cx.theme().sidebar_accent_foreground)
-                                    })
-                                    .when(!selected, |this| {
-                                        this.hover(|s| {
-                                            s.bg(cx.theme().sidebar_accent.opacity(0.45))
-                                        })
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        let requests =
-                                            this.onboarding.select_workspace(id.clone());
-                                        this.emit_requests(requests, cx);
-                                    }))
-                                    .child(
-                                        h_flex()
-                                            .gap_2()
-                                            .items_center()
-                                            .child(
-                                                Icon::new(IconName::FolderGit2).with_size(px(14.)),
-                                            )
-                                            .child(
-                                                v_flex()
-                                                    .gap_0()
-                                                    .child(div().text_sm().child(title))
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(
-                                                                cx.theme().muted_foreground,
-                                                            )
-                                                            .child(format!("{count} repos")),
-                                                    ),
-                                            ),
-                                    )
-                            }))
-                            .child(Button::new("toggle-workspace-form").ghost().small()
-                                .label("+ Nuovo workspace")
-                                .disabled(!connected)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.editing_workspace = !this.editing_workspace;
-                                    cx.notify();
-                                })))
-                            .when(show_workspace_form, |this| this.child(
-                                h_flex()
-                                    .gap_1()
-                                    .items_center()
-                                    .pt_1()
-                                    .child(
-                                        div().flex_1().min_w_0().child(
-                                            Input::new(&self.workspace_name).id("workspace-name"),
-                                        ),
-                                    )
-                                    .child(
-                                        Button::new("create-workspace")
-                                            .ghost()
-                                            .label("Crea")
-                                            .disabled(!can_workspace)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.submit_workspace(window, cx);
-                                            })),
-                                    ),
-                            ))
-                            .children(workspace_feedback.clone().map(|feedback| {
-                                feedback_line(&feedback, cx).into_any_element()
-                            })),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(section_label("Repository originali", cx))
-                            .child(
-                                div()
-                                    .px_2()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(repo_section_label(
-                                        connected,
-                                        repos_loaded,
-                                        repositories.len(),
-                                        &workspaces,
-                                        selected_workspace.as_ref(),
-                                    )),
-                            )
-                            .when(connected && selected_workspace.is_some() && repositories.is_empty(), |this| {
-                                this.child(
-                                    div()
-                                        .px_2()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("Nessun repository. Aggiungi una cartella Git esistente."),
-                                )
-                            })
-                            .children(repositories.iter().cloned().map(|repo| {
-                                let alias = repo.title.clone();
-                                let path = repo.path.display().to_string();
-                                let enabled = if repo.default_enabled {
-                                    "default"
-                                } else {
-                                    "not default"
-                                };
-                                div()
-                                    .id(SharedString::from(format!("repo-{}", repo.id)))
-                                    .px_2()
-                                    .py_1()
-                                    .child(
-                                        v_flex()
-                                            .gap_0()
-                                            .child(div().text_sm().child(alias))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(path),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(enabled),
-                                            ),
-                                    )
-                            }))
-                            .child(
-                                div()
-                                    .px_2()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Repository originale: la cartella resta dov’è. Gli URL remoti non vengono clonati."),
-                            )
-                            .child(Button::new("toggle-repository-form").ghost().small()
-                                .label("+ Aggiungi repository")
-                                .disabled(!connected || selected_workspace.is_none())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.editing_repository = !this.editing_repository;
-                                    cx.notify();
-                                })))
-                            .when(show_repo_form, |this| this.child(Input::new(&self.repo_path).id("repo-path")))
-                            .when(show_repo_form, |this| this.child(
-                                h_flex().gap_1().items_center().child(
-                                    Button::new("choose-repo-dir")
-                                        .ghost()
-                                        .label("Scegli cartella")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.choose_folder(cx);
-                                        })),
-                                ),
-                            ))
-                            .when(show_repo_form, |this| this.child(
-                                h_flex()
-                                    .gap_1()
-                                    .items_center()
-                                    .child(
-                                        div().flex_1().min_w_0().child(
-                                            Input::new(&self.repo_alias).id("repo-alias"),
-                                        ),
-                                    )
-                                    .child(
-                                        Button::new("add-repo")
-                                            .ghost()
-                                            .label("Aggiungi repository")
-                                            .disabled(!can_repo)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.submit_repository(window, cx);
-                                            })),
-                                    ),
-                            ))
-                            .children(
-                                repo_feedback
-                                    .clone()
-                                    .map(|feedback| feedback_line(&feedback, cx).into_any_element()),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(section_label("Threads", cx))
-                            .when(!connected, |this| {
-                                this.child(
-                                    div()
-                                        .px_2()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("Connect the local daemon to browse threads"),
-                                )
-                            })
-                            .when(connected && threads.is_empty(), |this| {
-                                this.child(
-                                    div()
-                                        .px_2()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("Nessun thread. Aggiungi un repository, poi crea un thread."),
-                                )
-                            })
-                            .children(threads.iter().cloned().map(|thread| {
-                                let selected = selected_thread.as_ref() == Some(&thread.id);
-                                let id = thread.id.clone();
-                                let title = thread.title.clone();
-                                div()
-                                    .id(SharedString::from(format!("th-{}", thread.id)))
-                                    .pl_2()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(cx.theme().radius)
-                                    .cursor_pointer()
-                                    .when(selected, |this| {
-                                        this.bg(cx.theme().sidebar_accent)
-                                            .text_color(cx.theme().sidebar_accent_foreground)
-                                    })
-                                    .when(!selected, |this| {
-                                        this.hover(|s| {
-                                            s.bg(cx.theme().sidebar_accent.opacity(0.45))
-                                        })
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        let requests = this.onboarding.select_thread(id.clone());
-                                        this.emit_requests(requests, cx);
-                                    }))
-                                    .child(
-                                        h_flex()
-                                            .gap_2()
-                                            .items_center()
-                                            .child(
-                                                Icon::new(IconName::MessageSquare)
-                                                    .with_size(px(12.)),
-                                            )
-                                            .child(div().text_sm().child(title)),
-                                    )
-                            }))
-                            .child(
-                                div()
-                                    .px_2()
-                                    .pt_2()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("La copia di lavoro è separata dal repository originale. La posizione globale esistente non viene spostata."),
-                            )
-                            .child(
-                                Button::new("prepare-isolated-checkout")
-                                    .ghost()
-                                    .label("Prepara copia di lavoro")
-                                    .disabled(!can_prepare)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_prepare(window, cx);
-                                    })),
-                            )
-                            .children(migration_feedback.clone().map(|feedback| {
-                                feedback_line(&feedback, cx).into_any_element()
-                            }))
-                            .when(connected, |this| {
-                                this.child(
-                                    h_flex()
-                                        .gap_1()
-                                        .items_center()
-                                        .pt_1()
-                                        .child(
-                                            div().flex_1().min_w_0().child(
-                                                Input::new(&self.new_thread).id("new-thread"),
-                                            ),
-                                        )
-                                        .child(
-                                            Button::new("create-thread")
-                                                .ghost()
-                                                .label("Nuovo thread")
-                                                .disabled(!can_thread)
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.submit_thread(window, cx);
-                                                })),
-                                        ),
-                                )
-                            })
-                            .children(thread_feedback.clone().map(|feedback| {
-                                feedback_line(&feedback, cx).into_any_element()
-                            })),
-                    ),
-            )
-    }
-}
-
-fn feedback_line(feedback: &Feedback, cx: &App) -> impl IntoElement {
-    let color = match feedback {
-        Feedback::Progress(_) => cx.theme().warning,
-        Feedback::Error(_) => cx.theme().danger,
-        Feedback::Notice(_) => cx.theme().success,
-    };
-    div()
-        .px_2()
-        .text_xs()
-        .text_color(color)
-        .child(feedback.text().to_string())
-}
-
-fn repo_section_label(
-    connected: bool,
-    loaded: bool,
-    loaded_count: usize,
-    workspaces: &[WorkspaceSnapshot],
-    selected: Option<&WorkspaceId>,
-) -> String {
-    if !connected {
-        return "Repository data unavailable".to_string();
-    }
-    let Some(id) = selected else {
-        return "Select a workspace".to_string();
-    };
-    if loaded {
-        return format!("{loaded_count} attached");
-    }
-    let count = workspaces
-        .iter()
-        .find(|workspace| &workspace.id == id)
-        .map(|workspace| workspace.repo_count)
-        .unwrap_or(0);
-    format!("{count} attached")
-}
-
-fn section_label(label: &'static str, cx: &App) -> impl IntoElement {
-    div()
-        .px_2()
-        .text_xs()
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(cx.theme().muted_foreground)
-        .child(label)
-}
-
-impl EventEmitter<SidebarEvent> for SidebarPanel {}

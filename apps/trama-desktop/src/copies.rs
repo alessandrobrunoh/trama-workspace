@@ -1,7 +1,7 @@
 //! Selected-thread working copies. Never guesses a path from an original repo.
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _,
+    Disableable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     scroll::ScrollableElement as _,
@@ -11,6 +11,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::path::PathBuf;
 use trama_protocol::{CheckoutSnapshot, CheckoutStatus, ThreadId};
+
+use crate::theme::{self, Palette};
 
 #[derive(Default)]
 pub struct CopyState {
@@ -48,16 +50,15 @@ fn ready_path(row: &CheckoutSnapshot) -> Option<PathBuf> {
 
 fn status_label(status: CheckoutStatus) -> &'static str {
     match status {
-        CheckoutStatus::Ready => "Pronta",
-        CheckoutStatus::NeedsPreparation => "Da preparare",
-        CheckoutStatus::Missing => "Non trovata",
-        CheckoutStatus::Invalid => "Errore",
+        CheckoutStatus::Ready => "Ready",
+        CheckoutStatus::NeedsPreparation => "Needs preparation",
+        CheckoutStatus::Missing => "Missing",
+        CheckoutStatus::Invalid => "Error",
     }
 }
 
 pub struct CopyPanel {
     pub state: CopyState,
-    expanded: bool,
     launching: bool,
     notice: Option<String>,
     launch_task: Option<Task<()>>,
@@ -67,7 +68,6 @@ impl CopyPanel {
     pub fn new() -> Self {
         Self {
             state: CopyState::default(),
-            expanded: true,
             launching: false,
             notice: None,
             launch_task: None,
@@ -104,7 +104,7 @@ impl CopyPanel {
             };
             match plan {
                 Ok(plan) => crate::editor::launch(plan),
-                Err(error) => Err(format!("Copia non apribile: {error:?}")),
+                Err(error) => Err(format!("Cannot open this copy: {error:?}")),
             }
         });
         self.launch_task = Some(cx.spawn(async move |this, cx| {
@@ -112,7 +112,7 @@ impl CopyPanel {
             let _ = this.update(cx, |this, cx| {
                 this.launching = false;
                 this.notice = Some(match result {
-                    Ok(()) => "Richiesta di apertura inviata.".into(),
+                    Ok(()) => "Open request sent.".into(),
                     Err(error) => error,
                 });
                 cx.notify();
@@ -123,58 +123,133 @@ impl CopyPanel {
 
 impl Render for CopyPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = theme::palette(cx);
+        let small = |text: String, color: Hsla| {
+            div()
+                .text_size(theme::text_xs())
+                .text_color(color)
+                .child(text)
+        };
         if self.state.thread.is_none() {
-            return div().into_any_element();
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(small(
+                    "Select a thread to see its working copies.".into(),
+                    p.text_muted,
+                ))
+                .into_any_element();
         }
-        v_flex().w_full().border_b_1().border_color(cx.theme().border).px_4().py_2()
-            .child(Button::new("toggle-working-copies").ghost().small()
-                .label(if self.expanded { "▾ Copie di lavoro" } else { "▸ Copie di lavoro" })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.expanded = !this.expanded;
-                    cx.notify();
-                })))
-            .when(self.expanded, |panel| panel.child(
-                v_flex().gap_2().max_h(px(230.)).overflow_y_scrollbar()
-                    .when(!self.state.loaded, |panel| panel.child(
-                        div().text_xs().child("Verifica delle copie di questo thread…")))
-                    .when(self.state.loaded && self.state.rows.is_empty(), |panel| panel.child(
-                        div().text_xs().child("Nessun repository collegato a questo thread.")))
-                    .children(self.state.rows.iter().cloned().enumerate().map(|(index, row)| {
-                        let path = ready_path(&row);
-                        let zed_path = path.clone();
-                        let finder_path = path.clone();
-                        let clipboard_path = path.clone();
-                        v_flex().gap_1()
-                            .child(div().text_sm().child(format!("{} · {}", row.title, status_label(row.status))))
-                            .child(div().text_xs().text_color(cx.theme().muted_foreground)
-                                .child(format!("Repository originale: {}", row.source_path.display())))
-                            .child(div().text_xs().child(match &row.checkout_path {
-                                Some(path) => format!("Copia di lavoro di questo thread: {}", path.display()),
-                                None => "Nessuna copia apribile. Usa «Prepara copia di lavoro» nella sidebar.".into(),
-                            }))
-                            .when_some(row.detail, |panel, detail| panel.child(div().text_xs().child(detail)))
-                            .child(h_flex().gap_2()
-                                .child(Button::new(SharedString::from(format!("open-zed-{index}"))).ghost().small()
-                                    .label("Apri in Zed").disabled(path.is_none() || self.launching)
+        v_flex()
+            .id("copies")
+            .size_full()
+            .p(theme::sp(3.))
+            .gap(theme::sp(2.))
+            .overflow_y_scrollbar()
+            .when(!self.state.loaded, |panel| {
+                panel.child(small("Checking this thread's working copies…".into(), p.text_muted))
+            })
+            .when(self.state.loaded && self.state.rows.is_empty(), |panel| {
+                panel.child(small("No repository is linked to this thread.".into(), p.text_muted))
+            })
+            .children(self.state.rows.iter().cloned().enumerate().map(|(index, row)| {
+                let path = ready_path(&row);
+                let zed_path = path.clone();
+                let finder_path = path.clone();
+                let clipboard_path = path.clone();
+                v_flex()
+                    .gap(theme::sp(1.))
+                    .p(theme::sp(2.5))
+                    .rounded(theme::radius())
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.bg)
+                    .child(
+                        h_flex()
+                            .gap(theme::sp(2.))
+                            .items_center()
+                            .text_size(theme::text_sm())
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(p.text)
+                                    .child(row.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_color(status_color(row.status, &p))
+                                    .child(status_label(row.status)),
+                            ),
+                    )
+                    .child(small(
+                        format!("Original: {}", row.source_path.display()),
+                        p.text_faint,
+                    ))
+                    .child(small(
+                        match &row.checkout_path {
+                            Some(path) => format!("Thread copy: {}", path.display()),
+                            None => "No copy to open yet. Prepare an isolated checkout (\u{2318}K).".into(),
+                        },
+                        p.text_muted,
+                    ))
+                    .when_some(row.detail, |panel, detail| panel.child(small(detail, p.text_muted)))
+                    .child(
+                        h_flex()
+                            .gap(theme::sp(1.))
+                            .pt(theme::sp(1.))
+                            .child(
+                                Button::new(SharedString::from(format!("open-zed-{index}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Open in Zed")
+                                    .disabled(path.is_none() || self.launching)
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(path) = &zed_path { this.open(path.clone(), false, cx); }
-                                    })))
-                                .child(Button::new(SharedString::from(format!("open-finder-{index}"))).ghost().small()
-                                    .label("Mostra nel Finder").disabled(path.is_none() || self.launching)
+                                        if let Some(path) = &zed_path {
+                                            this.open(path.clone(), false, cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("open-finder-{index}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Reveal in Finder")
+                                    .disabled(path.is_none() || self.launching)
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(path) = &finder_path { this.open(path.clone(), true, cx); }
-                                    })))
-                                .child(Button::new(SharedString::from(format!("copy-path-{index}"))).ghost().small()
-                                    .label("Copia percorso").disabled(path.is_none())
+                                        if let Some(path) = &finder_path {
+                                            this.open(path.clone(), true, cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("copy-path-{index}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Copy path")
+                                    .disabled(path.is_none())
                                     .on_click(cx.listener(move |_, _, _, cx| {
                                         if let Some(path) = &clipboard_path {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(path.to_string_lossy().into_owned()));
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                path.to_string_lossy().into_owned(),
+                                            ));
                                         }
-                                    }))))
-                    }))
-                    .when_some(self.notice.clone(), |panel, notice| panel.child(div().text_xs().child(notice)))
-            ))
+                                    })),
+                            ),
+                    )
+            }))
+            .when_some(self.notice.clone(), |panel, notice| {
+                panel.child(small(notice, p.text_muted))
+            })
             .into_any_element()
+    }
+}
+
+fn status_color(status: CheckoutStatus, p: &Palette) -> Hsla {
+    match status {
+        CheckoutStatus::Ready => p.success,
+        CheckoutStatus::NeedsPreparation => p.warning,
+        CheckoutStatus::Missing | CheckoutStatus::Invalid => p.danger,
     }
 }
 

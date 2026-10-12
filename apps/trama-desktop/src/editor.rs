@@ -48,7 +48,7 @@ pub fn launch(plan: LaunchPlan) -> Result<(), String> {
     let output = std::process::Command::new(&plan.program)
         .args(&plan.args)
         .output()
-        .map_err(|error| format!("Impossibile aprire la copia: {error}"))?;
+        .map_err(|error| format!("Could not open the copy: {error}"))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -56,7 +56,7 @@ pub fn launch(plan: LaunchPlan) -> Result<(), String> {
             .chars()
             .take(1024)
             .collect();
-        Err(format!("Apertura non riuscita: {}", detail.trim()))
+        Err(format!("Open failed: {}", detail.trim()))
     }
 }
 
