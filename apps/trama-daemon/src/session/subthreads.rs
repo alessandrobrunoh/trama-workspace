@@ -213,6 +213,7 @@ impl SessionManager {
 
         let checkout_manager = self.checkout_manager.clone();
         let thread_id = thread.id.clone();
+        let thread_title = thread.title.clone().unwrap_or_default();
         let requests: Vec<_> = parent_checkouts
             .iter()
             .map(|checkout| {
@@ -221,12 +222,13 @@ impl SessionManager {
                     checkout.source.clone(),
                     checkout.repository_id.clone(),
                     CheckoutId::generate(),
+                    checkout.title.clone(),
                 )
             })
             .collect();
         let copies = tokio::task::spawn_blocking(move || {
             let mut copies = Vec::with_capacity(requests.len());
-            for (parent_path, source, repository_id, checkout_id) in requests {
+            for (parent_path, source, repository_id, checkout_id, alias) in requests {
                 match checkout_manager.provision_copy(
                     &parent_path,
                     &source,
@@ -234,12 +236,22 @@ impl SessionManager {
                     &repository_id,
                     &checkout_id,
                 ) {
-                    Ok(copy) => copies.push((repository_id, checkout_id, copy)),
+                    Ok(copy) => copies.push((repository_id, checkout_id, copy, (source, alias))),
                     Err(error) => {
                         remove_fresh_copies(&copies);
                         return Err(error);
                     }
                 }
+            }
+            // Project setup runs in each new copy, after all were created.
+            for (_, _, copy, (source, alias)) in &copies {
+                super::run_checkout_setup(
+                    source,
+                    &copy.path,
+                    &thread_id,
+                    &thread_title,
+                    Some(alias),
+                );
             }
             Ok(copies)
         })
@@ -249,7 +261,7 @@ impl SessionManager {
 
         let mut locations = Vec::with_capacity(copies.len());
         let mut repos = Vec::with_capacity(copies.len());
-        for (attachment, (repository_id, checkout_id, copy)) in
+        for (attachment, (repository_id, checkout_id, copy, _)) in
             thread.repo_attachments.iter_mut().zip(&copies)
         {
             attachment.checkout_id = Some(checkout_id.clone());
@@ -334,7 +346,7 @@ impl SessionManager {
             SubthreadKind::Land => {
                 let copies: Vec<_> = copies
                     .iter()
-                    .map(|(_, _, copy)| copy.path.clone())
+                    .map(|(_, _, copy, _)| copy.path.clone())
                     .collect();
                 let skill = tokio::task::spawn_blocking(move || {
                     copies.iter().find_map(|p| find_land_skill(p))
@@ -755,9 +767,10 @@ fn remove_fresh_copies(
         RepositoryId,
         CheckoutId,
         trama_infra::checkout::ProvisionedCopy,
+        (PathBuf, String),
     )],
 ) {
-    for (_, _, copy) in copies {
+    for (_, _, copy, _) in copies {
         let _ = std::fs::remove_dir_all(&copy.path);
     }
 }

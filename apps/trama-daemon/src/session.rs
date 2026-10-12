@@ -1,6 +1,8 @@
 //! Persistent session manager: TramaDB + injected `AgentAdapter`.
 
 mod comments;
+#[cfg(test)]
+mod setup_tests;
 mod subthreads;
 
 use crate::approval::{self, ApprovalHookSettings, HookDecision};
@@ -343,7 +345,11 @@ impl SessionManager {
                     DaemonError::Invalid(format!("checkout validation task failed: {e}"))
                 })?;
                 match validation {
-                    Ok(()) => (CheckoutStatus::Ready, Some(path), None),
+                    Ok(()) => {
+                        let detail = trama_infra::setup::read_record(&path)
+                            .and_then(|record| record.failure_summary());
+                        (CheckoutStatus::Ready, Some(path), detail)
+                    }
                     Err(e) if !path.exists() => (
                         CheckoutStatus::Missing,
                         None,
@@ -459,17 +465,31 @@ impl SessionManager {
                 ))
             })?;
             let checkout_id = CheckoutId::generate();
-            provision_requests.push((source, attachment.repository_id.clone(), checkout_id));
+            let alias = memberships
+                .iter()
+                .find(|membership| membership.repository_id == attachment.repository_id)
+                .and_then(|membership| membership.alias.clone());
+            provision_requests.push((source, attachment.repository_id.clone(), checkout_id, alias));
         }
         let checkout_manager = self.checkout_manager.clone();
         let thread_id = thread.id.clone();
+        let thread_title = thread.title.clone().unwrap_or_default();
         let provisioned = tokio::task::spawn_blocking(move || {
             provision_requests
                 .into_iter()
-                .map(|(source, repository_id, checkout_id)| {
+                .map(|(source, repository_id, checkout_id, alias)| {
                     checkout_manager
                         .provision_repo_local(&source, &thread_id, &repository_id, &checkout_id)
                         .map(|checkout| {
+                            // Project setup; a failure is recorded on the
+                            // checkout and never fails thread creation.
+                            run_checkout_setup(
+                                &source,
+                                &checkout.path,
+                                &thread_id,
+                                &thread_title,
+                                alias.as_deref(),
+                            );
                             (
                                 CheckoutLocation {
                                     checkout_id,
@@ -2014,6 +2034,34 @@ fn validate_managed_checkout(
         manager.validate_repo_local(source, path, base)
     } else {
         manager.validate(source, path, base)
+    }
+}
+
+/// Run `.agents/linked` / `.agents/prepare` (see `trama_infra::setup`) in a
+/// newly created checkout. The outcome is recorded in the checkout and shown
+/// by `thread_checkouts`; it never removes the checkout.
+pub(crate) fn run_checkout_setup(
+    source: &std::path::Path,
+    checkout: &std::path::Path,
+    thread_id: &ThreadId,
+    thread_title: &str,
+    repository_alias: Option<&str>,
+) {
+    use trama_infra::setup::{SetupRequest, SetupStatus, timeout_from_env};
+    let record = trama_infra::setup::run_checkout_setup(&SetupRequest {
+        source,
+        checkout,
+        thread_id: &thread_id.0,
+        thread_title,
+        repository_alias,
+        timeout: timeout_from_env(),
+    });
+    if record.status == SetupStatus::Failed {
+        crate::log::warn(format!(
+            "checkout setup failed in {}: {}",
+            checkout.display(),
+            record.failure_summary().unwrap_or_default()
+        ));
     }
 }
 
