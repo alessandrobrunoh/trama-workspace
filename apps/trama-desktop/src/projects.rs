@@ -21,6 +21,8 @@ use crate::theme::{self, Palette};
 
 pub enum ProjectsEvent {
     StartDaemon,
+    /// Open the collaboration account dialog.
+    OpenCollaboration,
 }
 
 pub struct ProjectsPanel {
@@ -474,6 +476,27 @@ impl Render for ProjectsPanel {
                 .children(migration_feedback.map(|feedback| feedback_line(&feedback, &p))),
         );
 
+        let collaboration_section = section(
+            &p,
+            "Collaboration",
+            h_flex()
+                .gap(theme::sp(2.))
+                .items_center()
+                .child(div().flex_1().child(muted(
+                    &p,
+                    "Share threads through a collaboration server. Each person's turns run on their own machine with their own Claude Code.",
+                )))
+                .child(
+                    Button::new("projects-collaboration")
+                        .icon(IconName::Users)
+                        .label("Collaboration…")
+                        .disabled(!connected)
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.emit(ProjectsEvent::OpenCollaboration);
+                        })),
+                ),
+        );
+
         v_flex()
             .w_full()
             .gap(theme::sp(5.))
@@ -481,6 +504,7 @@ impl Render for ProjectsPanel {
             .child(projects_section)
             .child(repos_section)
             .child(checkout_section)
+            .child(collaboration_section)
     }
 }
 

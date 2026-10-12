@@ -243,6 +243,10 @@ pub struct ChatPanel {
     /// prompt. The daemon stores only prompts and final answers, so these
     /// are put back when a thread replays.
     turn_details: HashMap<ThreadId, TurnDetails>,
+    /// Shared-thread state (drafts, presence, remote turns).
+    collab: Option<Entity<crate::collab::CollabStore>>,
+    /// Mirrored messages of other participants: author and role.
+    remote_authors: HashMap<MessageId, (String, Role)>,
     _enter: Subscription,
     _event_task: Option<Task<()>>,
 }
@@ -301,6 +305,8 @@ impl ChatPanel {
             prompt_times: HashMap::new(),
             known_threads: Vec::new(),
             turn_details: HashMap::new(),
+            collab: None,
+            remote_authors: HashMap::new(),
             _enter: enter,
             _event_task: None,
         }
@@ -308,6 +314,15 @@ impl ChatPanel {
 
     pub fn is_running(&self) -> bool {
         self.lifecycle != TurnLifecycle::Idle
+    }
+
+    pub fn set_collab(&mut self, collab: Entity<crate::collab::CollabStore>) {
+        self.collab = Some(collab);
+    }
+
+    /// The composer's text state, for relaying live drafts.
+    pub fn composer_input(&self) -> Entity<gpui_kit::component::input::TextareaState> {
+        self.composer.input.clone()
     }
 
     pub fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -466,6 +481,7 @@ impl ChatPanel {
         self.tool_views.clear();
         self.rail = RailState::default();
         self.prompt_times.clear();
+        self.remote_authors.clear();
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -532,6 +548,14 @@ impl ChatPanel {
                     return;
                 }
                 if !self.seen_message_ids.insert(message.id.clone()) {
+                    return;
+                }
+                if let crate::collab::Speaker::Remote(author) =
+                    crate::collab::Speaker::of(&message.actor)
+                {
+                    self.append_remote_message(message, author);
+                    self.scroll.scroll_to_bottom();
+                    cx.notify();
                     return;
                 }
                 let is_assistant = message.role == Role::Assistant;
@@ -695,6 +719,42 @@ impl ChatPanel {
                 }
             }
         }
+    }
+
+    /// Another participant's prompt, their Claude's answer, or a notice
+    /// (comment, verdict, change summary). Kept apart from this view's own
+    /// turn lifecycle: a remote message never ends or adopts a local turn.
+    fn append_remote_message(&mut self, message: Message, author: String) {
+        let text = message.text();
+        if text.trim().is_empty() {
+            return;
+        }
+        self.remote_authors
+            .insert(message.id.clone(), (author, message.role));
+        match message.role {
+            Role::User => {
+                self.prompt_times
+                    .insert(message.id.clone(), message.created_at);
+                self.entries.push(ChatEntry::User {
+                    text,
+                    message_id: Some(message.id),
+                });
+            }
+            _ => {
+                if message.role == Role::Assistant {
+                    self.stored_len.insert(message.id.clone(), text.len());
+                }
+                self.entries.push(ChatEntry::Assistant {
+                    markdown: text,
+                    streaming: false,
+                    message_id: Some(message.id),
+                });
+            }
+        }
+    }
+
+    fn remote_author(&self, id: &MessageId) -> Option<&str> {
+        self.remote_authors.get(id).map(|(name, _)| name.as_str())
     }
 
     fn expand_message_blocks(&mut self, message: &Message) {
@@ -1953,6 +2013,10 @@ impl Render for ChatPanel {
         };
         let handlers = self.card_handlers(cx);
         let now = comments::now_secs();
+        let shared = match (&self.collab, &self.selected_thread) {
+            (Some(collab), Some(thread)) if uses_daemon => collab.read(cx).thread_view(thread),
+            _ => Default::default(),
+        };
 
         // Each row is one child of the scroll container, so a message can be
         // scrolled to by its row index.
@@ -1978,6 +2042,9 @@ impl Render for ChatPanel {
             rows.push(row(
                 notice(&p, IconName::TriangleAlert, p.warning, error).into_any_element()
             ));
+        }
+        if shared.revoked {
+            rows.push(row(crate::presence::revoked_banner(&p)));
         }
         if !self.connected {
             rows.push(row(notice(
@@ -2050,7 +2117,10 @@ impl Render for ChatPanel {
                         block =
                             block.child(div().w_full().h(px(1.)).my(theme::sp(2.)).bg(p.border));
                     }
-                    block = block.child(author_row(&p, Author::User));
+                    block = match message_id.as_ref().and_then(|id| self.remote_author(id)) {
+                        Some(name) => block.child(crate::presence::person_row(&p, name)),
+                        None => block.child(author_row(&p, Author::User)),
+                    };
                     match message_id {
                         Some(id) if uses_daemon => {
                             let split = comments::split_prompt_block(text);
@@ -2092,6 +2162,29 @@ impl Render for ChatPanel {
                     let content = render_approval(card, &p, cx);
                     rows.push(row(agent_block(&p, !previous_was_agent, content)));
                     previous_was_agent = true;
+                }
+                ChatEntry::Assistant {
+                    markdown,
+                    message_id: Some(id),
+                    ..
+                } if self.remote_authors.contains_key(id) => {
+                    let (name, role) = self.remote_authors[id].clone();
+                    if role == Role::Assistant && uses_daemon {
+                        let (content, threads) = self.message_body(
+                            id, markdown, 0, &groups, &mut hits, &handlers, now, &p, cx,
+                        );
+                        let content = self.message_row(id, content, &threads, &groups, &p, cx);
+                        row_of.insert(id.clone(), rows.len());
+                        rows.push(row(v_flex()
+                            .w_full()
+                            .gap(theme::sp(3.))
+                            .child(crate::presence::remote_agent_row(&p, &name))
+                            .child(content)
+                            .into_any_element()));
+                    } else {
+                        rows.push(row(crate::presence::remote_notice(&p, &name, markdown)));
+                    }
+                    previous_was_agent = false;
                 }
                 ChatEntry::Assistant {
                     markdown,
@@ -2163,11 +2256,18 @@ impl Render for ChatPanel {
                 .into_any_element();
         }
 
+        for turn in &shared.remote_turns {
+            rows.push(row(crate::presence::remote_turn(&p, turn)));
+            previous_was_agent = false;
+        }
+
         if running {
             let label = match self.lifecycle {
                 TurnLifecycle::Stopping => "Stopping…",
                 TurnLifecycle::AwaitingAssistant => "Finishing…",
                 _ if self.has_open_approval() => "Waiting for approval…",
+                _ if shared.queued && shared.runner_online => "Queued · starting on this machine…",
+                _ if shared.queued => "Queued · runs when your runner is online…",
                 _ => "Working…",
             };
             let mut block = v_flex().w_full().gap(theme::sp(3.));
@@ -2313,6 +2413,9 @@ impl Render for ChatPanel {
         } else {
             None
         };
+        let live_drafts = crate::presence::drafts_block(&p, &shared.drafts);
+        let shared_footer = (shared.linked && !shared.revoked)
+            .then(|| crate::presence::shared_footer(&p, shared.runner_online));
 
         v_flex()
             .size_full()
@@ -2340,6 +2443,7 @@ impl Render for ChatPanel {
                             .max_w(theme::transcript_width())
                             .px(theme::sp(6.))
                             .pb(theme::sp(4.))
+                            .children(live_drafts)
                             .children(strip)
                             .child(self.composer.render(
                                 running,
@@ -2349,7 +2453,8 @@ impl Render for ChatPanel {
                                 cx.listener(|this, _, _, cx| this.stop(cx)),
                                 window,
                                 cx,
-                            )),
+                            ))
+                            .children(shared_footer),
                     ),
                 )
             })
@@ -2610,11 +2715,17 @@ impl ChatPanel {
             .as_deref()
             .map(|model| format!("{} via Claude Code", turns::model_label(model)))
             .unwrap_or_else(|| "Claude Code".into());
+        let remote = turn
+            .message_id
+            .as_ref()
+            .and_then(|id| self.remote_author(id))
+            .map(str::to_string);
         let (author, avatar_icon, avatar_bg, avatar_fg) = if turn.question.is_empty() {
             ("Claude", IconName::Bot, p.accent_soft, p.accent_text)
         } else {
             ("You", IconName::User, p.selected, p.text_muted)
         };
+        let author: SharedString = remote.clone().unwrap_or_else(|| author.into()).into();
         let key = |label: &'static str| {
             div()
                 .px(px(4.))
@@ -2700,8 +2811,9 @@ impl ChatPanel {
                             .pt(theme::sp(1.))
                             .gap(theme::sp(2.))
                             .items_center()
-                            .child(
-                                div()
+                            .child(match &remote {
+                                Some(name) => crate::presence::avatar(p, name, 22., false),
+                                None => div()
                                     .size(px(22.))
                                     .flex_shrink_0()
                                     .rounded_full()
@@ -2714,7 +2826,7 @@ impl ChatPanel {
                                             .with_size(px(12.))
                                             .text_color(avatar_fg),
                                     ),
-                            )
+                            })
                             .child(
                                 v_flex()
                                     .flex_1()

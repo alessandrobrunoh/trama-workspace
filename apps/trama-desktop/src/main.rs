@@ -1,6 +1,8 @@
 mod agent;
 mod changes;
 mod chat;
+mod collab;
+mod collab_account;
 mod comments;
 mod composer;
 mod copies;
@@ -11,7 +13,9 @@ mod editor;
 mod keymap;
 mod net;
 mod onboarding;
+mod presence;
 mod projects;
+mod share_dialog;
 mod sidebar;
 mod startup;
 mod subthreads;
@@ -57,6 +61,15 @@ gpui_kit::assets::icon_assets!(
         SquarePen,
         UserCheck,
         Wrench,
+        // Shared threads.
+        Crown,
+        Link,
+        Lock,
+        LogOut,
+        Share2,
+        Unplug,
+        UserPlus,
+        Users,
     ]
 );
 

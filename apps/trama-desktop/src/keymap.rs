@@ -21,6 +21,7 @@ gpui_kit::actions!(
         AllowSession,
         DenyApproval,
         CommentOnSelection,
+        ShareThread,
     ]
 );
 
@@ -38,6 +39,7 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("cmd-shift-y", AllowSession, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-n", DenyApproval, Some(CONTEXT)),
         KeyBinding::new("cmd-alt-m", CommentOnSelection, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-s", ShareThread, Some(CONTEXT)),
     ]);
 }
 
@@ -83,6 +85,10 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut {
         keys: &["cmd-alt-m"],
         label: "Comment on the selected transcript text",
+    },
+    Shortcut {
+        keys: &["cmd-shift-s"],
+        label: "Share this thread",
     },
     Shortcut {
         keys: &["cmd-k"],

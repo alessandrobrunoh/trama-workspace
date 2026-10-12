@@ -20,12 +20,15 @@ use trama_protocol::{ClientMessage, DaemonMessage, LandOutcome, SubthreadKind, T
 
 use crate::changes::{ChangesEvent, ChangesPanel, DrawerTab, render_drawer};
 use crate::chat::{ChatEvent, ChatPanel};
+use crate::collab::CollabStore;
+use crate::collab_account::{AccountView, JoinEvent, JoinView};
 use crate::comments::CommentStore;
 use crate::copies::CopyPanel;
 use crate::keymap::{self, CONTEXT, fuzzy_rank};
 use crate::net::{DaemonClient, NetEvent};
 use crate::onboarding::{Link, OnboardingRequest};
 use crate::projects::{NewThreadEvent, NewThreadView, ProjectsEvent, ProjectsPanel};
+use crate::share_dialog::{ShareDialog, ShareDialogEvent};
 use crate::sidebar::{SidebarEvent, SidebarPanel, status_dot};
 use crate::startup::{DaemonLocate, DaemonStart};
 use crate::subthreads::{
@@ -47,6 +50,9 @@ enum PaletteTarget {
     Review,
     Land,
     PullChanges,
+    Share,
+    JoinShared,
+    CollabAccount,
 }
 
 pub struct Workspace {
@@ -59,6 +65,10 @@ pub struct Workspace {
     changes: Entity<ChangesPanel>,
     comments: Entity<CommentStore>,
     subthread_bar: Entity<SubthreadBar>,
+    collab: Entity<CollabStore>,
+    share_dialog: Entity<ShareDialog>,
+    account: Entity<AccountView>,
+    join: Entity<JoinView>,
     palette: Entity<CommandState>,
     palette_query: String,
     drawer_open: bool,
@@ -94,8 +104,51 @@ impl Workspace {
         let bar_sidebar = sidebar.clone();
         let subthread_bar = cx.new(|cx| SubthreadBar::new(bar_client, bar_sidebar, window, cx));
         let palette = cx.new(|cx| CommandState::new(window, cx));
+        let collab_client = client.clone();
+        let collab = cx.new(|_| CollabStore::new(collab_client));
+        chat.update(cx, |chat, _| chat.set_collab(collab.clone()));
+        let share_store = collab.clone();
+        let share_dialog = cx.new(|cx| ShareDialog::new(share_store, window, cx));
+        let account_store = collab.clone();
+        let account = cx.new(|cx| AccountView::new(account_store, window, cx));
+        let join_store = collab.clone();
+        let join = cx.new(|cx| JoinView::new(join_store, window, cx));
+        let composer_input = chat.read(cx).composer_input();
 
         let subscriptions = vec![
+            cx.observe(&collab, |this, collab, cx| {
+                let view = collab.read(cx).sidebar();
+                this.sidebar.update(cx, |sidebar, cx| {
+                    if sidebar.collab != view {
+                        sidebar.collab = view;
+                        cx.notify();
+                    }
+                });
+                this.chat.update(cx, |_, cx| cx.notify());
+                cx.notify();
+            }),
+            cx.subscribe(&composer_input, |this, input, event, cx| {
+                if let gpui_kit::component::input::InputEvent::Change = event {
+                    let text = input.read(cx).value().to_string();
+                    this.collab
+                        .update(cx, |collab, cx| collab.note_draft(&text, cx));
+                }
+            }),
+            cx.observe_window_activation(window, |this, window, cx| {
+                let active = window.is_window_active();
+                this.collab
+                    .update(cx, |collab, cx| collab.set_window_active(active, cx));
+            }),
+            cx.subscribe_in(
+                &share_dialog,
+                window,
+                |this, _, event, window, cx| match event {
+                    ShareDialogEvent::OpenAccount => this.open_account(None, window, cx),
+                },
+            ),
+            cx.subscribe_in(&join, window, |this, _, event, window, cx| match event {
+                JoinEvent::OpenAccount(server) => this.open_account(server.clone(), window, cx),
+            }),
             cx.observe(&chat, |this, chat, cx| {
                 let status = chat.read(cx).thread_status();
                 this.sidebar.update(cx, |sidebar, cx| {
@@ -142,9 +195,14 @@ impl Workspace {
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
                 this.on_sidebar_event(event, window, cx);
             }),
-            cx.subscribe(&projects, |this, _, event, cx| match event {
-                ProjectsEvent::StartDaemon => this.start_daemon(cx),
-            }),
+            cx.subscribe_in(
+                &projects,
+                window,
+                |this, _, event, window, cx| match event {
+                    ProjectsEvent::StartDaemon => this.start_daemon(cx),
+                    ProjectsEvent::OpenCollaboration => this.open_account(None, window, cx),
+                },
+            ),
             cx.subscribe_in(&new_thread, window, |this, _, event, window, cx| {
                 window.close_dialog(cx);
                 if let NewThreadEvent::ManageProjects = event {
@@ -189,6 +247,10 @@ impl Workspace {
             changes,
             comments,
             subthread_bar,
+            collab,
+            share_dialog,
+            account,
+            join,
             palette,
             palette_query: String::new(),
             drawer_open: crate::devhooks::from_env().is_some_and(|dev| dev.drawer),
@@ -369,6 +431,12 @@ impl Workspace {
             SidebarEvent::NewThread => self.open_new_thread(window, cx),
             SidebarEvent::ManageProjects => self.open_projects(window, cx),
             SidebarEvent::QuickSwitch => self.open_palette(window, cx),
+            SidebarEvent::OpenShared(listing) => self.open_shared(listing.clone(), window, cx),
+            SidebarEvent::RefreshShared => {
+                self.collab
+                    .update(cx, |collab, cx| collab.refresh_shared(cx));
+            }
+            SidebarEvent::JoinShared => self.open_join(window, cx),
         }
         cx.notify();
     }
@@ -392,6 +460,9 @@ impl Workspace {
     }
 
     fn focus_thread(&mut self, thread_id: Option<ThreadId>, cx: &mut Context<Self>) {
+        let selected = thread_id.clone();
+        self.collab
+            .update(cx, |collab, cx| collab.set_selected(selected, cx));
         self.copies
             .update(cx, |copies, cx| copies.select(thread_id.clone(), cx));
         self.subthread_bar.update(cx, |bar, cx| bar.reset_form(cx));
@@ -447,6 +518,137 @@ impl Workspace {
         });
         self.projects
             .update(cx, |projects, cx| projects.focus_first(window, cx));
+    }
+
+    // -- shared threads -----------------------------------------------------
+
+    fn open_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.connected {
+            return;
+        }
+        let (thread, title) = {
+            let sidebar = self.sidebar.read(cx);
+            let onboarding = &sidebar.onboarding;
+            match onboarding
+                .selected_thread
+                .as_ref()
+                .and_then(|id| onboarding.thread(id))
+            {
+                Some(thread) if thread.kind == ThreadKind::Top => {
+                    (thread.id.clone(), thread.title.clone())
+                }
+                Some(_) => {
+                    window.push_notification(
+                        Notification::info(
+                            "Share the top-level thread; its subthreads stay on this machine.",
+                        ),
+                        cx,
+                    );
+                    return;
+                }
+                None => {
+                    window.push_notification(Notification::info("Select a thread to share."), cx);
+                    return;
+                }
+            }
+        };
+        window.close_all_dialogs(cx);
+        self.collab
+            .update(cx, |collab, cx| collab.open_share(thread, title, cx));
+        self.share_dialog
+            .update(cx, |dialog, cx| dialog.reset(window, cx));
+        let view = self.share_dialog.clone();
+        let collab = self.collab.downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let collab = collab.clone();
+            dialog
+                .title("Share thread")
+                .w(px(520.))
+                .on_close(move |_, _, cx| {
+                    let _ = collab.update(cx, |collab, cx| {
+                        collab.share.close();
+                        cx.notify();
+                    });
+                })
+                .child(view.clone())
+        });
+    }
+
+    fn open_account(
+        &mut self,
+        server: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.close_all_dialogs(cx);
+        self.account
+            .update(cx, |account, cx| account.reset(server, window, cx));
+        let view = self.account.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Collaboration")
+                .w(px(520.))
+                .child(view.clone())
+        });
+    }
+
+    fn open_join(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.connected {
+            return;
+        }
+        window.close_all_dialogs(cx);
+        let (workspace, title) = {
+            let sidebar = self.sidebar.read(cx);
+            (
+                sidebar.onboarding.selected_workspace.clone(),
+                sidebar.selected_workspace_title(),
+            )
+        };
+        self.join.update(cx, |join, cx| {
+            join.workspace = workspace;
+            join.workspace_title = title;
+            join.reset(window, cx);
+        });
+        let view = self.join.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Join shared thread")
+                .w(px(520.))
+                .child(view.clone())
+        });
+    }
+
+    /// A "Shared with me" row: open its local thread, or join it into the
+    /// selected project.
+    fn open_shared(
+        &mut self,
+        listing: trama_protocol::SharedThreadListing,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(thread_id) = listing.local_thread_id {
+            self.sidebar
+                .update(cx, |sidebar, cx| sidebar.select_thread(thread_id, cx));
+            return;
+        }
+        let workspace = self.sidebar.read(cx).onboarding.selected_workspace.clone();
+        let target = crate::collab::JoinTarget {
+            server_url: None,
+            thread_id: listing.collab_thread_id,
+            link_token: None,
+        };
+        let sent = self
+            .collab
+            .update(cx, |collab, cx| collab.join(workspace, &target, cx));
+        if !sent {
+            let message = self
+                .collab
+                .read(cx)
+                .join_error
+                .clone()
+                .unwrap_or_else(|| "Could not join the shared thread.".into());
+            window.push_notification(Notification::error(message), cx);
+        }
     }
 
     fn open_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -639,6 +841,28 @@ impl Workspace {
                         .is_some_and(|kind| kind != ThreadKind::Top),
             ),
             (
+                "Share this thread…",
+                IconName::Share2,
+                PaletteTarget::Share,
+                connected && self.selected_thread_kind(cx) == Some(ThreadKind::Top),
+            ),
+            (
+                "Join shared thread…",
+                IconName::Link,
+                PaletteTarget::JoinShared,
+                connected,
+            ),
+            (
+                if self.collab.read(cx).signed_in() {
+                    "Collaboration account"
+                } else {
+                    "Connect to collaboration server"
+                },
+                IconName::Users,
+                PaletteTarget::CollabAccount,
+                connected,
+            ),
+            (
                 "Prepare isolated checkout for this thread",
                 IconName::GitBranch,
                 PaletteTarget::PrepareCheckout,
@@ -713,6 +937,9 @@ impl Workspace {
             PaletteTarget::Review => self.start_review(window, cx),
             PaletteTarget::Land => self.confirm_land(window, cx),
             PaletteTarget::PullChanges => self.pull_selected(cx),
+            PaletteTarget::Share => self.open_share(window, cx),
+            PaletteTarget::JoinShared => self.open_join(window, cx),
+            PaletteTarget::CollabAccount => self.open_account(None, window, cx),
         }
         cx.notify();
     }
@@ -756,6 +983,7 @@ impl Workspace {
                 self.chat.update(cx, |chat, cx| {
                     chat.set_connected(true, cx);
                 });
+                self.collab.update(cx, |collab, cx| collab.on_connected(cx));
             }
             NetEvent::Disconnected => {
                 self.connected = false;
@@ -890,7 +1118,36 @@ impl Workspace {
         {
             return;
         }
+        if self
+            .collab
+            .update(cx, |collab, cx| collab.apply(&message, cx))
+        {
+            return;
+        }
         match message {
+            DaemonMessage::SharedThreadJoined { thread, shared } => {
+                window.close_all_dialogs(cx);
+                let id = thread.id.clone();
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.onboarding.apply_subthread(thread.clone());
+                    if sidebar.onboarding.thread(&id).is_none() {
+                        let mut threads = sidebar.onboarding.threads.clone();
+                        threads.push(thread);
+                        sidebar.onboarding.apply_threads(threads);
+                    }
+                    cx.notify();
+                });
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.select_thread(id, cx));
+                window.push_notification(
+                    Notification::success(format!(
+                        "Joined \u{201c}{}\u{201d}, shared by {}.",
+                        shared.title, shared.owner
+                    ))
+                    .title("Shared thread"),
+                    cx,
+                );
+            }
             DaemonMessage::ThreadCheckouts {
                 thread_id,
                 checkouts,
@@ -1143,6 +1400,9 @@ impl Workspace {
             Some("projects") => self.open_projects(window, cx),
             Some("new-thread") => self.open_new_thread(window, cx),
             Some("shortcuts") => self.open_shortcuts(window, cx),
+            Some("share") => self.open_share(window, cx),
+            Some("collab") => self.open_account(None, window, cx),
+            Some("join") => self.open_join(window, cx),
             _ => {}
         }
     }
@@ -1194,6 +1454,21 @@ impl Workspace {
         let drawer_open = self.drawer_open;
         let can_fork =
             link == Link::Online && self.selected_thread_kind(cx) == Some(ThreadKind::Top);
+        let selected = sidebar.onboarding.selected_thread.clone();
+        let store = self.collab.read(cx);
+        let shared_thread = selected.as_ref().is_some_and(|id| store.is_linked(id));
+        let collaborators = selected.as_ref().filter(|_| shared_thread).and_then(|id| {
+            let snapshot = store.snapshot(id)?;
+            let live = store.presence(id).cloned().unwrap_or_default();
+            let people = crate::presence::roster(
+                &snapshot.members,
+                &snapshot.owner,
+                &live,
+                store.username(),
+                &store.typing(id),
+            );
+            (!people.is_empty()).then(|| crate::presence::title_avatars(&p, &people))
+        });
 
         TitleBar::new()
             .h(theme::title_bar_height())
@@ -1251,10 +1526,7 @@ impl Workspace {
                                 )
                             }),
                     )
-                    .child(
-                        // Collaborator avatars will go here once sharing exists.
-                        h_flex().id("collaborators").flex_shrink_0(),
-                    )
+                    .children(collaborators)
                     .child(
                         h_flex()
                             .flex_shrink_0()
@@ -1263,6 +1535,18 @@ impl Workspace {
                             .items_center()
                             .when(can_fork, |this| {
                                 this.child(
+                                    Button::new("titlebar-share")
+                                        .ghost()
+                                        .small()
+                                        .icon(IconName::Share2)
+                                        .label("Share")
+                                        .toggled(shared_thread)
+                                        .tooltip("Share this thread (\u{2318}\u{21e7}S)")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_share(window, cx);
+                                        })),
+                                )
+                                .child(
                                     Button::new("titlebar-review")
                                         .ghost()
                                         .small()
@@ -1369,7 +1653,7 @@ impl Workspace {
             )
             .child(counts)
             .child(div().flex_1())
-            .child("\u{2318}K jump · \u{2318}N new · \u{2318}\u{21e7}\u{23ce} subthread · \u{2318}R changes · \u{2318}/ shortcuts")
+            .child("\u{2318}K jump · \u{2318}N new · \u{2318}\u{21e7}\u{23ce} subthread · \u{2318}\u{21e7}S share · \u{2318}R changes · \u{2318}/ shortcuts")
     }
 }
 
@@ -1427,6 +1711,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &keymap::ManageProjects, window, cx| {
                 this.open_projects(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &keymap::ShareThread, window, cx| {
+                this.open_share(window, cx);
             }))
             .on_action(cx.listener(|this, _: &keymap::ToggleAppearance, _, cx| {
                 this.toggle_appearance(cx);

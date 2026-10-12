@@ -18,6 +18,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use trama_domain::ids::{ThreadId, WorkspaceId};
+use trama_protocol::SharedThreadListing;
 
 use crate::onboarding::{Link, Onboarding, OnboardingRequest};
 use crate::theme::{self, Palette};
@@ -58,6 +59,10 @@ pub enum SidebarEvent {
     NewThread,
     ManageProjects,
     QuickSwitch,
+    /// Open (or join) a thread from "Shared with me".
+    OpenShared(SharedThreadListing),
+    RefreshShared,
+    JoinShared,
 }
 
 pub struct SidebarPanel {
@@ -68,6 +73,8 @@ pub struct SidebarPanel {
     pub clear_workspace_name: bool,
     pub clear_repo_fields: bool,
     pub clear_thread_title: bool,
+    /// Shared-thread badges and the "Shared with me" list.
+    pub collab: crate::collab::SidebarCollab,
 }
 
 impl SidebarPanel {
@@ -79,6 +86,7 @@ impl SidebarPanel {
             clear_workspace_name: false,
             clear_repo_fields: false,
             clear_thread_title: false,
+            collab: Default::default(),
         }
     }
 
@@ -407,6 +415,10 @@ impl Render for SidebarPanel {
             }
         }
 
+        if connected && self.collab.signed_in {
+            list = list.child(self.shared_section(&selected_thread, &p, cx));
+        }
+
         let link = self.onboarding.link().clone();
         let (link_color, link_label) = match link {
             Link::Online => (p.success, "Daemon connected"),
@@ -509,6 +521,19 @@ impl SidebarPanel {
                     })
             }))
             .child(div().flex_1().min_w_0().truncate().child(title))
+            .when(self.collab.shared.contains(&id), |this| {
+                this.child(
+                    div()
+                        .id(SharedString::from(format!("th-shared-{id}")))
+                        .flex_shrink_0()
+                        .child(
+                            Icon::new(IconName::Users)
+                                .with_size(px(12.))
+                                .text_color(p.text_faint),
+                        )
+                        .tooltip(|window, cx| Tooltip::new("Shared thread").build(window, cx)),
+                )
+            })
             .children(verdict.map(|badge| {
                 div()
                     .id(SharedString::from(format!("th-verdict-{id}")))
@@ -541,6 +566,113 @@ impl SidebarPanel {
                             }),
                     ),
             )
+    }
+}
+
+impl SidebarPanel {
+    /// Threads other people shared with the signed-in user.
+    fn shared_section(
+        &self,
+        selected: &Option<ThreadId>,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let header = h_flex()
+            .px(theme::sp(2.))
+            .pt(theme::sp(4.))
+            .pb(theme::sp(1.))
+            .gap(px(2.))
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(theme::text_xs())
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(p.text_faint)
+                    .child("Shared with me"),
+            )
+            .child(
+                Button::new("sidebar-refresh-shared")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::RefreshCw)
+                    .tooltip("Refresh shared threads")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::RefreshShared))),
+            )
+            .child(
+                Button::new("sidebar-join-shared")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Link)
+                    .tooltip("Join a shared thread with a link")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::JoinShared))),
+            );
+        let mut section = v_flex().gap(px(1.)).child(header);
+        if self.collab.shared_with_me.is_empty() {
+            section = section.child(hint(p, "Nothing shared with you yet."));
+        }
+        for listing in &self.collab.shared_with_me {
+            let is_selected =
+                listing.local_thread_id.is_some() && &listing.local_thread_id == selected;
+            let joined = listing.local_thread_id.is_some();
+            let open = listing.clone();
+            let tooltip: SharedString = format!(
+                "Owned by {}{}",
+                listing.owner,
+                if joined {
+                    ""
+                } else {
+                    " · click to join it into the selected project"
+                }
+            )
+            .into();
+            section = section.child(
+                h_flex()
+                    .id(SharedString::from(format!(
+                        "shared-{}",
+                        listing.collab_thread_id
+                    )))
+                    .h(px(28.))
+                    .pl(theme::sp(2.))
+                    .pr(theme::sp(2.))
+                    .gap(theme::sp(2.))
+                    .items_center()
+                    .rounded(theme::radius())
+                    .cursor_pointer()
+                    .text_size(theme::text_ui())
+                    .when(is_selected, |this| this.bg(p.selected).text_color(p.text))
+                    .when(!is_selected, |this| {
+                        this.text_color(p.text_muted)
+                            .hover(|style| style.bg(p.hover).text_color(p.text))
+                    })
+                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(SidebarEvent::OpenShared(open.clone()));
+                    }))
+                    .child(crate::presence::avatar(p, &listing.owner, 16., false))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(listing.title.clone()),
+                    )
+                    .when(!joined, |this| {
+                        this.child(
+                            div()
+                                .flex_shrink_0()
+                                .px(theme::sp(1.5))
+                                .rounded(theme::radius_sm())
+                                .border_1()
+                                .border_color(p.border)
+                                .text_size(theme::text_xs())
+                                .text_color(p.text_faint)
+                                .child("Join"),
+                        )
+                    }),
+            );
+        }
+        section
     }
 }
 
