@@ -6,6 +6,9 @@ mod setup_tests;
 mod subthreads;
 
 use crate::approval::{self, ApprovalHookSettings, HookDecision};
+
+/// Model passed to `claude --model` unless the workspace sets `default_model`.
+pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-5-5";
 use crate::config::permission_mode_from_settings;
 use crate::error::{DaemonError, Result};
 use chrono::Utc;
@@ -1678,10 +1681,18 @@ impl SessionManager {
         let (permission_mode, model) = match &workspace {
             Some(ws) => (
                 permission_mode_from_settings(&ws.settings),
-                ws.settings.default_model.clone(),
+                ws.settings
+                    .default_model
+                    .clone()
+                    .filter(|model| !model.is_empty())
+                    .unwrap_or_else(|| DEFAULT_CLAUDE_MODEL.to_string()),
             ),
-            None => (trama_domain::agent::PermissionMode::Default, None),
+            None => (
+                trama_domain::agent::PermissionMode::Default,
+                DEFAULT_CLAUDE_MODEL.to_string(),
+            ),
         };
+        let model = Some(model);
 
         let own_session = self
             .db
