@@ -164,37 +164,7 @@ impl TramaDb {
         let locations = locations.to_vec();
         self.blocking_mut(move |conn| {
             let tx = conn.transaction().map_err(sql_err)?;
-            let now = rfc3339(Utc::now());
-            tx.execute(
-                "INSERT INTO threads
-                    (id, workspace_id, parent_thread_id, kind, title, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    thread.id.to_string(),
-                    thread.workspace_id.as_ref().map(|id| id.to_string()),
-                    thread.parent_thread_id.as_ref().map(|id| id.to_string()),
-                    enum_text(&thread.kind)?,
-                    thread.title,
-                    now,
-                    now,
-                ],
-            )
-            .map_err(sql_err)?;
-            for attachment in &thread.repo_attachments {
-                tx.execute(
-                    "INSERT INTO thread_repositories
-                        (thread_id, repository_id, base_revision, checkout_id, attach_mode)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        thread.id.to_string(),
-                        attachment.repository_id.to_string(),
-                        attachment.base_revision,
-                        attachment.checkout_id.as_ref().map(|id| id.to_string()),
-                        enum_text(&attachment.attach_mode)?,
-                    ],
-                )
-                .map_err(sql_err)?;
-            }
+            insert_thread(&tx, &thread)?;
             crate::checkouts::insert_locations(
                 &tx,
                 &thread.id.to_string(),
@@ -377,7 +347,42 @@ impl TramaDb {
     }
 }
 
-fn load_attachments(
+pub(crate) fn insert_thread(tx: &rusqlite::Transaction<'_>, thread: &Thread) -> Result<()> {
+    let now = rfc3339(Utc::now());
+    tx.execute(
+        "INSERT INTO threads
+            (id, workspace_id, parent_thread_id, kind, title, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            thread.id.to_string(),
+            thread.workspace_id.as_ref().map(|id| id.to_string()),
+            thread.parent_thread_id.as_ref().map(|id| id.to_string()),
+            enum_text(&thread.kind)?,
+            thread.title,
+            now,
+            now,
+        ],
+    )
+    .map_err(sql_err)?;
+    for attachment in &thread.repo_attachments {
+        tx.execute(
+            "INSERT INTO thread_repositories
+                (thread_id, repository_id, base_revision, checkout_id, attach_mode)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                thread.id.to_string(),
+                attachment.repository_id.to_string(),
+                attachment.base_revision,
+                attachment.checkout_id.as_ref().map(|id| id.to_string()),
+                enum_text(&attachment.attach_mode)?,
+            ],
+        )
+        .map_err(sql_err)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn load_attachments(
     conn: &rusqlite::Connection,
     thread_id: &str,
 ) -> Result<Vec<ThreadRepositoryAttachment>> {
@@ -1029,7 +1034,7 @@ fn fs_canonicalize_exists(path: &Path) -> Option<PathBuf> {
     std::fs::canonicalize(path).ok()
 }
 
-fn insert_message(tx: &rusqlite::Transaction<'_>, message: &Message) -> Result<()> {
+pub(crate) fn insert_message(tx: &rusqlite::Transaction<'_>, message: &Message) -> Result<()> {
     tx.execute(
         "INSERT INTO messages
             (id, thread_id, parent_id, actor_json, role, content_json, created_at)
@@ -1048,7 +1053,7 @@ fn insert_message(tx: &rusqlite::Transaction<'_>, message: &Message) -> Result<(
     Ok(())
 }
 
-fn insert_event(tx: &rusqlite::Transaction<'_>, record: &EventRecord) -> Result<()> {
+pub(crate) fn insert_event(tx: &rusqlite::Transaction<'_>, record: &EventRecord) -> Result<()> {
     let insert = tx.execute(
         "INSERT INTO events (
             id, aggregate_json, actor_json, schema_version, kind,

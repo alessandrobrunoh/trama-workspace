@@ -15,9 +15,11 @@ mod migrations;
 mod projections;
 mod revision;
 mod store;
+mod subthreads;
 
 pub use checkouts::CheckoutLocation;
 pub use store::TramaDb;
+pub use subthreads::{ReviewVerdictRecord, SubthreadFork};
 
 #[cfg(test)]
 mod tests {
