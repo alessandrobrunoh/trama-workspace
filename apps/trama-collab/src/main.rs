@@ -10,7 +10,7 @@ use trama_collab::{
 };
 
 #[derive(Parser)]
-#[command(about = "Local development authentication service for TramaWorkspace")]
+#[command(about = "Local development collaboration service for TramaWorkspace")]
 struct Args {
     #[arg(long, global = true, default_value = "trama-auth.sqlite")]
     db: PathBuf,
@@ -25,6 +25,15 @@ enum Command {
         username: String,
         #[arg(long)]
         password_stdin: bool,
+    },
+    /// Provision a runner credential for an existing user. The token is
+    /// printed once; only its digest is stored. The runner may only claim
+    /// turns authored by that user.
+    CreateRunner {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        name: String,
     },
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
@@ -63,11 +72,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             auth.create_user(&username, &password).await?;
             println!("Created user {username}");
         }
+        Command::CreateRunner { username, name } => {
+            let auth = AuthService::open(args.db, AuthConfig::default())?;
+            let token = auth.create_runner(&username, &name).await?;
+            eprintln!(
+                "Created runner {name} for {username}. Store this token now; it is not shown again:"
+            );
+            println!("{token}");
+        }
         Command::Serve { bind } => {
             validate_bind(bind)?;
             let auth = AuthService::open(args.db, AuthConfig::default())?;
             let listener = tokio::net::TcpListener::bind(bind).await?;
-            println!("Authentication service listening on http://{bind}");
+            println!("Collaboration service listening on http://{bind}");
             axum::serve(
                 listener,
                 router(auth).into_make_service_with_connect_info::<SocketAddr>(),

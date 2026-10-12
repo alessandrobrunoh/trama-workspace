@@ -26,6 +26,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
+mod collab;
+mod live;
+mod sockets;
+
+use live::Hub;
+
 const MAX_BODY_BYTES: usize = 4096;
 const MAX_USERNAME_BYTES: usize = 64;
 /// Maximum password material accepted from stdin in the provisioning CLI.
@@ -79,6 +85,15 @@ struct AppState {
     // Only login performs password hashing; this bounds concurrent hashing.
     hash_slots: Arc<Semaphore>,
     throttle: Arc<Mutex<ThrottleState>>,
+    /// Live fan-out, ephemeral drafts/presence and the event write lock.
+    hub: Arc<Hub>,
+}
+
+/// An authenticated user session.
+#[derive(Clone, Debug)]
+struct Identity {
+    user_id: i64,
+    username: String,
 }
 
 /// In-memory sliding-window login attempt tracking. All state is lost when
@@ -120,6 +135,14 @@ enum AuthError {
     Throttled,
     InvalidInput,
     Database,
+    /// Unknown resource or one the caller may not see; the two are
+    /// deliberately indistinguishable.
+    NotFound,
+    /// Visible to the caller but reserved for the thread owner.
+    Forbidden,
+    /// A command id was reused for a different thread or command kind.
+    Conflict,
+    RateLimited,
 }
 
 impl IntoResponse for AuthError {
@@ -130,6 +153,10 @@ impl IntoResponse for AuthError {
             Self::Throttled => (StatusCode::TOO_MANY_REQUESTS, "too many login attempts"),
             Self::InvalidInput => (StatusCode::BAD_REQUEST, "invalid request"),
             Self::Database => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+            Self::NotFound => (StatusCode::NOT_FOUND, "not found"),
+            Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
+            Self::Conflict => (StatusCode::CONFLICT, "command id already used"),
+            Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "too many requests"),
         };
         (status, Json(ErrorResponse { error })).into_response()
     }
@@ -184,10 +211,14 @@ impl AuthService {
                      user_id INTEGER NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
                      expires_at INTEGER NOT NULL
                  );
-                 CREATE INDEX IF NOT EXISTS auth_sessions_expiry ON auth_sessions(expires_at);
-                 PRAGMA user_version=1;",
+                 CREATE INDEX IF NOT EXISTS auth_sessions_expiry ON auth_sessions(expires_at);",
             )
             .map_err(|e| format!("initialize database: {e}"))?;
+        collab::migrate(&connection)?;
+        // A claim that was open when the previous process stopped has an
+        // unknown outcome: mark it ambiguous instead of offering it again.
+        collab::abandon_all_claims(&connection, (config.clock)())
+            .map_err(|_| "recover runner claims".to_owned())?;
         drop(connection);
         let mut dummy_password = [0_u8; 32];
         random_fill(&mut dummy_password).map_err(|e| format!("prepare dummy password: {e}"))?;
@@ -278,7 +309,40 @@ impl AuthService {
         .await
     }
 
-    async fn current_user(&self, token: String) -> Result<String, AuthError> {
+    /// Provisions a runner credential for `username` and returns the token
+    /// once. Used by the operator CLI; owners can also call `POST /runners`.
+    pub async fn create_runner(&self, username: &str, name: &str) -> Result<String, String> {
+        let database = self.database.clone();
+        let username = username.to_owned();
+        let name = name.to_owned();
+        let now = (self.config.clock)();
+        tokio_blocking(move || {
+            let connection = open_connection(&database).map_err(|_| AuthError::Database)?;
+            let user_id: i64 = connection
+                .query_row(
+                    "SELECT id FROM auth_users WHERE username = ?1 COLLATE NOCASE",
+                    [&username],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| AuthError::Database)?
+                .ok_or(AuthError::NotFound)?;
+            collab::insert_runner(&connection, user_id, &name, now).map(|created| created.token)
+        })
+        .await
+        .map_err(|error| match error {
+            AuthError::NotFound => "unknown username".to_owned(),
+            AuthError::InvalidInput => "runner name does not meet input requirements".to_owned(),
+            AuthError::RateLimited => "too many active runners for this user".to_owned(),
+            _ => "create runner failed".to_owned(),
+        })
+    }
+
+    fn now(&self) -> i64 {
+        (self.config.clock)()
+    }
+
+    async fn authenticate(&self, token: String) -> Result<Identity, AuthError> {
         let database = self.database.clone();
         let now = (self.config.clock)();
         tokio_blocking(move || {
@@ -286,17 +350,28 @@ impl AuthService {
             let digest = Sha256::digest(token.as_bytes()).to_vec();
             connection
                 .query_row(
-                    "SELECT users.username FROM auth_sessions sessions
+                    "SELECT users.id, users.username FROM auth_sessions sessions
                  JOIN auth_users users ON users.id = sessions.user_id
                  WHERE sessions.token_hash = ?1 AND sessions.expires_at > ?2",
                     params![digest, now],
-                    |row| row.get(0),
+                    |row| {
+                        Ok(Identity {
+                            user_id: row.get(0)?,
+                            username: row.get(1)?,
+                        })
+                    },
                 )
                 .optional()
                 .map_err(|_| AuthError::Database)?
                 .ok_or(AuthError::Unauthorized)
         })
         .await
+    }
+
+    async fn current_user(&self, token: String) -> Result<String, AuthError> {
+        self.authenticate(token)
+            .await
+            .map(|identity| identity.username)
     }
 
     async fn logout(&self, token: String) -> Result<(), AuthError> {
@@ -318,12 +393,15 @@ pub fn router(auth: AuthService) -> Router {
         auth,
         hash_slots: Arc::new(Semaphore::new(8)),
         throttle: Arc::new(Mutex::new(ThrottleState::default())),
+        hub: Arc::new(Hub::default()),
     };
-    Router::new()
+    let auth_routes = Router::new()
         .route("/auth/login", post(login))
         .route("/auth/me", get(me))
         .route("/auth/logout", post(logout))
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
+    auth_routes
+        .merge(collab::routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             acquire_hash_slot,
@@ -388,6 +466,8 @@ async fn logout(State(state): State<AppState>, request: Request) -> Result<Statu
             .and_then(|v| v.to_str().ok()),
     )?;
     state.auth.logout(token).await?;
+    // Open sockets re-validate their session and close if it is gone.
+    state.hub.credentials_changed();
     Ok(StatusCode::NO_CONTENT)
 }
 
