@@ -1,73 +1,100 @@
+<div align="center">
+
 # TramaWorkspace
 
-TramaWorkspace is a native macOS development workspace for agent-first coding: a GPUI desktop UI talks JSON-lines to a local daemon that owns long-lived agent sessions, an append-only event store (TramaDB), and execution runtimes that look the same on your laptop or over SSH. Threads are the unit of work — conversation plus isolated checkouts — grouped into multi-repo workspaces rather than a single git root.
+### Your Claude Code, in threads you can fork, review and share.
 
-## Product pillars
+**TramaWorkspace is a source-available, native macOS workspace for agent-first coding.**<br>
+Every thread gets its own isolated checkouts. The agent is your own Claude Code CLI, on your own subscription.
 
-1. **Claude Code, native, no ACP.** Claude sessions are a long-lived `stream-json` subprocess with `--resume` on Claude's own session id. ACP is only a later adapter for *other* agents.
-2. **Remote runners, same interface.** `ExecutionRuntime` is implemented by Local and SSH. Remote is not a file-sync feature; a runner daemon lands in phase 4.
-3. **MCP hybrid.** Project MCP config and extra directories flow through session config; the daemon/runtime owns process lifetime, the UI does not shell out.
-4. **Multi-repo workspace groups.** A workspace is a named group of repositories (e.g. backend + frontend). New threads snapshot default memberships; later workspace edits never mutate existing threads.
+[![License: PolyForm Shield](https://img.shields.io/badge/license-PolyForm%20Shield%201.0.0-1348dc?style=flat-square)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.92%2B-000000?style=flat-square&logo=rust&logoColor=white)](rust-toolchain.toml)
+[![macOS](https://img.shields.io/badge/macOS-native-111111?style=flat-square&logo=apple&logoColor=white)](#quick-start)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-2b7fff?style=flat-square)](CONTRIBUTING.md)
 
-Each new thread gets a separate managed clone for every default-enabled repository, stored beside that repository at `<source>/.trama/worktrees/<thread-id>/<checkout-id>`. The daemon persists its actual path, checkout ID and base commit in TramaDB and starts Claude only with those isolated paths. The local Git `info/exclude` ignores `/.trama/`; the tracked `.gitignore` is unchanged. Existing Application Support checkouts are legacy and remain in place. Clones use `--no-hardlinks` and a `local` remote; Trama never pushes or lands changes automatically.
+[How it works](docs/how-it-works.md) ·
+[Architecture decisions](docs/adr/) ·
+[Delta parity roadmap](plans/delta-parity.md) ·
+[Contributing](CONTRIBUTING.md) ·
+[Security](SECURITY.md)
 
-Thread creation requires each source repo to be clean. Uncommitted or non-ignored untracked files cause an actionable error; ignored files are not copied, while committed files and history are included. Existing copies are never replaced or cleaned automatically. Older threads can be explicitly prepared in place without losing the transcript; their next Claude session is fresh. The **Copie di lavoro** panel distinguishes original repositories from thread copies and offers **Apri in Zed**, **Mostra nel Finder** and **Copia percorso** for ready copies. These are working checkouts, not yet restorable checkpoints. A repository can commit `.agents/linked` and an executable `.agents/prepare` (overrides: `.trama/linked`, `.trama/prepare`) that Trama runs in every new checkout and subthread copy; a failure is shown on the copy, never deletes it. See [project setup](docs/project-setup.md).
+</div>
 
-Subthreads (plain, review, land) are children of any thread, at any depth. A subthread gets its own repo-local copy of each parent checkout at its current state (uncommitted and untracked non-ignored files included, ignored files never) and forks the parent's Claude session (`--resume <id> --fork-session`); it then diverges. **Changes** diffs a thread against its base, `HEAD`, or the last turn's starting state; **Pull Changes** merges a subthread's edits since its fork point into the parent's working tree file by file and reports conflicts, without committing. A review subthread starts with a change guide and its verdict (approve / request changes) is posted to the parent. A land subthread follows the repository's land skill (`SKILL.md` with `metadata: { trama-action: land }` under `.claude/skills` or `.agents/skills`) or proposes one; Trama itself still never pushes or merges. **Fork** at a message starts a child whose conversation ends with that turn and whose files are that turn's checkpoint (recorded at the end of every turn under `refs/trama/checkpoints/`): hover a message and click the fork icon in its gutter, or ⌘K → *Fork from here* for the turn under the rail pointer (or at the top of the view), then give an optional title, first prompt and kind (plain or review). Messages from before fork points were recorded show the action disabled. The sidebar nests children at any depth (indentation stops at 6 levels, deeper rows show their depth), with a collapse chevron per thread and *Show N more* after 6 children.
+---
 
-When Claude delegates, it creates Trama subagents instead of its built-in subagents: every session gets Trama's MCP server (`trama-daemon mcp`) with `spawn_subagent`, `wait_for_threads`, `thread_status`, `send_to_thread` and `list_threads`, and the built-in `Agent`/`Task` tool is disallowed (`config.json` `"subagents": {"allow_builtin_subagents": true}` re-enables it). A subagent is a regular thread you can open and chat with: a worker edits its own copy and its changes are merged back into the parent when it finishes, a scout reads the parent's checkout, a reviewer reviews it. At most 4 run per thread and 8 overall (`max_running_per_thread`, `max_running_total`); the rest are queued. In the sidebar and the subthread header a subagent shows its profile (worker, scout, reviewer) and its task status (queued, running, waiting to sync, failed, done), updated live; the parent's transcript links each spawn, completion and agent-to-agent message to the other thread. See [ADR 0010](docs/adr/0010-subagents-and-forks.md).
+## Why TramaWorkspace
 
-Tool calls, thinking and subagent lifecycle are stored per turn (bounded in size) next to the turn's answer, so diffs, command blocks and summary rows reappear after a restart. See [ADR 0011](docs/adr/0011-turn-activity.md).
+A coding agent in a terminal works on one checkout, in one conversation, for one person. Real work branches: you want to try two approaches side by side, hand a review to a second agent, fork from the turn before things went wrong, or let a teammate follow along and comment.
 
-Comments anchor to a transcript span (byte range of the message text), to code lines in a thread's checkout, or to a diff hunk, and support replies and resolve/reopen. A new comment is pending until the next prompt (or an explicit **send comments**): the agent then receives a `<review-comments>` block quoting each anchored passage, followed by the user's text, and the stored user message is exactly what was sent. Delivered comments record the prompt and turn that carried them and the assistant message that answered. Code anchors are relocated against the current checkout on every listing (resolved line, fuzzy, or orphaned; never reattached silently). A subthread's comments stay in that subthread.
+TramaWorkspace is a workspace in the style of [Delta](https://delta.dev) built around that. A GPUI desktop app talks to a local daemon that owns long-lived Claude Code sessions, an append-only event store (TramaDB) and a managed copy of your repositories for every thread. **Threads** are the unit of work: a conversation plus isolated checkouts, grouped into multi-repo workspaces (for example backend + frontend) rather than a single git root.
 
-Shared threads (protocol v8) go through a separate, loopback-only collaboration service (`apps/trama-collab`, ADR 0008/0009). `ConnectCollab` signs the daemon in with a username and password and stores the session token and a runner token owner-only in `<app dir>/collab-credentials.json` (the password is not stored; tokens are never logged). A top-level thread can be shared (invite or link access) or a shared thread joined into a new local thread with this machine's own checkouts. Sending in a shared thread submits the turn to the service; the daemon's runner then claims it back and runs it locally through the normal send path (checkout, approvals, billing guard). A turn always runs on the machine of the person who pressed Send with that person's `claude` login: the runner only claims turns this daemon submitted, whose shared-log author is the signed-in user, and refuses a runner token of another user. Other participants' messages, answers, comments, verdicts and change summaries are mirrored into the local transcript (actor `collab:<username>`) from a cursor stored in TramaDB, so reconnects neither skip nor duplicate; live agent output, drafts and presence are relayed but not stored. A claim the daemon cannot confirm (lost connection, restart) is marked ambiguous and never retried.
+> **Status:** early-stage and not yet considered production-ready (see [SECURITY.md](SECURITY.md)). macOS only, built from source.
 
-## Crate map
+## Features
 
-```
-trama-workspace
-├── apps/
-│   ├── trama-desktop    # GPUI Kit UI (TramaWorkspace.app)
-│   ├── trama-daemon     # local session manager, Unix-socket IPC
-│   └── trama-runner     # remote execution daemon (phase 4)
-└── crates/
-    ├── trama-domain     # persistent core types and ports (frozen)
-    ├── trama-protocol   # versioned JSON-lines IPC
-    ├── trama-db         # TramaDB: SQLite WAL, event log, FTS5, blobs
-    └── trama-infra      # Claude driver, git, Local/SSH runtimes, MCP
-```
+Everything below exists on `main` today. Details are in [docs/how-it-works.md](docs/how-it-works.md).
 
-Architecture notes live in [`docs/adr/`](docs/adr/).
+**Threads and checkouts**
 
-## Quickstart
+- **Isolated copy per thread.** Each thread gets its own clone of every repository in the workspace, beside the source at `<repo>/.trama/worktrees/`. The agent never runs in the repository you added, and TramaWorkspace never pushes, merges or lands on its own.
+- **Subthreads at any depth.** A child thread copies its parent's current files and forks its Claude session, then diverges. The sidebar shows the tree.
+- **Fork at any message.** Every turn records a checkpoint; fork from a message to get that turn's files and the conversation up to it.
+- **Review, land and pull.** A review subthread posts an approve / request-changes verdict to its parent. A land subthread follows your repository's land skill. **Pull Changes** merges a subthread's edits into the parent's working tree file by file and reports conflicts, without committing.
+- **Trama-native subagents.** When Claude delegates, it spawns real threads you can open and talk to (worker, scout, reviewer) through TramaWorkspace's MCP server, instead of hidden in-process subagents. A worker's changes are pulled back into the parent when it finishes.
+- **Project setup hooks.** Commit `.agents/prepare` and `.agents/linked` (the same names as Delta) to install or link dependencies in every new checkout. See [project setup](docs/project-setup.md).
 
-Requires a current stable Rust (see `rust-toolchain.toml`) on macOS.
+**Reviewing what the agent did**
+
+- **Changes drawer** (⌘R): diffs against the thread's base, `HEAD`, or the start of the last turn, with per-file seen state.
+- **Comments, Delta style.** Select text in the transcript or lines in a diff and start typing. Comments stay pending and are delivered with your next prompt, quoting the passage they refer to. Replies and resolve / reopen included.
+- **Turn rail.** One tick per turn along the transcript, with a hover preview and bookmarks.
+- **Tool views.** Diffs, command blocks and thinking render inline, and are stored per turn so they survive a restart.
+
+**Talking to the agent**
+
+- **Composer:** `@` mentions for files, directories, threads and people; `/` for your Claude Code skills and commands; `!` for inline terminals whose output you can attach to a prompt. See [composer](docs/composer.md).
+- **Model picker** per thread. Sonnet 5.5 is the default; Opus 5.5, Haiku 5.5 and Fable 5.1 are available.
+- **Approvals.** Tool calls that need permission show up inline: allow once (⌘Y), allow for the session (⌘⇧Y) or deny (⌘⇧N).
+- **Keyboard first.** ⌘K switcher and commands, ⌘N new thread, ⌘/ for all shortcuts.
+
+**Working together**
+
+- **Shared threads.** Share a thread by invite or link (⌘⇧S); others join it into their own project with their own checkouts. Messages, answers, comments and verdicts are mirrored; drafts ("*bob is typing*") and presence are live. Today this runs through a **local, loopback-only** collaboration service (`trama-collab`). See [Try sharing locally](#try-sharing-locally).
+
+## How Claude Code is used
+
+TramaWorkspace does not ship an agent and does not call the Anthropic API itself. It drives the `claude` binary you already have. The rules are set in [ADR 0008](docs/adr/0008-claude-subscription-and-multiplayer-turns.md):
+
+- **Your own, unmodified `claude`.** Each thread runs your locally installed, logged-in Claude Code as a long-lived `stream-json` process. Your `CLAUDE.md`, skills and MCP servers keep working (`--bare` is never passed).
+- **Your subscription.** Usage counts against your normal Claude plan. By default `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are removed from the child process, so it bills your login, not the API. API-key billing is an explicit opt-in (`"billing": "api_key"` in `config.json`), and the app shows which source Claude reports.
+- **No credential handling.** TramaWorkspace never reads, stores or proxies your Claude.ai login or tokens.
+- **Everyone uses their own Claude.** In a shared thread, a turn always runs on the machine of the person who pressed Send, with that person's own `claude` login. The collaboration service replicates the conversation; it never forwards one person's prompt into another person's Claude session, and a runner can only claim its own user's turns.
+
+Usage rules can change. Check Anthropic's terms for your plan; this README is not legal advice.
+
+## Quick start
+
+**Requirements:** macOS, a stable Rust toolchain (see [`rust-toolchain.toml`](rust-toolchain.toml); minimum 1.92), and [Claude Code](https://code.claude.com) installed and logged in.
 
 ```bash
+git clone https://github.com/alessandrobrunoh/trama-workspace.git
+cd trama-workspace
+
 # Build once, before starting either process
 cargo build --workspace --all-targets
 
 # Local daemon (Unix socket under Application Support)
 ./target/debug/trama-daemon
 
-# Desktop UI (separate terminal)
+# Desktop app (separate terminal)
 ./target/debug/TramaWorkspace
 ```
 
-To run an isolated instance (separate socket, database and config) without
-touching your real data, set `TRAMA_DATA_DIR=/some/dir` for both processes.
-Do not override `HOME` for that: the `claude` child process needs your real
-`HOME` to find your Claude Code login.
+The first build is heavy (GPUI). The workspace is tuned for small disks: one build job, no debug symbols, no incremental state. See [build and disk usage](docs/build-and-space.md). Starting the binaries directly does not take Cargo's build lock, so do not start parallel `cargo run` / `check` / `test` commands while building.
 
-Starting the binaries directly does not acquire Cargo's build lock. Do not
-start parallel `cargo run`/check/test commands while building. The desktop also
-offers **Start daemon** when the sibling binary is installed and no daemon is
-listening. Stop old app/daemon processes before restarting with protocol v10.
-Build profiles and editor-check settings are described in
-[build and disk usage](docs/build-and-space.md).
+The app offers **Start daemon** when the sibling binary is installed and no daemon is listening. Then create a project, add a local Git repository (it must be clean) and start a thread. See [onboarding and migration](docs/onboarding-and-migration.md).
 
-The UI and daemon speak newline-delimited JSON (`crates/trama-protocol`). First message on a connection must be `Hello` with `protocol_version = 10`. A mismatch is rejected at the handshake; it does not rewrite stored threads or workspace ids. See [onboarding and legacy migration](docs/onboarding-and-migration.md).
+**Isolated instance.** To run a separate instance (own socket, database, config and checkouts) without touching your real data, set `TRAMA_DATA_DIR=/some/dir` for both processes. Do not override `HOME` for that: the `claude` child process needs your real `HOME` to find your Claude Code login.
 
 ## Try sharing locally
 
@@ -115,17 +142,104 @@ In each app:
    Turning the link off or removing a member revokes access at once; local
    history stays.
 
+## Architecture
+
+```text
+  TramaWorkspace.app (GPUI)
+          │  JSON lines over a Unix socket (protocol v10)
+          ▼
+  trama-daemon ─────────────────► claude  (your binary, one per session)
+   │  TramaDB (SQLite)              │  approval hook and MCP helper call back
+   │  isolated checkouts            │  into the daemon with per-session tokens
+   │  terminals, setup hooks        ▼
+   │                            trama-daemon approval-hook / trama-daemon mcp
+   │
+   └── HTTP + WebSocket ────────► trama-collab  (optional, loopback only)
+                                   accounts, shared threads, runner claims
+```
+
+```text
+trama-workspace
+├── apps/
+│   ├── trama-desktop          # GPUI Kit UI (TramaWorkspace.app)
+│   ├── trama-daemon           # local session manager, Unix-socket IPC, approval hook, MCP helper
+│   ├── trama-collab           # collaboration service: accounts, shared threads, runner claims
+│   └── trama-runner           # remote execution daemon (scaffold)
+└── crates/
+    ├── trama-domain           # persistent core types and ports, no I/O
+    ├── trama-protocol         # versioned JSON-lines IPC between UI and daemon
+    ├── trama-collab-protocol  # wire types for trama-collab (HTTP bodies, WebSocket frames)
+    ├── trama-db               # TramaDB: SQLite WAL, append-only event log, FTS5, blobs
+    └── trama-infra            # Claude Code driver, git checkouts and changes, setup hooks, PTYs
+```
+
+Invariants every change keeps:
+
+- The first message on a connection is `Hello` with `protocol_version = 10`. A mismatch is rejected at the handshake and never rewrites stored data; restart the app and the daemon together after a protocol bump.
+- TramaDB migrations are applied by position and only ever appended.
+- Agents run in isolated checkouts only; nothing is pushed, merged or landed automatically.
+- Unbuilt features must not look operational.
+
+## Documentation
+
+| | |
+|---|---|
+| [docs/how-it-works.md](docs/how-it-works.md) | Checkouts, subthreads, forks, subagents, comments and shared threads in detail |
+| [docs/onboarding-and-migration.md](docs/onboarding-and-migration.md) | Creating workspaces, adding repositories, migrating legacy threads |
+| [docs/project-setup.md](docs/project-setup.md) | `.agents/prepare` and `.agents/linked` |
+| [docs/composer.md](docs/composer.md) | `@` mentions, `/` skills, models and `!` terminals |
+| [docs/build-and-space.md](docs/build-and-space.md) | Building on a small disk |
+| [docs/standalone-auth.md](docs/standalone-auth.md) | The collaboration service's authentication |
+| [apps/trama-collab/README.md](apps/trama-collab/README.md) | Collaboration service: provisioning and HTTP/WebSocket API |
+| [plans/delta-parity.md](plans/delta-parity.md) | Delta concepts mapped to TramaWorkspace, and what is next |
+
+**Architecture decision records**
+
+| ADR | Decision |
+|---|---|
+| [0001](docs/adr/0001-ui-framework-gpui-kit.md) | UI framework is GPUI Kit |
+| [0002](docs/adr/0002-claude-code-native-stream-json.md) | Claude Code via a native stream-json subprocess |
+| [0003](docs/adr/0003-tramadb-sqlite-event-log.md) | TramaDB is SQLite WAL plus an append-only event log |
+| [0004](docs/adr/0004-execution-runtime-local-ssh.md) | ExecutionRuntime: local and SSH, same interface |
+| [0005](docs/adr/0005-workspace-is-a-repo-group.md) | A workspace is a group of repos; threads snapshot defaults |
+| [0006](docs/adr/0006-daemon-real-sessions.md) | The daemon owns processes and persistence |
+| [0007](docs/adr/0007-standalone-auth.md) | Standalone local authentication service |
+| [0008](docs/adr/0008-claude-subscription-and-multiplayer-turns.md) | Claude subscription usage and who runs a multiplayer turn |
+| [0009](docs/adr/0009-collab-shared-threads.md) | Shared threads in the collaboration service |
+| [0010](docs/adr/0010-subagents-and-forks.md) | Subagents as threads, nested subthreads, fork at a message |
+| [0011](docs/adr/0011-turn-activity.md) | Store each turn's tool activity |
+
 ## Roadmap
 
-| Phase | Focus |
-|-------|--------|
-| 0 | Domain model, protocol, daemon skeleton, CI |
-| 1 | GPUI desktop shell, thread list, live event stream |
-| 2 | TramaDB persistence, FTS, content-addressed file revisions |
-| 3 | Native Claude Code adapter, approvals, mock → real sessions |
-| 4 | Runner daemon + SSH `ExecutionRuntime` (same interface as local) |
-| 5 | Multi-repo isolated checkouts, comments, checkpoints, MCP hybrid |
+Not built yet:
+
+- **Hosted collaboration.** Running `trama-collab` on a server (for example a VPS) with TLS ingress, durable rate limiting, backups and retention. Today it only listens on loopback.
+- **Web client** for reading, commenting on and reviewing shared threads without a local runner.
+- **Remote execution.** The SSH `ExecutionRuntime` and the `trama-runner` daemon.
+- **Review loop.** Reverting conversation and files to a turn, and seen state synced between participants.
+- **Multiplayer extras.** Organization-level access, follow mode, an @mention inbox, resolving ambiguous turns, interrupting a shared turn.
+- **Agent ergonomics.** Dev servers on `<thread>.<repo>.localhost`, notifications, pin and archive, thread search.
+
+See [plans/delta-parity.md](plans/delta-parity.md) for the full plan.
+
+## Contributing
+
+TramaWorkspace is early-stage and the architecture is still evolving. Small fixes, docs and tests can go straight to a pull request. For anything touching the protocol, the database schema, how Claude Code is spawned or the collaboration service, please open an issue or discussion first.
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md), sign the [CLA](CLA.md) on your first pull request, and follow the [Code of Conduct](CODE_OF_CONDUCT.md). If you find a vulnerability, follow [SECURITY.md](SECURITY.md) rather than opening a public issue.
 
 ## License
 
-Apache-2.0
+TramaWorkspace is **source-available** under the [PolyForm Shield License 1.0.0](LICENSE). It is not an OSI-approved open-source license.
+
+| You can | You can't |
+|---|---|
+| Use it, for yourself or inside your company | Use it to build a product or service that competes with TramaWorkspace |
+| Read, modify and run it | Resell it, or offer it as a hosted service in competition with TramaWorkspace |
+| Fork it and contribute back | Remove the license and notices ([NOTICE](NOTICE)) |
+
+Want to do something the license doesn't allow, such as a commercial or hosted offering? Get in touch for a separate license.
+
+Contributions are welcome. By opening a pull request you agree to the [Contributor License Agreement](CLA.md): you keep your copyright, and the maintainer can distribute your work under this license and under other terms in the future.
+
+This is a summary, not legal advice. The [license text](LICENSE) is what counts.
