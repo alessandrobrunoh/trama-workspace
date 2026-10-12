@@ -13,6 +13,7 @@ mod archive;
 mod checkouts;
 mod codec;
 mod collab;
+mod collab_history;
 mod comments;
 mod composer;
 mod content;
@@ -27,6 +28,9 @@ pub use agents::SubagentRecord;
 pub use archive::ThreadCheckoutRow;
 pub use checkouts::CheckoutLocation;
 pub use collab::{CollabLink, CollabTurn};
+pub use collab_history::{
+    CollabApplied, CollabApply, FamilyRow, OutboxJob, OutboxRow, RemoteChangesRow,
+};
 pub use comments::CommentRecord;
 pub use composer::AgentCommands;
 pub use store::TramaDb;

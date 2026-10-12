@@ -15,6 +15,7 @@ pub(crate) fn migrations() -> Migrations<'static> {
         M::up(include_str!("../migrations/0008_subagents_checkpoints.sql")),
         M::up(include_str!("../migrations/0009_turn_activity.sql")),
         M::up(include_str!("../migrations/0010_thread_archive.sql")),
+        M::up(include_str!("../migrations/0011_collab_history.sql")),
     ])
 }
 
