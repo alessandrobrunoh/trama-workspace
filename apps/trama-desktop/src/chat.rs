@@ -215,6 +215,13 @@ impl ChatPanel {
         cx.notify();
     }
 
+    /// Take the composer draft (for "send to subthread").
+    pub fn take_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<String> {
+        let draft = self.composer.take_prompt(window, cx);
+        cx.notify();
+        draft
+    }
+
     /// Dot shown next to the selected thread in the sidebar.
     pub fn thread_status(&self) -> ThreadStatus {
         if self.has_open_approval() {

@@ -7,6 +7,7 @@ use gpui_kit::component::{
     command::{Command, CommandGroup, CommandItem, CommandState},
     h_flex,
     kbd::Kbd,
+    notification::Notification,
     theme::ThemeMode,
     tooltip::Tooltip,
     v_flex,
@@ -15,7 +16,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use trama_domain::agent::ApprovalDecision;
 use trama_domain::ids::{ThreadId, WorkspaceId};
-use trama_protocol::{ClientMessage, DaemonMessage};
+use trama_protocol::{ClientMessage, DaemonMessage, LandOutcome, SubthreadKind, ThreadKind};
 
 use crate::changes::{ChangesEvent, ChangesPanel, DrawerTab, render_drawer};
 use crate::chat::ChatPanel;
@@ -26,6 +27,9 @@ use crate::onboarding::{Link, OnboardingRequest};
 use crate::projects::{NewThreadEvent, NewThreadView, ProjectsEvent, ProjectsPanel};
 use crate::sidebar::{SidebarEvent, SidebarPanel, status_dot};
 use crate::startup::{DaemonLocate, DaemonStart};
+use crate::subthreads::{
+    PullSummary, SubthreadBar, land_label, subthread_parent, title_from_prompt,
+};
 use crate::theme::{self, Palette};
 
 /// What a palette row does when confirmed.
@@ -39,6 +43,9 @@ enum PaletteTarget {
     PrepareCheckout,
     ToggleAppearance,
     Shortcuts,
+    Review,
+    Land,
+    PullChanges,
 }
 
 pub struct Workspace {
@@ -49,12 +56,15 @@ pub struct Workspace {
     projects: Entity<ProjectsPanel>,
     new_thread: Entity<NewThreadView>,
     changes: Entity<ChangesPanel>,
+    subthread_bar: Entity<SubthreadBar>,
     palette: Entity<CommandState>,
     palette_query: String,
     drawer_open: bool,
     drawer_tab: DrawerTab,
     /// `ChatPanel::completed_turns` last seen; a change refreshes Changes.
     seen_completed_turns: u64,
+    /// Subthread this window asked for, to follow it once created.
+    pending_subthread: Option<(ThreadId, SubthreadKind)>,
     client: DaemonClient,
     connected: bool,
     _subscriptions: Vec<Subscription>,
@@ -75,6 +85,9 @@ impl Workspace {
         let projects = cx.new(|cx| ProjectsPanel::new(sidebar.clone(), window, cx));
         let new_thread = cx.new(|cx| NewThreadView::new(sidebar.clone(), window, cx));
         let changes = cx.new(|_| ChangesPanel::new());
+        let bar_client = client.clone();
+        let bar_sidebar = sidebar.clone();
+        let subthread_bar = cx.new(|cx| SubthreadBar::new(bar_client, bar_sidebar, window, cx));
         let palette = cx.new(|cx| CommandState::new(window, cx));
 
         let subscriptions = vec![
@@ -96,6 +109,7 @@ impl Workspace {
             cx.subscribe(&changes, |this, _, event, cx| match event {
                 ChangesEvent::Refresh => this.refresh_changes(cx),
             }),
+            cx.observe(&subthread_bar, |_, _, cx| cx.notify()),
             cx.observe(&sidebar, |_, _, cx| cx.notify()),
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
                 this.on_sidebar_event(event, window, cx);
@@ -145,11 +159,13 @@ impl Workspace {
             projects,
             new_thread,
             changes,
+            subthread_bar,
             palette,
             palette_query: String::new(),
             drawer_open: crate::devhooks::from_env().is_some_and(|dev| dev.drawer),
             drawer_tab: DrawerTab::default(),
             seen_completed_turns: 0,
+            pending_subthread: None,
             client,
             connected: false,
             _subscriptions: subscriptions,
@@ -178,6 +194,117 @@ impl Workspace {
         if self.client.send(message) == crate::net::SendStatus::Enqueued {
             self.changes
                 .update(cx, |changes, cx| changes.begin_loading(thread_id, cx));
+        }
+    }
+
+    fn selected_thread_kind(&self, cx: &App) -> Option<ThreadKind> {
+        let onboarding = &self.sidebar.read(cx).onboarding;
+        let id = onboarding.selected_thread.as_ref()?;
+        onboarding.thread(id).map(|thread| thread.kind)
+    }
+
+    /// Fork a subthread from the selected thread (or its parent).
+    fn create_subthread(
+        &mut self,
+        kind: SubthreadKind,
+        initial_prompt: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let parent = {
+            let onboarding = &self.sidebar.read(cx).onboarding;
+            onboarding
+                .selected_thread
+                .as_ref()
+                .and_then(|selected| subthread_parent(&onboarding.threads, selected))
+        };
+        let Some(parent) = parent else {
+            return false;
+        };
+        let title = initial_prompt
+            .as_deref()
+            .map(title_from_prompt)
+            .filter(|title| !title.is_empty());
+        let message = ClientMessage::CreateSubthread {
+            parent_thread_id: parent.clone(),
+            kind,
+            title,
+            initial_prompt,
+        };
+        if self.client.send(message) == crate::net::SendStatus::Rejected {
+            window.push_notification(
+                Notification::error("The daemon is not connected; no subthread was created."),
+                cx,
+            );
+            return false;
+        }
+        self.pending_subthread = Some((parent, kind));
+        true
+    }
+
+    /// Delta's "send to subthread": the composer draft becomes the first
+    /// prompt of a new plain subthread; this thread stays selected.
+    fn send_to_subthread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.connected {
+            return;
+        }
+        let Some(thread_id) = self.sidebar.read(cx).onboarding.selected_thread.clone() else {
+            return;
+        };
+        let Some(draft) = self.chat.update(cx, |chat, cx| chat.take_draft(window, cx)) else {
+            window.push_notification(
+                Notification::info("Write a prompt first, then press \u{2318}\u{21e7}Enter."),
+                cx,
+            );
+            return;
+        };
+        if !self.create_subthread(SubthreadKind::Plain, Some(draft.clone()), window, cx) {
+            self.chat.update(cx, |chat, cx| {
+                chat.restore_prompt(&thread_id, &draft, window, cx);
+            });
+        }
+    }
+
+    fn start_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_thread_kind(cx) == Some(ThreadKind::Top) {
+            self.create_subthread(SubthreadKind::Review, None, window, cx);
+        }
+    }
+
+    fn confirm_land(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_thread_kind(cx) != Some(ThreadKind::Top) {
+            return;
+        }
+        let workspace = cx.weak_entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let workspace = workspace.clone();
+            alert
+                .confirm()
+                .title("Land this thread?")
+                .description(
+                    "A land subthread starts from a copy of this thread and follows the repository's land skill, which may commit, push or merge. Without a land skill the agent proposes one instead of landing.",
+                )
+                .ok_text("Start land")
+                .cancel_text("Cancel")
+                .on_ok(move |_, window, cx| {
+                    let _ = workspace.update(cx, |this, cx| {
+                        this.create_subthread(SubthreadKind::Land, None, window, cx);
+                    });
+                    true
+                })
+        });
+    }
+
+    fn pull_selected(&mut self, cx: &mut Context<Self>) {
+        let onboarding = &self.sidebar.read(cx).onboarding;
+        let Some(id) = onboarding.selected_thread.clone() else {
+            return;
+        };
+        if onboarding
+            .thread(&id)
+            .is_some_and(|thread| thread.parent_thread_id.is_some())
+        {
+            self.subthread_bar.update(cx, |bar, cx| bar.pull(id, cx));
         }
     }
 
@@ -226,6 +353,7 @@ impl Workspace {
     fn focus_thread(&mut self, thread_id: Option<ThreadId>, cx: &mut Context<Self>) {
         self.copies
             .update(cx, |copies, cx| copies.select(thread_id.clone(), cx));
+        self.subthread_bar.update(cx, |bar, cx| bar.reset_form(cx));
         self.chat.update(cx, |chat, cx| {
             chat.set_thread(None, cx);
             chat.set_thread(thread_id, cx);
@@ -444,6 +572,27 @@ impl Workspace {
                 true,
             ),
             (
+                "Review this thread in a subthread",
+                IconName::MessageSquareDiff,
+                PaletteTarget::Review,
+                connected && self.selected_thread_kind(cx) == Some(ThreadKind::Top),
+            ),
+            (
+                "Land this thread",
+                IconName::PlaneLanding,
+                PaletteTarget::Land,
+                connected && self.selected_thread_kind(cx) == Some(ThreadKind::Top),
+            ),
+            (
+                "Pull subthread changes into parent",
+                IconName::GitMerge,
+                PaletteTarget::PullChanges,
+                connected
+                    && self
+                        .selected_thread_kind(cx)
+                        .is_some_and(|kind| kind != ThreadKind::Top),
+            ),
+            (
                 "Prepare isolated checkout for this thread",
                 IconName::GitBranch,
                 PaletteTarget::PrepareCheckout,
@@ -515,6 +664,9 @@ impl Workspace {
             }
             PaletteTarget::ToggleAppearance => self.toggle_appearance(cx),
             PaletteTarget::Shortcuts => self.open_shortcuts(window, cx),
+            PaletteTarget::Review => self.start_review(window, cx),
+            PaletteTarget::Land => self.confirm_land(window, cx),
+            PaletteTarget::PullChanges => self.pull_selected(cx),
         }
         cx.notify();
     }
@@ -762,6 +914,45 @@ impl Workspace {
                     self.dispatch_request(request, cx);
                 }
             }
+            DaemonMessage::SubthreadCreated(snapshot) => {
+                let ours = self
+                    .pending_subthread
+                    .as_ref()
+                    .is_some_and(|(parent, kind)| {
+                        snapshot.parent_thread_id.as_ref() == Some(parent)
+                            && kind.thread_kind() == snapshot.kind
+                    });
+                let id = snapshot.id.clone();
+                let kind = snapshot.kind;
+                let title = snapshot.title.clone();
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.onboarding.apply_subthread(snapshot);
+                    cx.notify();
+                });
+                if ours {
+                    self.pending_subthread = None;
+                    if kind == ThreadKind::Sub {
+                        window.push_notification(
+                            Notification::success(format!(
+                                "Started subthread \u{201c}{title}\u{201d}."
+                            ))
+                            .title("Sent to subthread"),
+                            cx,
+                        );
+                    } else {
+                        self.sidebar
+                            .update(cx, |sidebar, cx| sidebar.select_thread(id, cx));
+                    }
+                }
+            }
+            DaemonMessage::Subthreads { threads, .. } => {
+                self.sidebar.update(cx, |sidebar, cx| {
+                    for thread in threads {
+                        sidebar.onboarding.apply_subthread(thread);
+                    }
+                    cx.notify();
+                });
+            }
             DaemonMessage::Changes {
                 thread_id,
                 base,
@@ -769,6 +960,65 @@ impl Workspace {
             } => {
                 self.changes.update(cx, |changes, cx| {
                     changes.set_changes(&thread_id, base, &repos, cx);
+                });
+            }
+            DaemonMessage::ChangesPulled {
+                subthread_id,
+                parent_thread_id,
+                repos,
+            } => {
+                let summary = PullSummary::from_repos(&repos);
+                let note = if summary.conflicts > 0 {
+                    Notification::warning(summary.text())
+                } else {
+                    Notification::success(summary.text())
+                };
+                window.push_notification(note.title("Pulled changes into parent"), cx);
+                self.subthread_bar.update(cx, |bar, cx| {
+                    bar.apply_pull(subthread_id.clone(), repos, cx);
+                });
+                let selected = self.sidebar.read(cx).onboarding.selected_thread.clone();
+                if selected == Some(parent_thread_id) || selected == Some(subthread_id) {
+                    self.refresh_changes(cx);
+                }
+            }
+            DaemonMessage::ReviewVerdictPosted {
+                review_thread_id,
+                verdict,
+                ..
+            } => {
+                let approved = matches!(verdict, trama_protocol::ReviewVerdict::Approve);
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar
+                        .onboarding
+                        .set_review_verdict(&review_thread_id, verdict);
+                    cx.notify();
+                });
+                self.subthread_bar
+                    .update(cx, |bar, cx| bar.apply_verdict(&review_thread_id, cx));
+                window.push_notification(
+                    if approved {
+                        Notification::success("Review approved; posted to the parent thread.")
+                    } else {
+                        Notification::warning("Changes requested; posted to the parent thread.")
+                    },
+                    cx,
+                );
+            }
+            DaemonMessage::LandResult {
+                land_thread_id,
+                outcome,
+                summary,
+                ..
+            } => {
+                let note = match outcome {
+                    LandOutcome::Landed => Notification::success(summary.clone()),
+                    LandOutcome::Failed => Notification::error(summary.clone()),
+                    LandOutcome::Proposed => Notification::warning(summary.clone()),
+                };
+                window.push_notification(note.title(land_label(outcome)), cx);
+                self.subthread_bar.update(cx, |bar, cx| {
+                    bar.apply_land(land_thread_id, outcome, summary, cx);
                 });
             }
             DaemonMessage::Error { message, .. }
@@ -779,6 +1029,8 @@ impl Workspace {
                 // The pending GetChanges failed (e.g. no last turn yet).
             }
             DaemonMessage::Error { code, message } => {
+                self.pending_subthread = None;
+                self.subthread_bar.update(cx, |bar, cx| bar.note_error(cx));
                 self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.onboarding.note_error(&code, &message);
                     cx.notify();
@@ -885,6 +1137,8 @@ impl Workspace {
             ),
         };
         let drawer_open = self.drawer_open;
+        let can_fork =
+            link == Link::Online && self.selected_thread_kind(cx) == Some(ThreadKind::Top);
 
         TitleBar::new()
             .h(theme::title_bar_height())
@@ -952,6 +1206,30 @@ impl Workspace {
                             .px(theme::sp(2.))
                             .gap(theme::sp(1.))
                             .items_center()
+                            .when(can_fork, |this| {
+                                this.child(
+                                    Button::new("titlebar-review")
+                                        .ghost()
+                                        .small()
+                                        .icon(IconName::MessageSquareDiff)
+                                        .label("Review")
+                                        .tooltip("Start a review subthread for this thread's changes")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.start_review(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("titlebar-land")
+                                        .ghost()
+                                        .small()
+                                        .icon(IconName::PlaneLanding)
+                                        .label("Land")
+                                        .tooltip("Land this thread's changes with the repository's land skill")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.confirm_land(window, cx);
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new("titlebar-palette")
                                     .ghost()
@@ -1036,7 +1314,7 @@ impl Workspace {
             )
             .child(counts)
             .child(div().flex_1())
-            .child("\u{2318}K jump · \u{2318}N new · \u{2318}R changes · \u{2318}/ shortcuts")
+            .child("\u{2318}K jump · \u{2318}N new · \u{2318}\u{21e7}\u{23ce} subthread · \u{2318}R changes · \u{2318}/ shortcuts")
     }
 }
 
@@ -1060,7 +1338,11 @@ impl Render for Workspace {
         let daemon_feedback = self.sidebar.read(cx).onboarding.daemon_feedback.clone();
 
         let center = if matches!(link, Link::Online) {
-            self.chat.clone().into_any_element()
+            v_flex()
+                .size_full()
+                .child(self.subthread_bar.clone())
+                .child(div().flex_1().min_h_0().child(self.chat.clone()))
+                .into_any_element()
         } else {
             connection_panel(
                 &p,
@@ -1097,6 +1379,11 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &keymap::CloseOverlay, window, cx| {
                 this.close_overlay(window, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &keymap::SendToSubthread, window, cx| {
+                    this.send_to_subthread(window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &keymap::AllowOnce, _, cx| {
                 this.answer_approval(ApprovalDecision::AllowOnce, cx);
             }))

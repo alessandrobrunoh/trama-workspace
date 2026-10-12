@@ -510,6 +510,36 @@ impl Onboarding {
         }
     }
 
+    pub fn thread(&self, id: &ThreadId) -> Option<&ThreadSnapshot> {
+        self.threads.iter().find(|thread| &thread.id == id)
+    }
+
+    /// Add or refresh a subthread without selecting it. Ignored unless its
+    /// parent belongs to the threads shown (snapshots carry no workspace).
+    pub fn apply_subthread(&mut self, snapshot: ThreadSnapshot) -> bool {
+        let known = self.threads.iter().any(|thread| {
+            thread.id == snapshot.id || Some(&thread.id) == snapshot.parent_thread_id.as_ref()
+        });
+        if known {
+            upsert_thread(&mut self.threads, snapshot);
+        }
+        known
+    }
+
+    pub fn set_review_verdict(
+        &mut self,
+        review_thread_id: &ThreadId,
+        verdict: trama_protocol::ReviewVerdict,
+    ) {
+        if let Some(thread) = self
+            .threads
+            .iter_mut()
+            .find(|thread| &thread.id == review_thread_id)
+        {
+            thread.review_verdict = Some(verdict);
+        }
+    }
+
     pub fn apply_thread_created(&mut self, snapshot: ThreadSnapshot) -> Vec<OnboardingRequest> {
         let id = snapshot.id.clone();
         upsert_thread(&mut self.threads, snapshot);
@@ -831,6 +861,39 @@ mod tests {
             path,
             default_enabled: true,
         }
+    }
+
+    #[test]
+    fn subthreads_join_the_list_only_under_a_known_parent_and_keep_verdicts() {
+        let mut state = online();
+        state.apply_threads(vec![thread("top", "Top")]);
+        state.selected_thread = Some(tid("top"));
+        let mut review = thread("rev", "Review");
+        review.parent_thread_id = Some(tid("top"));
+        review.kind = trama_protocol::ThreadKind::Review;
+        assert!(state.apply_subthread(review.clone()));
+        let mut stray = thread("stray", "Stray");
+        stray.parent_thread_id = Some(tid("elsewhere"));
+        assert!(!state.apply_subthread(stray));
+        assert_eq!(state.threads.len(), 2);
+        assert_eq!(
+            state.selected_thread,
+            Some(tid("top")),
+            "creation does not select"
+        );
+
+        state.set_review_verdict(&tid("rev"), trama_protocol::ReviewVerdict::Approve);
+        assert_eq!(
+            state
+                .thread(&tid("rev"))
+                .and_then(|t| t.review_verdict.clone()),
+            Some(trama_protocol::ReviewVerdict::Approve)
+        );
+        assert!(
+            state.apply_subthread(review),
+            "re-broadcast upserts in place"
+        );
+        assert_eq!(state.threads.len(), 2);
     }
 
     #[test]

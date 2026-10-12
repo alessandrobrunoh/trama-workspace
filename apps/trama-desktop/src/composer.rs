@@ -319,7 +319,7 @@ impl Composer {
                         .primary()
                         .small()
                         .icon(IconName::ArrowUp)
-                        .tooltip("Send (Enter or \u{2318}Enter)")
+                        .tooltip("Send (Enter) · \u{2318}\u{21e7}Enter sends to a new subthread")
                         .disabled(!can_send)
                         .on_click(on_send),
                 )

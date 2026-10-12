@@ -16,6 +16,7 @@ gpui_kit::actions!(
         ManageProjects,
         CloseOverlay,
         ToggleAppearance,
+        SendToSubthread,
         AllowOnce,
         AllowSession,
         DenyApproval,
@@ -30,6 +31,8 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("cmd-/", ShowShortcuts, Some(CONTEXT)),
         KeyBinding::new("cmd-,", ManageProjects, Some(CONTEXT)),
         KeyBinding::new("escape", CloseOverlay, Some(CONTEXT)),
+        // Not bound by the composer textarea, so it reaches the workspace.
+        KeyBinding::new("cmd-shift-enter", SendToSubthread, Some(CONTEXT)),
         KeyBinding::new("cmd-y", AllowOnce, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-y", AllowSession, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-n", DenyApproval, Some(CONTEXT)),
@@ -58,6 +61,10 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut {
         keys: &["shift-enter"],
         label: "New line in the composer",
+    },
+    Shortcut {
+        keys: &["cmd-shift-enter"],
+        label: "Send the draft to a new subthread",
     },
     Shortcut {
         keys: &["cmd-y"],

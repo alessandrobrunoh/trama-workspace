@@ -154,9 +154,8 @@ impl EventEmitter<SidebarEvent> for SidebarPanel {}
 /// Order threads so children follow their parent, with a nesting depth.
 ///
 /// `items` is `(id, parent)` in display order. A parent that is missing from
-/// the list (or a cycle) leaves the child at the top level. The current
-/// protocol snapshot has no parent, so every row is depth 0 today; when
-/// `ThreadSnapshot` grows `parent_thread_id`, pass it here.
+/// the list (or a cycle) leaves the child at the top level. Callers pass
+/// `ThreadSnapshot::parent_thread_id` (see [`crate::subthreads::thread_rows`]).
 pub fn nest_threads<T: PartialEq + Clone>(items: &[(T, Option<T>)]) -> Vec<(usize, usize)> {
     let known = |id: &T| items.iter().any(|(candidate, _)| candidate == id);
     let mut out = Vec::with_capacity(items.len());
@@ -388,12 +387,8 @@ impl Render for SidebarPanel {
                 );
                 continue;
             }
-            let pairs: Vec<(ThreadId, Option<ThreadId>)> = threads
-                .iter()
-                .map(|thread| (thread.id.clone(), None))
-                .collect();
-            for (index, depth) in nest_threads(&pairs) {
-                let thread = &threads[index];
+            for row in crate::subthreads::thread_rows(&threads) {
+                let thread = &threads[row.index];
                 let is_selected = selected_thread.as_ref() == Some(&thread.id);
                 let status = if is_selected {
                     self.selected_status
@@ -403,7 +398,7 @@ impl Render for SidebarPanel {
                 list = list.child(self.thread_row(
                     thread.id.clone(),
                     thread.title.clone(),
-                    depth,
+                    &row,
                     is_selected,
                     status,
                     &p,
@@ -467,12 +462,15 @@ impl SidebarPanel {
         &self,
         id: ThreadId,
         title: String,
-        depth: usize,
+        row: &crate::subthreads::ThreadRow,
         selected: bool,
         status: ThreadStatus,
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let depth = row.depth;
+        let kind = row.kind;
+        let verdict = row.verdict;
         let group = SharedString::from(format!("thread-row-{id}"));
         let click_id = id.clone();
         let copy_id = id.to_string();
@@ -501,7 +499,32 @@ impl SidebarPanel {
                     .child(status_dot(status, p))
                     .tooltip(move |window, cx| Tooltip::new(status.label()).build(window, cx)),
             )
+            .children(crate::subthreads::kind_icon(kind).map(|icon| {
+                div()
+                    .id(SharedString::from(format!("th-kind-{id}")))
+                    .flex_shrink_0()
+                    .child(Icon::new(icon).with_size(px(12.)).text_color(p.text_faint))
+                    .tooltip(move |window, cx| {
+                        Tooltip::new(crate::subthreads::kind_label(kind)).build(window, cx)
+                    })
+            }))
             .child(div().flex_1().min_w_0().truncate().child(title))
+            .children(verdict.map(|badge| {
+                div()
+                    .id(SharedString::from(format!("th-verdict-{id}")))
+                    .flex_shrink_0()
+                    .child(
+                        Icon::new(match badge {
+                            crate::subthreads::VerdictBadge::Approved => IconName::CircleCheckBig,
+                            crate::subthreads::VerdictBadge::ChangesRequested => {
+                                IconName::CircleAlert
+                            }
+                        })
+                        .with_size(px(12.))
+                        .text_color(badge.color(p)),
+                    )
+                    .tooltip(move |window, cx| Tooltip::new(badge.label()).build(window, cx))
+            }))
             .child(
                 h_flex()
                     .opacity(0.)

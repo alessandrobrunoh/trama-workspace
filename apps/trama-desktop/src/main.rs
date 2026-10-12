@@ -13,6 +13,7 @@ mod onboarding;
 mod projects;
 mod sidebar;
 mod startup;
+mod subthreads;
 mod theme;
 mod workspace;
 
@@ -27,17 +28,22 @@ use workspace::Workspace;
 gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
+        CircleCheckBig,
         Command,
         FileDiff,
         FolderGit2,
         GitBranch,
+        GitMerge,
         KeyRound,
         Keyboard,
         ListChecks,
         MessageSquare,
+        MessageSquareDiff,
         Pencil,
+        PlaneLanding,
         ShieldAlert,
         ShieldCheck,
+        Split,
         SquarePen,
         UserCheck,
         Wrench,
