@@ -1,6 +1,7 @@
 mod agent;
 mod changes;
 mod chat;
+mod comments;
 mod composer;
 mod copies;
 mod devhooks;
@@ -39,6 +40,8 @@ gpui_kit::assets::icon_assets!(
         ListChecks,
         MessageSquare,
         MessageSquareDiff,
+        MessageSquarePlus,
+        MessageSquareText,
         Pencil,
         PlaneLanding,
         ShieldAlert,

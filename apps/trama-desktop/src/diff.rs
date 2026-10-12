@@ -46,6 +46,9 @@ pub struct DiffLine {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hunk {
+    /// `@@ -a,b +c,d @@` exactly as in the diff, without the section text.
+    /// Comments address a hunk by this header.
+    pub header: String,
     pub old_start: u32,
     pub old_len: u32,
     pub new_start: u32,
@@ -283,6 +286,7 @@ fn parse_hunk_header(header: &str) -> Option<Hunk> {
     let (old_start, old_len) = parse_range(parts.next()?.strip_prefix('-')?)?;
     let (new_start, new_len) = parse_range(parts.next()?.strip_prefix('+')?)?;
     Some(Hunk {
+        header: format!("@@ {ranges} @@"),
         old_start,
         old_len,
         new_start,
@@ -378,6 +382,7 @@ index 3b18e51..a9c2f07 100644
             (10, 7, 10, 8)
         );
         assert_eq!(hunk.section, "fn login(user: &User) -> Session {");
+        assert_eq!(hunk.header, "@@ -10,7 +10,8 @@");
         let kinds: Vec<_> = hunk.lines.iter().map(|line| line.kind).collect();
         assert_eq!(
             kinds,
@@ -489,6 +494,7 @@ Binary files a/logo.png and b/logo.png differ
         assert_eq!((files[0].additions, files[0].deletions), (1, 1));
         assert_eq!(files[1].path, "other.md");
         assert_eq!(files[1].hunks[0].old_len, 1);
+        assert_eq!(files[1].hunks[0].header, "@@ -3 +3,2 @@", "kept verbatim");
         assert_eq!(files[1].hunks[0].lines[1].new_line, Some(4));
     }
 

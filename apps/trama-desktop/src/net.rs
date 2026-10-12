@@ -163,7 +163,11 @@ pub(crate) fn replay_messages(
         messages.push(ClientMessage::SubscribeThread {
             thread_id: thread_id.clone(),
         });
-        messages.push(ClientMessage::GetThreadCheckouts { thread_id });
+        messages.push(ClientMessage::GetThreadCheckouts {
+            thread_id: thread_id.clone(),
+        });
+        // Subscribing does not replay comments.
+        messages.push(ClientMessage::ListComments { thread_id });
     }
     messages
 }
@@ -183,7 +187,10 @@ pub(crate) fn select_thread_messages(
     messages.push(ClientMessage::SubscribeThread {
         thread_id: thread_id.clone(),
     });
-    messages.push(ClientMessage::GetThreadCheckouts { thread_id });
+    messages.push(ClientMessage::GetThreadCheckouts {
+        thread_id: thread_id.clone(),
+    });
+    messages.push(ClientMessage::ListComments { thread_id });
     messages
 }
 
@@ -500,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_lists_repositories_and_resubscribes_history() {
+    fn replay_lists_repositories_and_resubscribes_history_and_comments() {
         let workspace_id = WorkspaceId::from("ws");
         let thread_id = ThreadId::from("th");
         assert_eq!(
@@ -514,7 +521,10 @@ mod tests {
                 ClientMessage::SubscribeThread {
                     thread_id: thread_id.clone()
                 },
-                ClientMessage::GetThreadCheckouts { thread_id },
+                ClientMessage::GetThreadCheckouts {
+                    thread_id: thread_id.clone()
+                },
+                ClientMessage::ListComments { thread_id },
             ]
         );
     }
@@ -531,7 +541,10 @@ mod tests {
                 ClientMessage::SubscribeThread {
                     thread_id: thread_id.clone()
                 },
-                ClientMessage::GetThreadCheckouts { thread_id },
+                ClientMessage::GetThreadCheckouts {
+                    thread_id: thread_id.clone()
+                },
+                ClientMessage::ListComments { thread_id },
             ]
         );
     }
