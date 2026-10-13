@@ -13,6 +13,7 @@ pub mod manifest;
 pub mod message;
 pub mod revision;
 pub mod runtime;
+pub mod secrets;
 pub mod share;
 pub mod subagent;
 pub mod subthread;
