@@ -1,13 +1,17 @@
 //! `GET /.well-known/trama-collab` (docs/plan/03 §6): public metadata for
 //! capability negotiation. Unauthenticated; exposes no user or share data.
 //!
-//! This service still speaks only collab protocol v2, so it advertises
-//! `2..=2` and no vNext capabilities. A capability is listed only once the
-//! routes behind it exist. `server_id` comes from `--server-id` /
+//! The service speaks the v2 thread protocol and the v3 share routes
+//! (`2..=3`). A capability is listed only once the routes behind it exist:
+//! event stream, manifest store and writer leases. Not E2EE (the MLS layer
+//! is separate), content transfer, chunk resume or direct transport. `server_id` comes from `--server-id` /
 //! `TRAMA_COLLAB_SERVER_ID` when set, else a random persisted id.
 
 use crate::*;
-use trama_collab_protocol::vnext::discovery::{ServerDiscovery, ServerLimits, ServerPolicy};
+use trama_collab_protocol::vnext::VNEXT_PROTOCOL_VERSION;
+use trama_collab_protocol::vnext::discovery::{
+    Capability, ServerDiscovery, ServerLimits, ServerPolicy,
+};
 use trama_collab_protocol::{
     COLLAB_PROTOCOL_VERSION, MAX_PUBLISH_EVENTS, MAX_PUBLISH_PAYLOAD_BYTES,
 };
@@ -64,8 +68,12 @@ pub(crate) fn document(server_id: String) -> ServerDiscovery {
     ServerDiscovery {
         server_id,
         min_client_protocol: COLLAB_PROTOCOL_VERSION,
-        max_client_protocol: COLLAB_PROTOCOL_VERSION,
-        capabilities: Vec::new(),
+        max_client_protocol: VNEXT_PROTOCOL_VERSION,
+        capabilities: vec![
+            Capability::EventStream,
+            Capability::ManifestStore,
+            Capability::WriterLeases,
+        ],
         limits: ServerLimits {
             max_event_payload_bytes: Some(MAX_PUBLISH_PAYLOAD_BYTES as u64),
             max_events_per_publish: Some(MAX_PUBLISH_EVENTS as u32),

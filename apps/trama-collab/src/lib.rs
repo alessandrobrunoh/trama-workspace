@@ -31,6 +31,7 @@ mod credentials;
 mod database;
 mod http;
 mod service;
+mod shares;
 mod util;
 
 use credentials::*;
@@ -107,6 +108,8 @@ struct AppState {
     /// Set only when the service runs behind a trusted reverse proxy; absent,
     /// forwarding headers are never read.
     proxy: Option<Arc<ProxyTrust>>,
+    /// Live fan-out of `/v3` share streams.
+    shares: Arc<shares::fanout::ShareFanout>,
 }
 
 /// An authenticated user session.

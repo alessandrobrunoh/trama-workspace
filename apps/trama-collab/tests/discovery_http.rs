@@ -10,7 +10,8 @@ use tempfile::tempdir;
 use tower::ServiceExt;
 use trama_collab::{AuthConfig, AuthService, router};
 use trama_collab_protocol::COLLAB_PROTOCOL_VERSION;
-use trama_collab_protocol::vnext::discovery::{DISCOVERY_PATH, ServerDiscovery};
+use trama_collab_protocol::vnext::VNEXT_PROTOCOL_VERSION;
+use trama_collab_protocol::vnext::discovery::{Capability, DISCOVERY_PATH, ServerDiscovery};
 
 async fn fetch(app: axum::Router) -> (StatusCode, ServerDiscovery) {
     let mut request = Request::builder()
@@ -27,7 +28,7 @@ async fn fetch(app: axum::Router) -> (StatusCode, ServerDiscovery) {
 }
 
 #[tokio::test]
-async fn discovery_is_public_stable_and_advertises_only_v2() {
+async fn discovery_is_public_stable_and_advertises_existing_v3_routes() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("collab.sqlite");
     let first = {
@@ -38,8 +39,15 @@ async fn discovery_is_public_stable_and_advertises_only_v2() {
     };
     assert!(first.server_id.starts_with("srv_"));
     assert_eq!(first.min_client_protocol, COLLAB_PROTOCOL_VERSION);
-    assert_eq!(first.max_client_protocol, COLLAB_PROTOCOL_VERSION);
-    assert!(first.capabilities.is_empty());
+    assert_eq!(first.max_client_protocol, VNEXT_PROTOCOL_VERSION);
+    assert_eq!(
+        first.capabilities,
+        vec![
+            Capability::EventStream,
+            Capability::ManifestStore,
+            Capability::WriterLeases
+        ]
+    );
     // The id survives a restart on the same database.
     let app = router(AuthService::open(&path, AuthConfig::default()).unwrap());
     let (_, again) = fetch(app).await;

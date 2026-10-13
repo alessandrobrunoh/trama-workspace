@@ -17,6 +17,7 @@ pub fn router_with_proxy(auth: AuthService, proxy: Option<ProxyTrust>) -> Router
         throttle: Arc::new(Mutex::new(ThrottleState::default())),
         hub: Arc::new(Hub::default()),
         proxy: proxy.map(Arc::new),
+        shares: Arc::default(),
     };
     let auth_routes = Router::new()
         .route("/auth/login", post(login))
@@ -30,6 +31,7 @@ pub fn router_with_proxy(auth: AuthService, proxy: Option<ProxyTrust>) -> Router
             get(super::discovery::well_known),
         )
         .merge(collab::routes())
+        .merge(crate::shares::routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             acquire_hash_slot,

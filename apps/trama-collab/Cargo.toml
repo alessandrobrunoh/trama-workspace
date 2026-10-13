@@ -29,6 +29,7 @@ serde_json.workspace = true
 sha2 = "0.10"
 trama-collab-protocol = { path = "../../crates/trama-collab-protocol" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+base64 = "0.22"
 tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
