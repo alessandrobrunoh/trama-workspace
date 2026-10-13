@@ -28,6 +28,6 @@ Requisito trasversale aggiunto: l'app deve essere **cross-platform**
 | Milestone | Contenuto | Stato |
 |---|---|---|
 | M1 | Contratti di dominio (`trama-domain::share`, `checkout_state`), snapshot/restore Git esatto (`trama-infra::share_git`), migration `0012_share_vnext`, CI matrice ubuntu/windows/macos sui crate core | fatto |
-| M2 | Build Linux/Windows dell'intero workspace; astrazione IPC daemon (UDS ↔ named pipe Windows); CI workspace su 3 OS | in corso |
+| M2 | Full-workspace builds on Linux/Windows/macOS; `trama-ipc` (Unix sockets / Windows named pipes); ConPTY terminals on Windows; per-OS data dir; `dunce` paths; CI on 3 OSes | done |
 | M3 | Repository DB `trama-db::share`, manifest firmato (`SignedEnvelope`), protocollo vNext/discovery | da fare |
 | M4 | Trasporto, E2EE MLS/openmls (dopo security review), wizard Share/Join | da fare |
