@@ -7697,6 +7697,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "trama-ipc"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "trama-protocol"
 version = "0.1.0"
 dependencies = [

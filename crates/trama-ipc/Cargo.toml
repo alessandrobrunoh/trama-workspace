@@ -1,0 +1,13 @@
+[package]
+name = "trama-ipc"
+description = "Local UI/daemon IPC transport: Unix domain sockets on Unix, named pipes on Windows."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"
