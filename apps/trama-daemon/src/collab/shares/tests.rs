@@ -314,6 +314,25 @@ async fn owner_shares_device_joins_and_history_flows_encrypted() {
             .is_some_and(|m| m.devices.iter().any(|d| d.signing_key_bound))
     );
 
+    let thread_share = a
+        .request(
+            ClientMessage::GetThreadShare {
+                thread_id: root.clone(),
+            },
+            "thread share",
+            |m| {
+                fail(m);
+                match m {
+                    DaemonMessage::ThreadShare { share, .. } => Some(share.clone()),
+                    _ => None,
+                }
+            },
+        )
+        .await
+        .expect("root is shared");
+    assert_eq!(thread_share.share_id, share_id);
+    assert_eq!(thread_share.role, ShareRole::Owner);
+
     // Snapshots re-read from the sealed cache (an MLS message opens once).
     let (_, bob_client) = bob.collab.share_client().unwrap();
     for _ in 0..2 {

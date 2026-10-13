@@ -19,3 +19,5 @@ mod slices;
 mod snapshot;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_content;
