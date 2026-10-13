@@ -242,6 +242,70 @@ pub enum ClientMessage {
         #[serde(default)]
         server_url: Option<String>,
     },
+    /// Check whether `thread_id` can be shared with `scope`: perimeter
+    /// (scouts outside the share are refused), Git conflicts and secrets in
+    /// files and Git objects to export. Answered with `SharePreflightReport`.
+    SharePreflight {
+        thread_id: ThreadId,
+        scope: ShareScope,
+    },
+    /// Run the preflight again and, when clean, register the share on the
+    /// connected service, create its MLS group, grant `members` and publish
+    /// the first snapshot. Answered with `ShareCreated`, or
+    /// `SharePreflightReport` when blocked.
+    CreateShare {
+        thread_id: ThreadId,
+        scope: ShareScope,
+        #[serde(default)]
+        members: Vec<ShareInvite>,
+    },
+    /// Answered with `Shares`.
+    ListShares,
+    /// Joiner: publish this device's key package for `share_id` (the user
+    /// must already be granted). Answered with `ShareJoinRequested`.
+    RequestShareJoin {
+        share_id: String,
+    },
+    /// Owner: devices waiting for admission. Answered with
+    /// `ShareJoinRequests`.
+    ListShareJoinRequests {
+        share_id: String,
+    },
+    /// Owner: add the device to the share's MLS group (Welcome to it,
+    /// commit to the members). Answered with `ShareJoinApproved`.
+    ApproveShareJoin {
+        share_id: String,
+        device_id: String,
+    },
+    /// Joiner: once approved, join from the Welcome, fetch the manifests
+    /// and create the local threads in `workspace_id`. Answered with
+    /// `ShareJoined`.
+    CompleteShareJoin {
+        share_id: String,
+        workspace_id: WorkspaceId,
+    },
+    /// Publish the next snapshot (manifests) of a share this device owns or
+    /// writes. Answered with `ShareSnapshotPublished`.
+    PublishShareSnapshot {
+        share_id: String,
+    },
+    /// Exclusive writer lease on a shared thread. Answered with
+    /// `ShareLease`.
+    AcquireShareLease {
+        share_id: String,
+        thread_id: ThreadId,
+        #[serde(default = "default_lease_ttl")]
+        ttl_secs: u64,
+    },
+    /// Answered with `ShareLeaseReleased`.
+    ReleaseShareLease {
+        share_id: String,
+        thread_id: ThreadId,
+    },
+    /// Answered with `ShareLeases`.
+    ListShareLeases {
+        share_id: String,
+    },
     /// Share a top-level thread: create its collab thread on first use
     /// (access `invited`), then apply `access` when set and invite the
     /// `invite` usernames (owner only). Setting `link` (again) returns a fresh

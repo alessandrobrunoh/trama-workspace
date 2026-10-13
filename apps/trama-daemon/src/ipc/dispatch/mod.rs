@@ -4,6 +4,7 @@ use super::*;
 
 mod collab;
 mod comments;
+mod shares;
 mod subthreads;
 mod terminals;
 mod turns;
@@ -26,6 +27,7 @@ enum Family {
     Comments,
     Terminals,
     Collab,
+    Shares,
     Control,
 }
 
@@ -83,6 +85,17 @@ fn family(msg: &ClientMessage) -> Family {
         | ClientMessage::UnlinkSharedThread { .. }
         | ClientMessage::SetCollabDraft { .. }
         | ClientMessage::SetCollabPresence { .. } => Family::Collab,
+        ClientMessage::SharePreflight { .. }
+        | ClientMessage::CreateShare { .. }
+        | ClientMessage::ListShares
+        | ClientMessage::RequestShareJoin { .. }
+        | ClientMessage::ListShareJoinRequests { .. }
+        | ClientMessage::ApproveShareJoin { .. }
+        | ClientMessage::CompleteShareJoin { .. }
+        | ClientMessage::PublishShareSnapshot { .. }
+        | ClientMessage::AcquireShareLease { .. }
+        | ClientMessage::ReleaseShareLease { .. }
+        | ClientMessage::ListShareLeases { .. } => Family::Shares,
         ClientMessage::Hello { .. }
         | ClientMessage::ApprovalHook { .. }
         | ClientMessage::McpToolCall { .. }
@@ -123,6 +136,7 @@ pub(super) async fn handle_line(
         Family::Comments => comments::handle(msg, &mut ctx).await,
         Family::Terminals => terminals::handle(msg, &mut ctx).await,
         Family::Collab => collab::handle(msg, &mut ctx).await,
+        Family::Shares => shares::handle(msg, &mut ctx).await,
         Family::Control => control(msg, &mut ctx).await,
     }
 }

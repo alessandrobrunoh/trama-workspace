@@ -45,3 +45,40 @@ fn share_event_frame_uses_snake_case_kind() {
     assert_eq!(json["type"], "share_event");
     assert_eq!(json["payload"]["event"]["kind"], "share_created");
 }
+
+#[test]
+fn share_flow_messages_round_trip_with_defaults() {
+    let msg: ClientMessage = serde_json::from_str(
+        r#"{"type":"acquire_share_lease","payload":{"share_id":"s","thread_id":"t"}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        msg,
+        ClientMessage::AcquireShareLease {
+            ttl_secs: DEFAULT_LEASE_TTL_SECS,
+            ..
+        }
+    ));
+    let msg: ClientMessage = serde_json::from_str(
+        r#"{"type":"create_share","payload":{"thread_id":"t","scope":"subtree"}}"#,
+    )
+    .unwrap();
+    assert!(matches!(msg, ClientMessage::CreateShare { ref members, .. } if members.is_empty()));
+    let report = DaemonMessage::SharePreflightReport(SharePreflightReport {
+        thread_id: ThreadId::from("t"),
+        scope: ShareScope::Subtree,
+        ok: false,
+        threads: vec![],
+        repositories: vec![],
+        scanned_files: 0,
+        blockers: vec![ShareBlocker::GitConflicts {
+            thread_id: ThreadId::from("t"),
+            repository: "repo".into(),
+            paths: vec!["a.txt".into()],
+        }],
+    });
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["payload"]["blockers"][0]["kind"], "git_conflicts");
+    let back: DaemonMessage = serde_json::from_value(json).unwrap();
+    assert!(matches!(back, DaemonMessage::SharePreflightReport(r) if !r.ok));
+}

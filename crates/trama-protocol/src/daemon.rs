@@ -152,6 +152,47 @@ pub enum DaemonMessage {
     CollabStatus(CollabStatusSnapshot),
     /// Reply to `DiscoverCollabServer`.
     CollabServerInfo(CollabServerInfo),
+    /// Reply to `SharePreflight`, and to a blocked `CreateShare`.
+    SharePreflightReport(SharePreflightReport),
+    /// Reply to `CreateShare`.
+    ShareCreated(ShareSnapshot),
+    /// Reply to `ListShares`.
+    Shares(Vec<ShareSnapshot>),
+    /// Reply to `RequestShareJoin`.
+    ShareJoinRequested {
+        share_id: String,
+        device_id: String,
+    },
+    /// Reply to `ListShareJoinRequests`.
+    ShareJoinRequests {
+        share_id: String,
+        requests: Vec<ShareJoinRequest>,
+    },
+    /// Reply to `ApproveShareJoin`.
+    ShareJoinApproved {
+        share_id: String,
+        device_id: String,
+        key_epoch: u64,
+    },
+    /// Reply to `CompleteShareJoin`.
+    ShareJoined(ShareSnapshot),
+    /// Reply to `PublishShareSnapshot`.
+    ShareSnapshotPublished {
+        share_id: String,
+        version: u64,
+    },
+    /// Reply to `AcquireShareLease`.
+    ShareLease(ShareLeaseSnapshot),
+    /// Reply to `ReleaseShareLease`.
+    ShareLeaseReleased {
+        share_id: String,
+        thread_id: ThreadId,
+    },
+    /// Reply to `ListShareLeases`.
+    ShareLeases {
+        share_id: String,
+        leases: Vec<ShareLeaseSnapshot>,
+    },
     /// A vNext durable share event that passed shape and replay checks,
     /// sent to the subscribers of `thread_id` (thread-scoped kinds) or to
     /// every connection (share-wide kinds). `cipher_payload` stays opaque.
