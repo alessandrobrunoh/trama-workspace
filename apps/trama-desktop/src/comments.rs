@@ -508,7 +508,8 @@ pub fn repo_relative(
         .iter()
         .filter_map(|(repo, root)| {
             let rest = path.strip_prefix(root).ok()?;
-            let rest = rest.to_string_lossy().to_string();
+            // Repository-relative paths are Git-style (`/`) on every OS.
+            let rest = rest.to_string_lossy().replace('\\', "/");
             (!rest.is_empty()).then(|| (root.as_os_str().len(), repo.clone(), rest))
         })
         // The deepest root wins (a checkout inside another).
@@ -2155,6 +2156,10 @@ diff --git a/src/a.rs b/src/a.rs
 
     #[test]
     fn transcript_diff_lines_anchor_to_code_in_a_known_checkout() {
+        // The fixture paths (`/w/...`) are only absolute on Unix.
+        if cfg!(windows) {
+            return;
+        }
         let checkouts = vec![
             ("r1".to_string(), std::path::PathBuf::from("/w/app")),
             (

@@ -119,12 +119,9 @@ fn canonical_checkout(path: &Path) -> Result<PathBuf, PlanError> {
 }
 
 fn find_executable(name: &str, path_env: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    // No executable bit on Windows: only executable extensions count.
     let names: Vec<String> = if cfg!(windows) {
-        vec![
-            format!("{name}.exe"),
-            format!("{name}.cmd"),
-            name.to_owned(),
-        ]
+        vec![format!("{name}.exe"), format!("{name}.cmd")]
     } else {
         vec![name.to_owned()]
     };
