@@ -269,7 +269,7 @@ async fn decide_from_env(raw: &str) -> HookDecision {
             "This session was not started by Trama, so no one can approve tool calls.",
         );
     };
-    match tokio::net::UnixStream::connect(PathBuf::from(socket)).await {
+    match trama_ipc::connect(&PathBuf::from(socket)).await {
         Ok(stream) => request_over(stream, &token, &tool_name, tool_input).await,
         Err(err) => HookDecision::deny(format!(
             "Trama daemon is unreachable ({err}), so this tool call was denied."

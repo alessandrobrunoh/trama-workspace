@@ -7632,6 +7632,7 @@ dependencies = [
  "trama-db",
  "trama-domain",
  "trama-infra",
+ "trama-ipc",
  "trama-protocol",
 ]
 
@@ -7663,6 +7664,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "trama-domain",
+ "trama-ipc",
  "trama-protocol",
 ]
 

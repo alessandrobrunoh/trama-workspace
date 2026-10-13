@@ -394,7 +394,7 @@ pub async fn run_server() -> i32 {
                             .to_owned(),
                     );
                 };
-                match tokio::net::UnixStream::connect(&socket).await {
+                match trama_ipc::connect(&socket).await {
                     Ok(stream) => call_over(stream, &token, tool, arguments, tool_use_id).await,
                     Err(err) => (true, format!("The TramaWorkspace daemon is unreachable ({err}).")),
                 }

@@ -200,6 +200,27 @@ impl IpcListener {
     }
 }
 
+/// Synchronous liveness probe: whether a daemon currently accepts
+/// connections at `path`. Never blocks waiting for a busy endpoint.
+pub fn probe(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        path.exists() && std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_PIPE_BUSY: i32 = 231;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pipe_name(path))
+        {
+            Ok(_) => true,
+            Err(err) => err.raw_os_error() == Some(ERROR_PIPE_BUSY),
+        }
+    }
+}
+
 /// Connect to the daemon endpoint for `path`.
 pub async fn connect(path: &Path) -> io::Result<IpcStream> {
     imp::connect(path).await.map(IpcStream)
@@ -230,19 +251,41 @@ mod tests {
                     let (read, mut write) = tokio::io::split(stream);
                     let mut line = String::new();
                     BufReader::new(read).read_line(&mut line).await.unwrap();
-                    write.write_all(format!("echo {line}").as_bytes()).await.unwrap();
+                    write
+                        .write_all(format!("echo {line}").as_bytes())
+                        .await
+                        .unwrap();
                 });
             }
         });
         for name in ["one", "two"] {
             let stream = connect(&path).await.unwrap();
             let (read, mut write) = tokio::io::split(stream);
-            write.write_all(format!("{name}\n").as_bytes()).await.unwrap();
+            write
+                .write_all(format!("{name}\n").as_bytes())
+                .await
+                .unwrap();
             let mut line = String::new();
             BufReader::new(read).read_line(&mut line).await.unwrap();
             assert_eq!(line, format!("echo {name}\n"));
         }
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_sees_only_live_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.sock");
+        assert!(!probe(&path));
+        let mut listener = IpcListener::bind(&path).unwrap();
+        let accept = tokio::spawn(async move {
+            let _stream = listener.accept().await.unwrap();
+        });
+        let probed = tokio::task::spawn_blocking(move || probe(&path))
+            .await
+            .unwrap();
+        assert!(probed);
+        accept.await.unwrap();
     }
 
     #[cfg(unix)]

@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use trama_domain::ids::{ThreadId, WorkspaceId};
 use trama_protocol::{
@@ -449,8 +448,8 @@ enum ConnectFailure {
     ProtocolMismatch { daemon_protocol: u32 },
 }
 
-type DaemonRead = tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>;
-type DaemonWrite = tokio::net::unix::OwnedWriteHalf;
+type DaemonRead = tokio::io::Lines<BufReader<tokio::io::ReadHalf<trama_ipc::IpcStream>>>;
+type DaemonWrite = tokio::io::WriteHalf<trama_ipc::IpcStream>;
 
 async fn connect_and_handshake(
     timeout: Duration,
@@ -464,10 +463,10 @@ async fn connect_and_handshake(
 }
 
 async fn handshake_on(path: &Path) -> Result<(DaemonRead, DaemonWrite, String), ConnectFailure> {
-    let stream = UnixStream::connect(path)
+    let stream = trama_ipc::connect(path)
         .await
         .map_err(|err| ConnectFailure::Unavailable(err.to_string()))?;
-    let (read, mut write) = stream.into_split();
+    let (read, mut write) = tokio::io::split(stream);
 
     let hello = encode_json_line(&ClientMessage::Hello {
         protocol_version: PROTOCOL_VERSION,

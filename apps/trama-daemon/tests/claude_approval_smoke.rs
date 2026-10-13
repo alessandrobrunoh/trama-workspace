@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::time::timeout;
 use trama_daemon::SessionManager;
 use trama_daemon::approval::{APPROVAL_HOOK_SUBCOMMAND, ApprovalHookSettings};
@@ -88,10 +87,10 @@ async fn real_claude_asks_trama_before_running_bash() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let stream = UnixStream::connect(&socket).await.unwrap();
-    let (read, mut write) = stream.into_split();
+    let stream = trama_ipc::connect(&socket).await.unwrap();
+    let (read, mut write) = tokio::io::split(stream);
     let mut lines = BufReader::new(read).lines();
-    async fn send(write: &mut tokio::net::unix::OwnedWriteHalf, msg: ClientMessage) {
+    async fn send(write: &mut tokio::io::WriteHalf<trama_ipc::IpcStream>, msg: ClientMessage) {
         write
             .write_all(&encode_json_line(&msg).unwrap())
             .await

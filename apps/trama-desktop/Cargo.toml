@@ -11,6 +11,7 @@ name = "TramaWorkspace"
 path = "src/main.rs"
 
 [dependencies]
+trama-ipc = { path = "../../crates/trama-ipc" }
 trama-domain = { path = "../../crates/trama-domain" }
 trama-protocol = { path = "../../crates/trama-protocol" }
 serde_json = { workspace = true }

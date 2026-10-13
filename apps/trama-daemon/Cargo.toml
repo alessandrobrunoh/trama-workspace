@@ -7,6 +7,7 @@ rust-version.workspace = true
 license-file.workspace = true
 
 [dependencies]
+trama-ipc = { path = "../../crates/trama-ipc" }
 trama-domain = { path = "../../crates/trama-domain" }
 trama-protocol = { path = "../../crates/trama-protocol" }
 trama-infra = { path = "../../crates/trama-infra" }

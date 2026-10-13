@@ -26,7 +26,6 @@ use crate::claude::ProductionAdapter;
 use crate::config::{load_or_init_config, seed_from_config};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::net::UnixListener;
 use tokio::sync::watch;
 use trama_db::TramaDb;
 
@@ -95,17 +94,8 @@ pub async fn serve_on_socket_with(
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if socket_path.exists() {
-        std::fs::remove_file(socket_path)?;
-    }
-
-    let listener = UnixListener::bind(socket_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(socket_path, perms)?;
-    }
+    // Unix socket (0600) or Windows named pipe; see `trama-ipc`.
+    let mut listener = trama_ipc::IpcListener::bind(socket_path)?;
     crate::log::info(format!("listening on {}", socket_path.display()));
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -120,7 +110,7 @@ pub async fn serve_on_socket_with(
             }
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _)) => {
+                    Ok(stream) => {
                         let sessions = sessions.clone();
                         let collab = collab.clone();
                         let shutdown_tx = shutdown_tx.clone();

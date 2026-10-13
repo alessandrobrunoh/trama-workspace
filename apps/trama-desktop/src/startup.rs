@@ -85,10 +85,7 @@ fn socket_accepts_connections() -> bool {
     let Some(path) = default_socket_path() else {
         return false;
     };
-    if !path.exists() {
-        return false;
-    }
-    std::os::unix::net::UnixStream::connect(&path).is_ok()
+    trama_ipc::probe(&path)
 }
 
 #[cfg(test)]
