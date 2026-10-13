@@ -9,6 +9,7 @@ pub mod comment;
 pub mod error;
 pub mod event;
 pub mod ids;
+pub mod manifest;
 pub mod message;
 pub mod revision;
 pub mod runtime;
