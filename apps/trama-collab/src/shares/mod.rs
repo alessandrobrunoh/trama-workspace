@@ -6,6 +6,7 @@
 mod error;
 mod events;
 pub(crate) mod fanout;
+mod keys;
 mod leases;
 mod manifests;
 mod members;
@@ -74,7 +75,8 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), String> {
                  PRIMARY KEY (share_id, thread_gid)
              );",
         )
-        .map_err(|e| format!("initialize share schema: {e}"))
+        .map_err(|e| format!("initialize share schema: {e}"))?;
+    keys::migrate(connection)
 }
 
 pub(crate) fn routes() -> Router<AppState> {
@@ -102,6 +104,15 @@ pub(crate) fn routes() -> Router<AppState> {
         .route(
             "/v3/shares/{share_id}/leases/{thread_gid}/release",
             post(leases::release),
+        )
+        .route(
+            "/v3/shares/{share_id}/key-packages",
+            post(keys::post_key_package).get(keys::pending),
+        )
+        .route("/v3/shares/{share_id}/welcomes", post(keys::post_welcome))
+        .route(
+            "/v3/shares/{share_id}/welcomes/{device_id}",
+            get(keys::get_welcome),
         )
         .layer(DefaultBodyLimit::max(V3_BODY_LIMIT))
 }

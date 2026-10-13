@@ -7,6 +7,7 @@
 //! payloads as opaque ciphertext.
 
 pub mod api;
+pub mod bodies;
 pub mod cipher;
 pub mod discovery;
 pub mod events;

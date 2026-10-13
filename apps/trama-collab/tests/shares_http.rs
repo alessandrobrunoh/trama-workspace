@@ -343,3 +343,43 @@ async fn stream_backfills_then_delivers_live_in_order() {
     .await;
     assert_eq!(next().await["type"], "manifest_committed");
 }
+
+#[tokio::test]
+async fn key_packages_and_welcomes_flow_between_owner_and_device() {
+    let h = H::new().await;
+    let (a, b, c) = h.share().await;
+    let kp = json!({"device_id": "db", "key_package": "a3A="});
+    let (status, _) = h.call("POST", "/v3/shares/sh1/key-packages", &b, kp).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = h
+        .call("GET", "/v3/shares/sh1/key-packages", &b, Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, pending) = h
+        .call("GET", "/v3/shares/sh1/key-packages", &a, Value::Null)
+        .await;
+    assert_eq!(pending[0]["username"], "bob");
+    let (status, _) = h
+        .call("GET", "/v3/shares/sh1/welcomes/db", &b, Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let welcome = json!({"device_id": "db", "welcome": "d2Vs", "epoch": 1});
+    let (status, _) = h.call("POST", "/v3/shares/sh1/welcomes", &a, welcome).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = h
+        .call("GET", "/v3/shares/sh1/welcomes/db", &c, Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, got) = h
+        .call("GET", "/v3/shares/sh1/welcomes/db", &b, Value::Null)
+        .await;
+    assert_eq!(got["epoch"], 1);
+    let (_, pending) = h
+        .call("GET", "/v3/shares/sh1/key-packages", &a, Value::Null)
+        .await;
+    assert!(pending.as_array().unwrap().is_empty());
+    // Carol cannot post for bob's device.
+    let kp = json!({"device_id": "db", "key_package": "a3A="});
+    let (status, _) = h.call("POST", "/v3/shares/sh1/key-packages", &c, kp).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}

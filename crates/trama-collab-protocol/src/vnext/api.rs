@@ -158,3 +158,36 @@ pub enum ShareServerFrame {
 pub enum ShareClientFrame {
     Ping,
 }
+
+/// Largest base64 MLS key package / Welcome accepted.
+pub const MAX_MLS_BLOB_BYTES: usize = 256 * 1024;
+
+/// `POST /v3/shares/{id}/key-packages`: a granted member's device asks to
+/// join the share's MLS group. Replaces an earlier request of that device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyPackageRequest {
+    pub device_id: String,
+    /// Base64 MLS key package.
+    pub key_package: String,
+}
+
+/// `GET /v3/shares/{id}/key-packages` (owner): devices without a Welcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingKeyPackage {
+    pub username: String,
+    pub device_id: String,
+    pub key_package: String,
+}
+
+/// `POST /v3/shares/{id}/welcomes` (owner) and
+/// `GET /v3/shares/{id}/welcomes/{device_id}` (that device's user).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WelcomeBlob {
+    pub device_id: String,
+    /// Base64 MLS Welcome.
+    pub welcome: String,
+    /// Group epoch the Welcome joins at.
+    pub epoch: u64,
+}
