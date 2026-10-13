@@ -66,10 +66,25 @@ fn zed_plan_in(
     }
 }
 
+/// Reveal the checkout in the platform file manager: Finder on macOS,
+/// Explorer on Windows, the default handler (`xdg-open`) elsewhere.
 pub fn finder_plan(path: &Path) -> Result<LaunchPlan, PlanError> {
-    Ok(LaunchPlan {
-        program: PathBuf::from("/usr/bin/open"),
-        args: vec![PathBuf::from("-R"), canonical_checkout(path)?],
+    let checkout = canonical_checkout(path)?;
+    Ok(if cfg!(target_os = "macos") {
+        LaunchPlan {
+            program: PathBuf::from("/usr/bin/open"),
+            args: vec![PathBuf::from("-R"), checkout],
+        }
+    } else if cfg!(windows) {
+        LaunchPlan {
+            program: PathBuf::from("explorer.exe"),
+            args: vec![checkout],
+        }
+    } else {
+        LaunchPlan {
+            program: PathBuf::from("xdg-open"),
+            args: vec![checkout],
+        }
     })
 }
 
@@ -91,9 +106,8 @@ pub fn launch(plan: LaunchPlan) -> Result<(), String> {
 }
 
 fn canonical_checkout(path: &Path) -> Result<PathBuf, PlanError> {
-    let canonical = path
-        .canonicalize()
-        .map_err(|_| PlanError::MissingDirectory(path.to_path_buf()))?;
+    let canonical =
+        dunce::canonicalize(path).map_err(|_| PlanError::MissingDirectory(path.to_path_buf()))?;
     if !canonical.is_dir() {
         return Err(PlanError::MissingDirectory(path.to_path_buf()));
     }
@@ -101,8 +115,17 @@ fn canonical_checkout(path: &Path) -> Result<PathBuf, PlanError> {
 }
 
 fn find_executable(name: &str, path_env: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let names: Vec<String> = if cfg!(windows) {
+        vec![
+            format!("{name}.exe"),
+            format!("{name}.cmd"),
+            name.to_owned(),
+        ]
+    } else {
+        vec![name.to_owned()]
+    };
     std::env::split_paths(path_env?)
-        .map(|dir| dir.join(name))
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
         .find(|candidate| candidate.is_file() && is_executable(candidate))
 }
 
@@ -141,11 +164,25 @@ mod tests {
         let directory = test_directory("spaces");
         let checkout = directory.join("repo with spaces - branch");
         std::fs::create_dir(&checkout).unwrap();
-        let plan = zed_plan(&checkout, Some(OsStr::new(""))).unwrap();
-        assert_eq!(plan.args.last().unwrap(), &checkout.canonicalize().unwrap());
+        // A fake `zed` on PATH, so the test does not depend on an install.
+        let bin = directory.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let zed = bin.join(if cfg!(windows) { "zed.exe" } else { "zed" });
+        std::fs::write(&zed, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&zed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plan = zed_plan(&checkout, Some(bin.as_os_str())).unwrap();
+        assert_eq!(plan.program, zed);
         assert_eq!(
-            finder_plan(&checkout).unwrap().args[1],
-            checkout.canonicalize().unwrap()
+            plan.args.last().unwrap(),
+            &dunce::canonicalize(&checkout).unwrap()
+        );
+        assert_eq!(
+            finder_plan(&checkout).unwrap().args.last().unwrap(),
+            &dunce::canonicalize(&checkout).unwrap()
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -184,7 +221,7 @@ mod tests {
         let bundle = fake_bundle(&apps, "Zed Preview.app", true);
         let plan = zed_plan_in(&checkout, Some(OsStr::new("")), &[apps.clone()]).unwrap();
         assert_eq!(plan.program, bundle.join("Contents/MacOS/cli"));
-        assert_eq!(plan.args, vec![checkout.canonicalize().unwrap()]);
+        assert_eq!(plan.args, vec![dunce::canonicalize(&checkout).unwrap()]);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
