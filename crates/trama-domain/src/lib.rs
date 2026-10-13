@@ -3,6 +3,7 @@
 
 pub mod activity;
 pub mod agent;
+pub mod checkout_state;
 pub mod checkpoint;
 pub mod comment;
 pub mod error;
@@ -11,6 +12,7 @@ pub mod ids;
 pub mod message;
 pub mod revision;
 pub mod runtime;
+pub mod share;
 pub mod subagent;
 pub mod subthread;
 pub mod thread;
