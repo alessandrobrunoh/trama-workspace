@@ -10,6 +10,8 @@ mod keys;
 mod leases;
 mod manifests;
 mod members;
+mod objects;
+mod registry;
 mod revoke;
 mod stream;
 
@@ -77,14 +79,28 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), String> {
              );",
         )
         .map_err(|e| format!("initialize share schema: {e}"))?;
-    keys::migrate(connection)
+    keys::migrate(connection)?;
+    registry::migrate(connection)?;
+    objects::migrate(connection)
 }
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/v3/shares", post(members::register))
         .route("/v3/shares/{share_id}", get(members::info))
-        .route("/v3/shares/{share_id}/members", post(members::add_member))
+        .route(
+            "/v3/shares/{share_id}/members",
+            post(members::add_member).get(registry::members),
+        )
+        .route("/v3/signing-keys", post(registry::bind_signing_key))
+        .route(
+            "/v3/shares/{share_id}/signing-keys",
+            get(registry::signing_keys),
+        )
+        .route(
+            "/v3/shares/{share_id}/objects/{content_id}/parts/{part}",
+            axum::routing::put(objects::put_part).get(objects::get_part),
+        )
         .route(
             "/v3/shares/{share_id}/members/{username}/revoke",
             post(revoke::revoke),

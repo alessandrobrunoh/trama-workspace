@@ -200,3 +200,47 @@ pub struct RevokedMember {
     pub username: String,
     pub devices: Vec<String>,
 }
+
+/// `GET /v3/shares/{id}/members` (any member).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareMemberInfo {
+    pub username: String,
+    pub role: ShareRole,
+    pub read_code: bool,
+    /// Devices bound to this member in the share (key package or event).
+    pub devices: Vec<String>,
+}
+
+/// `POST /v3/signing-keys`: binds a device's manifest signing key to the
+/// authenticated account. First binding wins; a different key or account
+/// for the same device is refused (409).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigningKeyRequest {
+    pub device_id: String,
+    /// Base64 Ed25519 public key (32 bytes).
+    pub public_key: String,
+}
+
+/// `GET /v3/shares/{id}/signing-keys` (any member): bindings of the
+/// share's members.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SigningKeyBinding {
+    pub username: String,
+    pub device_id: String,
+    pub public_key: String,
+}
+
+/// Largest encrypted object part (`PUT /v3/shares/{id}/objects/{content_id}/parts/{n}`).
+pub const MAX_OBJECT_PART_BYTES: usize = 1024 * 1024;
+/// Most parts of one object.
+pub const MAX_OBJECT_PARTS: u32 = 4096;
+
+/// Who may read an object: every member (`history`, message slices) or
+/// `read_code` holders only (`content`, Git bundles).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectClass {
+    History,
+    Content,
+}
