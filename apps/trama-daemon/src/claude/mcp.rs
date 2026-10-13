@@ -89,7 +89,7 @@ pub fn mcp_config(settings: &McpSettings, token: &str, user: Option<Value>) -> V
         "command": settings.command.to_string_lossy(),
         "args": settings.args,
         "env": {
-            crate::approval::ENV_SOCKET: settings.socket_path.to_string_lossy(),
+            crate::claude::approval::ENV_SOCKET: settings.socket_path.to_string_lossy(),
             ENV_MCP_TOKEN: token,
         },
         "timeout": SERVER_TIMEOUT_MS,
@@ -378,7 +378,7 @@ where
 
 /// Entry point for `trama-daemon mcp`: serve stdio until Claude closes it.
 pub async fn run_server() -> i32 {
-    let socket = std::env::var_os(crate::approval::ENV_SOCKET).map(PathBuf::from);
+    let socket = std::env::var_os(crate::claude::approval::ENV_SOCKET).map(PathBuf::from);
     let token = std::env::var(ENV_MCP_TOKEN).ok();
     serve(
         tokio::io::stdin(),

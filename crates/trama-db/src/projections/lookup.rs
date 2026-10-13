@@ -494,7 +494,7 @@ impl TramaDb {
                     )));
                 }
             }
-            crate::checkouts::insert_locations(&tx, &thread_id, &attachments, &locations)?;
+            crate::repo::checkouts::insert_locations(&tx, &thread_id, &attachments, &locations)?;
             tx.execute(
                 "UPDATE agent_sessions SET external_session_id = NULL WHERE thread_id = ?1",
                 params![thread_id],

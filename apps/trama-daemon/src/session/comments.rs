@@ -9,7 +9,7 @@ use trama_domain::comment::{
     relocate_anchor,
 };
 use trama_domain::ids::{CommentId, RepositoryId};
-use trama_infra::changes;
+use trama_infra::git::changes;
 use trama_protocol::{CommentSnapshot, CommentState};
 
 /// The local person. Matches the actor of user prompts.

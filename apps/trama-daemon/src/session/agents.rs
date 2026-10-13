@@ -1,5 +1,5 @@
 //! Subagents as Trama threads, driven by the agent through the Trama MCP
-//! tools (see [`crate::mcp`]).
+//! tools (see [`crate::claude::mcp`]).
 //!
 //! A tool call arrives with the session token of the calling agent; the
 //! token maps to exactly one thread, which is always the parent of what the
@@ -14,7 +14,7 @@
 
 use super::subthreads::{ForkConversation, ForkFiles, ForkRequest, review_prompt, system_message};
 use super::*;
-use crate::mcp::{self, McpSettings};
+use crate::claude::mcp::{self, McpSettings};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;

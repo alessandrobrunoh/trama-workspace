@@ -9,7 +9,7 @@ pub(crate) use self::dispatch::*;
 #[allow(unused_imports)]
 pub(crate) use self::hooks::*;
 
-use crate::approval::HookDecision;
+use crate::claude::approval::HookDecision;
 use crate::collab::CollabService;
 use crate::error::{DaemonError, Result};
 use crate::session::{ApprovalWait, SessionManager, SubscriptionId};

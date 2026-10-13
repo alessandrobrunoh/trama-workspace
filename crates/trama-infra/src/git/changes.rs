@@ -6,7 +6,7 @@
 //! never included. Snapshot objects are written to the checkout's object
 //! store and kept alive by refs under `refs/trama/`.
 
-use crate::checkout::{CheckoutError, git, git_text, text};
+use crate::git::checkout::{CheckoutError, git, git_text, text};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
@@ -644,7 +644,7 @@ pub fn pull(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkout::CheckoutManager;
+    use crate::git::checkout::CheckoutManager;
     use trama_domain::ids::{CheckoutId, RepositoryId, ThreadId};
 
     fn sh_git(cwd: &Path, args: &[&str]) {
@@ -726,7 +726,7 @@ mod tests {
         }
     }
 
-    fn copy(fixture: &Fixture, thread: &str) -> crate::checkout::ProvisionedCopy {
+    fn copy(fixture: &Fixture, thread: &str) -> crate::git::checkout::ProvisionedCopy {
         fixture
             .manager
             .provision_copy(
@@ -818,7 +818,7 @@ mod tests {
         );
     }
 
-    fn copy_again(fixture: &Fixture) -> crate::checkout::ProvisionedCopy {
+    fn copy_again(fixture: &Fixture) -> crate::git::checkout::ProvisionedCopy {
         copy(fixture, "sub")
     }
 

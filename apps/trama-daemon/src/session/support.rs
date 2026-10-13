@@ -26,7 +26,7 @@ pub(super) fn validate_managed_checkout(
     }
 }
 
-/// Run `.agents/linked` / `.agents/prepare` (see `trama_infra::setup`) in a
+/// Run `.agents/linked` / `.agents/prepare` (see `trama_infra::process::setup`) in a
 /// newly created checkout. The outcome is recorded in the checkout and shown
 /// by `thread_checkouts`; it never removes the checkout.
 pub(crate) fn run_checkout_setup(
@@ -36,8 +36,8 @@ pub(crate) fn run_checkout_setup(
     thread_title: &str,
     repository_alias: Option<&str>,
 ) {
-    use trama_infra::setup::{SetupRequest, SetupStatus, timeout_from_env};
-    let record = trama_infra::setup::run_checkout_setup(&SetupRequest {
+    use trama_infra::process::setup::{SetupRequest, SetupStatus, timeout_from_env};
+    let record = trama_infra::process::setup::run_checkout_setup(&SetupRequest {
         source,
         checkout,
         thread_id: &thread_id.0,

@@ -165,7 +165,7 @@ impl TramaDb {
         self.blocking_mut(move |conn| {
             let tx = conn.transaction().map_err(sql_err)?;
             insert_thread(&tx, &thread)?;
-            crate::checkouts::insert_locations(
+            crate::repo::checkouts::insert_locations(
                 &tx,
                 &thread.id.to_string(),
                 &thread.repo_attachments,

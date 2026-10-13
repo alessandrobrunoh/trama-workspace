@@ -1492,7 +1492,7 @@ async fn mixed_migration_keeps_managed_edits_and_invalidates_resume() {
     }
     let thread_id = ThreadId::generate();
     let checkout_alpha = CheckoutId::generate();
-    let provisioner = trama_infra::checkout::CheckoutManager::new(dir.path().join("managed"));
+    let provisioner = trama_infra::git::checkout::CheckoutManager::new(dir.path().join("managed"));
     let managed_checkout = provisioner
         .provision(&sources[0], &thread_id, &alpha_id, &checkout_alpha)
         .unwrap();

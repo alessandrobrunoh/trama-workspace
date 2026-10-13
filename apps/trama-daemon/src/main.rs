@@ -4,13 +4,14 @@ use trama_daemon::DaemonError;
 async fn main() {
     // Claude Code runs `trama-daemon approval-hook` as its PermissionRequest
     // hook; it must never start a second daemon.
-    if std::env::args().nth(1).as_deref() == Some(trama_daemon::approval::APPROVAL_HOOK_SUBCOMMAND)
+    if std::env::args().nth(1).as_deref()
+        == Some(trama_daemon::claude::approval::APPROVAL_HOOK_SUBCOMMAND)
     {
-        std::process::exit(trama_daemon::approval::run_hook().await);
+        std::process::exit(trama_daemon::claude::approval::run_hook().await);
     }
     // Claude Code runs `trama-daemon mcp` as Trama's stdio MCP server.
-    if std::env::args().nth(1).as_deref() == Some(trama_daemon::mcp::MCP_SUBCOMMAND) {
-        std::process::exit(trama_daemon::mcp::run_server().await);
+    if std::env::args().nth(1).as_deref() == Some(trama_daemon::claude::mcp::MCP_SUBCOMMAND) {
+        std::process::exit(trama_daemon::claude::mcp::run_server().await);
     }
     if let Err(err) = trama_daemon::run().await {
         match err {

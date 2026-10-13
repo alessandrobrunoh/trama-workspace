@@ -53,7 +53,7 @@ pub use context::{NoCollaborators, PeopleSource, Person, PromptContext};
 pub use agents::SubagentSettings;
 pub use archive::RemovalOutcome;
 
-use crate::approval::{self, ApprovalHookSettings, HookDecision};
+use crate::claude::approval::{self, ApprovalHookSettings, HookDecision};
 
 /// Model passed to `claude --model` unless the workspace sets `default_model`.
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-5-5";
@@ -75,7 +75,7 @@ use trama_domain::ids::{AgentSessionId, CheckoutId, CommentId, MessageId, Thread
 use trama_domain::message::{Actor, ContentBlock, Message, Role};
 use trama_domain::thread::{AttachMode, Thread, ThreadRepositoryAttachment};
 use trama_domain::workspace::{Repository, Workspace, WorkspaceMembership};
-use trama_infra::checkout::{CheckoutError, CheckoutManager};
+use trama_infra::git::checkout::{CheckoutError, CheckoutManager};
 use trama_protocol::{DaemonMessage, RepositorySnapshot, ThreadSnapshot, WorkspaceSnapshot};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -209,7 +209,7 @@ struct TurnFailure {
 pub struct SessionManager {
     db: TramaDb,
     adapter: Arc<dyn AgentAdapter>,
-    checkout_manager: trama_infra::checkout::CheckoutManager,
+    checkout_manager: trama_infra::git::checkout::CheckoutManager,
     inner: Arc<Mutex<Inner>>,
     billing: BillingMode,
     /// `None`: no approval channel; the CLI denies prompts on its own.
@@ -242,7 +242,7 @@ impl SessionManager {
             adapter,
             agents_config: Arc::new(agents::AgentsConfig::new(root.clone())),
             agents: Arc::default(),
-            checkout_manager: trama_infra::checkout::CheckoutManager::new(root),
+            checkout_manager: trama_infra::git::checkout::CheckoutManager::new(root),
             inner: Arc::new(Mutex::new(Inner {
                 next_sub: 1,
                 threads: HashMap::new(),
@@ -290,7 +290,7 @@ impl SessionManager {
     }
 
     /// How new checkouts are copied (`config.json` `checkouts`).
-    pub fn with_checkout_copy(mut self, copy: trama_infra::checkout::CopyOptions) -> Self {
+    pub fn with_checkout_copy(mut self, copy: trama_infra::git::checkout::CopyOptions) -> Self {
         self.checkout_manager = self.checkout_manager.clone().with_copy_options(copy);
         self
     }

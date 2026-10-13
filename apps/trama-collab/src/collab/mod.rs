@@ -27,8 +27,8 @@ use trama_collab_protocol::{
 };
 
 use crate::{
-    AppState, AuthError, Identity, bearer_token, live::Outbox, open_connection, tokio_blocking,
-    valid_username,
+    AppState, AuthError, Identity, bearer_token, http::live::Outbox, open_connection,
+    tokio_blocking, valid_username,
 };
 
 /// HTTP body limit for collaboration routes (auth routes keep 4 KiB).
@@ -168,11 +168,11 @@ pub(crate) fn routes() -> Router<AppState> {
         )
         .route(
             "/threads/{thread_id}/ws",
-            get(crate::sockets::thread_socket),
+            get(crate::http::sockets::thread_socket),
         )
         .route("/runners", post(create_runner).get(list_runners))
         .route("/runners/{runner_id}", delete(revoke_runner))
-        .route("/runner/ws", get(crate::sockets::runner_socket))
+        .route("/runner/ws", get(crate::http::sockets::runner_socket))
         .layer(DefaultBodyLimit::max(COLLAB_BODY_LIMIT))
 }
 

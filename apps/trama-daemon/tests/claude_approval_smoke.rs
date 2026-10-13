@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 use trama_daemon::SessionManager;
-use trama_daemon::approval::{APPROVAL_HOOK_SUBCOMMAND, ApprovalHookSettings};
+use trama_daemon::claude::approval::{APPROVAL_HOOK_SUBCOMMAND, ApprovalHookSettings};
 use trama_db::TramaDb;
 use trama_domain::agent::{AgentEvent, ApprovalDecision, BillingSource};
 use trama_domain::workspace::{Repository, Workspace, WorkspaceMembership};

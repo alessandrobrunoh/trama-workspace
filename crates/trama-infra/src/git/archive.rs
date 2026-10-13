@@ -11,7 +11,7 @@
 //! back too) and replays the bundle. Ignored files of the removed checkout
 //! (its own build output, local databases) are not kept.
 
-use crate::checkout::{
+use crate::git::checkout::{
     ARCHIVE_REF, ArchivedCheckout, CheckoutError, CheckoutManager, CopyMethod, REPORT_FILE_LIMIT,
     RemovalReport, git, git_text,
 };
@@ -96,7 +96,7 @@ impl CheckoutManager {
             .trim()
             .to_owned();
         self.validate_repo_local(source, checkout, &base_revision)?;
-        let snapshot = crate::changes::record_snapshot(
+        let snapshot = crate::git::changes::record_snapshot(
             checkout,
             ARCHIVE_REF,
             "trama: working state before the checkout was removed",
@@ -271,9 +271,9 @@ impl CheckoutManager {
             )?
             .stdout;
             if !patch.is_empty() {
-                crate::changes::apply_patch(&staging, &patch)?;
+                crate::git::changes::apply_patch(&staging, &patch)?;
             }
-            if crate::changes::snapshot_tree(&staging)? != tree {
+            if crate::git::changes::snapshot_tree(&staging)? != tree {
                 return Err(CheckoutError::Invalid(staging.clone()));
             }
             git(&staging, ["update-ref", "-d", ARCHIVE_REF])?;

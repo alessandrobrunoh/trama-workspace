@@ -28,11 +28,11 @@ impl CheckoutManager {
                     || excluded.iter().any(|entry| OsStr::new(entry) == name)
             };
             let result = if self.copy.simulate_clone_failure {
-                Err(crate::cow::CloneError::Unsupported(std::io::Error::from(
-                    std::io::ErrorKind::Unsupported,
-                )))
+                Err(crate::fs::cow::CloneError::Unsupported(
+                    std::io::Error::from(std::io::ErrorKind::Unsupported),
+                ))
             } else {
-                crate::cow::clone_tree(origin, staging, &skip)
+                crate::fs::cow::clone_tree(origin, staging, &skip)
             };
             match result {
                 Ok(stats)
@@ -107,7 +107,7 @@ impl CheckoutManager {
     /// repository links to the primary checkout (setup links them back) and
     /// nested `exclude` entries. Only ignored, untracked paths are removed.
     pub(crate) fn prune_copy(&self, staging: &Path) -> Result<(), CheckoutError> {
-        let mut entries = crate::setup::linked_entries(staging);
+        let mut entries = crate::process::setup::linked_entries(staging);
         entries.extend(
             self.copy
                 .exclude
@@ -220,8 +220,8 @@ pub(super) fn fixup_cow_git(staging: &Path) -> Result<(), CheckoutError> {
         "BISECT_NAMES",
         "gc.pid",
         "trama-base-commit",
-        crate::setup::RECORD_FILE,
-        crate::setup::LOG_FILE,
+        crate::process::setup::RECORD_FILE,
+        crate::process::setup::LOG_FILE,
     ] {
         let path = git_dir.join(name);
         match fs::symlink_metadata(&path) {
@@ -309,7 +309,7 @@ pub(crate) fn clean_to_head(checkout: &Path) -> Result<(), CheckoutError> {
     Ok(())
 }
 
-/// Repository-tracked files allowed under `.trama` (see [`crate::setup`]).
+/// Repository-tracked files allowed under `.trama` (see [`crate::process::setup`]).
 pub(super) const TRACKED_TRAMA_CONFIG: [&[u8]; 2] = [b".trama/prepare", b".trama/linked"];
 
 pub(super) fn safe_id(value: &str) -> bool {

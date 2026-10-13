@@ -581,7 +581,7 @@ impl SessionManager {
                     repo_local,
                 )?;
             }
-            Ok::<_, trama_infra::checkout::CheckoutError>(())
+            Ok::<_, trama_infra::git::checkout::CheckoutError>(())
         })
         .await
         .map_err(|error| DaemonError::Invalid(format!("checkout validation task failed: {error}")))?

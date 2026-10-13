@@ -587,7 +587,7 @@ fn git_output(cwd: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::checkout::CheckoutManager;
+    use crate::git::checkout::CheckoutManager;
     use std::os::unix::fs::PermissionsExt;
     use trama_domain::ids::{CheckoutId, RepositoryId, ThreadId};
 

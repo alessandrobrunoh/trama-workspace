@@ -9,7 +9,7 @@ use trama_domain::agent::{BillingMode, PermissionMode};
 use trama_domain::event::{Aggregate, DomainEvent, EventRecord};
 use trama_domain::message::Actor;
 use trama_domain::workspace::{Repository, Workspace, WorkspaceMembership, WorkspaceSettings};
-use trama_infra::checkout::CheckoutManager;
+use trama_infra::git::checkout::CheckoutManager;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileConfig {
@@ -27,7 +27,7 @@ pub struct FileConfig {
     /// How thread checkouts are copied: `{"mode": "copy_on_write" | "git",
     /// "exclude": ["relative/path", ...]}` (ADR 0012).
     #[serde(default)]
-    pub checkouts: trama_infra::checkout::CopyOptions,
+    pub checkouts: trama_infra::git::checkout::CopyOptions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -445,14 +445,17 @@ mod tests {
         let config: FileConfig = serde_json::from_str(r#"{"workspaces":[]}"#).unwrap();
         assert_eq!(
             config.checkouts.mode,
-            trama_infra::checkout::CopyMode::CopyOnWrite
+            trama_infra::git::checkout::CopyMode::CopyOnWrite
         );
         assert!(config.checkouts.exclude.is_empty());
         let config: FileConfig = serde_json::from_str(
             r#"{"checkouts":{"mode":"git","exclude":["target/debug/incremental",".venv"]}}"#,
         )
         .unwrap();
-        assert_eq!(config.checkouts.mode, trama_infra::checkout::CopyMode::Git);
+        assert_eq!(
+            config.checkouts.mode,
+            trama_infra::git::checkout::CopyMode::Git
+        );
         assert_eq!(
             config.checkouts.exclude,
             vec!["target/debug/incremental".to_owned(), ".venv".to_owned()]

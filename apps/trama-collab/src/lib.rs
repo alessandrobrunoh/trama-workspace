@@ -29,12 +29,10 @@ use tokio::sync::Semaphore;
 mod collab;
 mod http;
 
-// Crate-root aliases keep `crate::<module>` paths stable.
 pub use http::routes::{router, router_with_proxy};
-use http::{live, proxy, sockets};
 
-use live::Hub;
-pub use proxy::{ForwardedHeader, IpCidr, ProxyTrust};
+use http::live::Hub;
+pub use http::proxy::{ForwardedHeader, IpCidr, ProxyTrust};
 
 const MAX_BODY_BYTES: usize = 4096;
 const MAX_USERNAME_BYTES: usize = 64;

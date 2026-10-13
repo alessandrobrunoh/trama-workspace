@@ -13,8 +13,8 @@
 //! every object id against the expected state before reporting success.
 //! Encryption, upload and secret scanning are separate layers (plan 06).
 
-use crate::changes::{SNAPSHOT_IDENTITY, snapshot_tree};
-use crate::checkout::{CheckoutError, git, git_text, text};
+use crate::git::changes::{SNAPSHOT_IDENTITY, snapshot_tree};
+use crate::git::checkout::{CheckoutError, git, git_text, text};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};

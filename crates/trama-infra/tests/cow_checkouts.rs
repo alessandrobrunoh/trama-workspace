@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 use trama_domain::ids::{CheckoutId, RepositoryId, ThreadId};
-use trama_infra::checkout::{CheckoutError, CheckoutManager, CopyMode, CopyOptions};
-use trama_infra::cow::disk_usage;
+use trama_infra::fs::cow::disk_usage;
+use trama_infra::git::checkout::{CheckoutError, CheckoutManager, CopyMode, CopyOptions};
 
 fn git(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -393,14 +393,16 @@ fn linked_and_excluded_paths_are_not_cloned() {
     assert!(checkout.join("target/debug/keep").exists());
     // Removed so setup can link it back to the primary checkout.
     assert!(fs::symlink_metadata(checkout.join("shared.local")).is_err());
-    let record = trama_infra::setup::run_checkout_setup(&trama_infra::setup::SetupRequest {
-        source: &source,
-        checkout: &checkout,
-        thread_id: "t",
-        thread_title: "t",
-        repository_alias: None,
-        timeout: std::time::Duration::from_secs(20),
-    });
+    let record = trama_infra::process::setup::run_checkout_setup(
+        &trama_infra::process::setup::SetupRequest {
+            source: &source,
+            checkout: &checkout,
+            thread_id: "t",
+            thread_title: "t",
+            repository_alias: None,
+            timeout: std::time::Duration::from_secs(20),
+        },
+    );
     assert!(record.linked[0].linked, "{record:?}");
     assert!(
         fs::symlink_metadata(checkout.join("shared.local"))
@@ -515,7 +517,7 @@ fn removed_subthread_copy_restores_its_fork_point() {
     assert_eq!(
         git(
             &restored,
-            &["rev-parse", trama_infra::changes::FORK_POINT_REF]
+            &["rev-parse", trama_infra::git::changes::FORK_POINT_REF]
         ),
         copy.fork_commit
     );

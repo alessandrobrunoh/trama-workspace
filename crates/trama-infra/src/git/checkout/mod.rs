@@ -352,7 +352,7 @@ impl CheckoutManager {
             self.validate_repo_local(&source, &destination, &base_revision)?;
             let fork_commit = git_text(
                 &destination,
-                ["rev-parse", "--verify", crate::changes::FORK_POINT_REF],
+                ["rev-parse", "--verify", crate::git::changes::FORK_POINT_REF],
             )
             .map_err(|_| CheckoutError::Invalid(destination.clone()))?;
             return Ok(ProvisionedCopy {
@@ -365,7 +365,7 @@ impl CheckoutManager {
         let (base_revision, parent_tree) = match at {
             None => (
                 git_text(&parent, ["rev-parse", "HEAD"])?,
-                crate::changes::snapshot_tree(&parent)?,
+                crate::git::changes::snapshot_tree(&parent)?,
             ),
             Some(commit) => (
                 git_text(
@@ -405,7 +405,7 @@ impl CheckoutManager {
                     let head = git_text(&staging, ["rev-parse", "HEAD"])?;
                     let exact = at.is_none()
                         && head == base_revision
-                        && crate::changes::snapshot_tree(&staging)? == parent_tree;
+                        && crate::git::changes::snapshot_tree(&staging)? == parent_tree;
                     if !exact {
                         git(&staging, ["reset", "--quiet", "--hard"])?;
                         git(&staging, ["clean", "-fdq"])?;
@@ -416,7 +416,7 @@ impl CheckoutManager {
                             )?;
                         }
                         if !patch.is_empty() {
-                            crate::changes::apply_patch(&staging, &patch)?;
+                            crate::git::changes::apply_patch(&staging, &patch)?;
                         }
                     }
                     set_remote(&staging, "origin", origin.as_deref().map(OsStr::new))?;
@@ -453,7 +453,7 @@ impl CheckoutManager {
                     set_remote(&staging, "origin", origin.as_deref().map(OsStr::new))?;
                     set_remote(&staging, "local", Some(source.as_os_str()))?;
                     if !patch.is_empty() {
-                        crate::changes::apply_patch(&staging, &patch)?;
+                        crate::git::changes::apply_patch(&staging, &patch)?;
                     }
                 }
             }
@@ -461,9 +461,9 @@ impl CheckoutManager {
             // checkpoints) describe the parent, not this copy.
             delete_trama_refs(&staging)?;
             fs::write(staging.join(".git/trama-base-commit"), &base_revision)?;
-            let fork_commit = crate::changes::record_snapshot(
+            let fork_commit = crate::git::changes::record_snapshot(
                 &staging,
-                crate::changes::FORK_POINT_REF,
+                crate::git::changes::FORK_POINT_REF,
                 "trama: subthread fork point",
             )?;
             let fork_tree = git_text(&staging, ["rev-parse", &format!("{fork_commit}^{{tree}}")])?;

@@ -9,9 +9,4 @@ pub mod fs;
 pub mod git;
 pub mod process;
 
-// Stable top-level paths for dependents.
-pub use fs::cow;
-pub use git::{archive, changes, checkout, share_git};
-pub use process::{pty, setup};
-
 pub use claude::adapter::ClaudeAdapter;

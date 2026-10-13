@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use trama_domain::ids::{MessageId, RepositoryId, ThreadId};
-use trama_infra::pty::{PtyChild, PtySpec, exit_parts};
+use trama_infra::process::pty::{PtyChild, PtySpec, exit_parts};
 use trama_protocol::{DaemonMessage, TerminalExitStatus, TerminalSnapshot};
 
 /// Raw output retained per terminal.
@@ -141,8 +141,8 @@ pub(super) fn filter_env(
             let key = key.to_string_lossy();
             key != "CLAUDECODE"
                 && !key.starts_with("CLAUDE_CODE_")
-                && key != crate::approval::ENV_SOCKET
-                && key != crate::approval::ENV_TOKEN
+                && key != crate::claude::approval::ENV_SOCKET
+                && key != crate::claude::approval::ENV_TOKEN
                 && key != "TERM"
         })
         .collect();

@@ -8,7 +8,7 @@ use trama_domain::checkpoint::{RepoState, WorkingChanges};
 use trama_domain::ids::RepositoryId;
 use trama_domain::subthread::{LandOutcome, RepoForkPoint, RepoPullResult, ReviewVerdict};
 use trama_domain::thread::ThreadKind;
-use trama_infra::changes;
+use trama_infra::git::changes;
 use trama_protocol::{ChangeBase, RepoChanges, SubthreadKind};
 
 /// Line a land subthread ends its final message with.
@@ -935,9 +935,9 @@ impl SessionManager {
                         REVIEW_VERDICT_REF,
                         "trama: review verdict snapshot",
                     )?;
-                    let tree = trama_infra::changes::resolve_tree(&path, &commit)?;
+                    let tree = trama_infra::git::changes::resolve_tree(&path, &commit)?;
                     let fork_tree = match &fork_commit {
-                        Some(fork) => Some(trama_infra::changes::resolve_tree(&path, fork)?),
+                        Some(fork) => Some(trama_infra::git::changes::resolve_tree(&path, fork)?),
                         None => None,
                     };
                     Ok(RepoState {
@@ -1113,7 +1113,7 @@ fn remove_fresh_copies(
     copies: &[(
         RepositoryId,
         CheckoutId,
-        trama_infra::checkout::ProvisionedCopy,
+        trama_infra::git::checkout::ProvisionedCopy,
         (PathBuf, String),
     )],
 ) {

@@ -1,7 +1,7 @@
 //! Trama subagents through the MCP tool entry point, with the fake adapter.
 
 use super::*;
-use crate::mcp::{self, McpSettings};
+use crate::claude::mcp::{self, McpSettings};
 use crate::testing::{FakeAdapter, scripted_events};
 use serde_json::json;
 use std::path::Path;

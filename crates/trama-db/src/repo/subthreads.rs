@@ -69,9 +69,9 @@ impl TramaDb {
             let tx = conn.transaction().map_err(sql_err)?;
             insert_thread(&tx, &thread)?;
             if let Some(subagent) = &subagent {
-                crate::agents::insert_subagent(&tx, subagent)?;
+                crate::repo::agents::insert_subagent(&tx, subagent)?;
             }
-            crate::checkouts::insert_locations(
+            crate::repo::checkouts::insert_locations(
                 &tx,
                 &thread.id.to_string(),
                 &thread.repo_attachments,

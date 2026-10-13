@@ -31,7 +31,7 @@ use crate::{
         self, AfterQuery, ClaimOutcome, MAX_PAGE, MAX_WS_MESSAGE_BYTES, RunnerIdentity, read,
         validate_draft, validate_thread_id, write,
     },
-    live::Live,
+    http::live::Live,
 };
 
 /// Sessions, memberships and runner credentials are also re-validated on

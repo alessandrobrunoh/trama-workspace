@@ -1,7 +1,7 @@
 //! Approval broker end to end: a fake adapter session, the real connection
 //! handler, and the real hook client (`approval::request_over`).
 
-use crate::approval::{self, ApprovalHookSettings, HookDecision};
+use crate::claude::approval::{self, ApprovalHookSettings, HookDecision};
 use crate::ipc::handle_connection;
 use crate::session::SessionManager;
 use crate::testing::FakeAdapter;

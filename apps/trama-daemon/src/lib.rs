@@ -1,15 +1,12 @@
 //! Local TramaWorkspace daemon: Unix-socket JSON-lines server and real sessions.
 
-mod claude;
+pub mod claude;
 mod collab;
 mod config;
 mod error;
 mod ipc;
 mod log;
 mod session;
-
-// Paths kept stable: `trama_daemon::approval` and `trama_daemon::mcp`.
-pub use claude::{approval, mcp};
 
 #[cfg(test)]
 mod testing;
@@ -20,8 +17,8 @@ pub use session::{
     NoCollaborators, PeopleSource, Person, PromptContext, SessionManager, SubagentSettings,
 };
 
-use crate::approval::ApprovalHookSettings;
 use crate::claude::ProductionAdapter;
+use crate::claude::approval::ApprovalHookSettings;
 use crate::config::{load_or_init_config, seed_from_config};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -72,7 +69,7 @@ pub async fn run_on_socket(socket_path: &Path) -> Result<()> {
     let sessions = bootstrap_sessions()
         .await?
         .with_approval_hook(ApprovalHookSettings::for_current_exe(socket_path)?)
-        .with_mcp(mcp::McpSettings::for_current_exe(socket_path)?);
+        .with_mcp(claude::mcp::McpSettings::for_current_exe(socket_path)?);
     // Shared threads: credentials and the runner live beside the database.
     let collab = CollabService::new(sessions.clone(), &default_app_dir()?);
     collab.start().await?;

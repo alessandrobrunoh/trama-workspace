@@ -14,7 +14,7 @@ use std::path::Path;
 use trama_db::ThreadCheckoutRow;
 use trama_domain::ids::RepositoryId;
 use trama_domain::subagent::SubagentProfile;
-use trama_infra::checkout::RemovalReport;
+use trama_infra::git::checkout::RemovalReport;
 use trama_protocol::{CheckoutRemoval, DiskUsageItem};
 
 /// Serializes checkout recreation, so two requests cannot restore the same
@@ -75,7 +75,7 @@ impl SessionManager {
         let mut items = tokio::task::spawn_blocking(move || {
             items.retain(|item| item.path.is_dir());
             for item in &mut items {
-                match trama_infra::cow::disk_usage(&item.path) {
+                match trama_infra::fs::cow::disk_usage(&item.path) {
                     Ok(usage) => {
                         item.apparent_bytes = usage.apparent_bytes;
                         item.private_bytes = usage.private_bytes;
@@ -290,7 +290,7 @@ impl SessionManager {
                 } else {
                     RemovalReport::default()
                 };
-                let freed = trama_infra::cow::disk_usage(&target.row.path)
+                let freed = trama_infra::fs::cow::disk_usage(&target.row.path)
                     .ok()
                     .map(|usage| usage.private_bytes);
                 reports.push(removal(target, &report, freed));

@@ -93,8 +93,9 @@ impl SessionManager {
             paths
                 .into_iter()
                 .map(|(repository_id, path)| {
-                    let (commit, tree) = trama_infra::changes::record_checkpoint(&path, &ref_id)?;
-                    let head_tree = trama_infra::changes::resolve_tree(&path, "HEAD").ok();
+                    let (commit, tree) =
+                        trama_infra::git::changes::record_checkpoint(&path, &ref_id)?;
+                    let head_tree = trama_infra::git::changes::resolve_tree(&path, "HEAD").ok();
                     Ok(RepoState {
                         repository_id,
                         working_changes: if head_tree.as_deref() == Some(tree.as_str()) {

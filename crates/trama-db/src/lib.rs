@@ -14,20 +14,17 @@ mod projections;
 mod repo;
 mod store;
 
-// Crate-root aliases keep `crate::<module>` paths stable.
-use repo::{agents, archive, checkouts, collab, collab_history, comments, composer, subthreads};
-
-pub use agents::SubagentRecord;
-pub use archive::ThreadCheckoutRow;
-pub use checkouts::CheckoutLocation;
-pub use collab::{CollabLink, CollabTurn};
-pub use collab_history::{
+pub use repo::agents::SubagentRecord;
+pub use repo::archive::ThreadCheckoutRow;
+pub use repo::checkouts::CheckoutLocation;
+pub use repo::collab::{CollabLink, CollabTurn};
+pub use repo::collab_history::{
     CollabApplied, CollabApply, FamilyRow, OutboxJob, OutboxRow, RemoteChangesRow,
 };
-pub use comments::CommentRecord;
-pub use composer::AgentCommands;
+pub use repo::comments::CommentRecord;
+pub use repo::composer::AgentCommands;
+pub use repo::subthreads::{ReviewVerdictRecord, SubthreadFork};
 pub use store::TramaDb;
-pub use subthreads::{ReviewVerdictRecord, SubthreadFork};
 
 /// Absolute test path on every platform: `/a/b` stays as is on Unix and
 /// becomes `C:/a/b` on Windows, where a leading `/` is not absolute.

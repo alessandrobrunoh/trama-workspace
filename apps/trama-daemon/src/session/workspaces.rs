@@ -127,7 +127,7 @@ impl SessionManager {
                 })?;
                 match validation {
                     Ok(()) => {
-                        let detail = trama_infra::setup::read_record(&path)
+                        let detail = trama_infra::process::setup::read_record(&path)
                             .and_then(|record| record.failure_summary());
                         (CheckoutStatus::Ready, Some(path), detail)
                     }
