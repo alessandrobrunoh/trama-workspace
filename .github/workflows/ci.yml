@@ -15,36 +15,34 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  # Portable core crates must build and pass on every desktop OS.
-  core:
-    name: core (${{ matrix.os }})
+  # The whole workspace (core crates, daemon, collab service, GPUI desktop)
+  # must build and pass on every desktop OS.
+  workspace:
+    name: workspace (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-14]
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Keep LF line endings in fixtures
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Linux system libraries for GPUI
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfreetype-dev libfontconfig-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libxcb1-dev libvulkan-dev \
+            libssl-dev libasound2-dev libzstd-dev pkg-config clang cmake
       - name: Git identity for test fixtures
         run: |
           git config --global user.name "Trama CI"
           git config --global user.email "ci@example.invalid"
           git config --global init.defaultBranch main
-      - name: Check core crates
-        run: cargo check -p trama-domain -p trama-infra -p trama-db -p trama-protocol -p trama-collab-protocol --all-targets
-      - name: Test core crates
-        run: cargo test --no-fail-fast -p trama-domain -p trama-infra -p trama-db -p trama-protocol -p trama-collab-protocol
-
-  # Full workspace (daemon, collab service, GPUI desktop). Linux/Windows
-  # ports of the daemon IPC and desktop are tracked as follow-up milestones.
-  workspace:
-    name: workspace (macOS)
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
-      - run: cargo test --workspace
+      - name: Check workspace
+        run: cargo check --workspace --all-targets
+      - name: Test workspace
+        run: cargo test --workspace --no-fail-fast
