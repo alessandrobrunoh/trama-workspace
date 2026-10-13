@@ -472,6 +472,45 @@ pub fn revoked_banner(p: &Palette) -> AnyElement {
         .into_any_element()
 }
 
+/// A vNext share ended (closed by the owner, or access revoked).
+pub fn ended_banner(p: &Palette, why: &str) -> AnyElement {
+    h_flex()
+        .w_full()
+        .px(theme::sp(3.))
+        .py(theme::sp(2.))
+        .gap(theme::sp(2.))
+        .items_center()
+        .rounded(theme::radius())
+        .border_1()
+        .border_color(p.warning.opacity(0.30))
+        .bg(p.warning.opacity(0.08))
+        .text_size(theme::text_sm())
+        .text_color(p.text)
+        .child(
+            Icon::new(IconName::Lock)
+                .with_size(px(14.))
+                .text_color(p.warning),
+        )
+        .child(div().flex_1().child(why.to_owned()))
+        .into_any_element()
+}
+
+/// Under a message written without the writer lease: it never reached
+/// the share.
+pub fn unshared_badge(p: &Palette) -> AnyElement {
+    h_flex()
+        .gap(theme::sp(1.))
+        .items_center()
+        .pl(theme::sp(3.))
+        .text_size(theme::text_xs())
+        .text_color(p.warning)
+        .child(Icon::new(IconName::TriangleAlert).with_size(px(11.)))
+        .child(UNSHARED_LABEL)
+        .into_any_element()
+}
+
+pub const UNSHARED_LABEL: &str = "Not shared: take the lease to publish your turns";
+
 /// The subtle line under the composer of a shared thread (ADR 0008).
 pub fn shared_footer(p: &Palette, runner_online: bool) -> AnyElement {
     h_flex()

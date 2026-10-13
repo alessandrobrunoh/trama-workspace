@@ -10,8 +10,11 @@ use trama_protocol::{ClientMessage, CollabCapability, CollabServerInfo, DaemonMe
 
 use super::CollabStore;
 use super::wizard::join_flow::JoinFlow;
-use super::wizard::route::{WizardOp, route};
+use super::wizard::route::{Correlation, WizardOp, route};
+
+mod history;
 use super::wizard::share_flow::ShareFlow;
+pub use history::ShareHistory;
 
 /// How long Share/Join waits for the server check before using v2.
 pub const SERVER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -53,7 +56,9 @@ pub struct VNextState {
     pub note: Option<String>,
     pub share: Option<ShareFlow>,
     pub join: Option<JoinFlow>,
-    pending: Option<WizardOp>,
+    corr: Correlation,
+    /// Per-thread share state shown in the transcript.
+    pub history: ShareHistory,
 }
 
 impl VNextState {
@@ -138,8 +143,8 @@ impl VNextState {
         if self.share.as_ref().is_some_and(|f| f.thread_id == thread) {
             return;
         }
-        if self.pending == Some(WizardOp::Share) {
-            self.pending = None;
+        if self.corr.pending == Some(WizardOp::Share) {
+            self.corr.pending = None;
         }
         self.share = Some(ShareFlow::new(thread, title));
     }
@@ -153,37 +158,44 @@ impl VNextState {
             .as_ref()
             .is_some_and(|f| !matches!(f.step, JoinStep::Enter | JoinStep::Joined(_)));
         if !resumable {
-            if self.pending == Some(WizardOp::Join) {
-                self.pending = None;
+            if self.corr.pending == Some(WizardOp::Join) {
+                self.corr.pending = None;
             }
             self.join = Some(JoinFlow::new(workspace));
         }
     }
 
-    /// Routes a wizard reply. Returns `(handled, follow_up)`.
-    pub fn apply(&mut self, message: &DaemonMessage) -> (bool, Option<ClientMessage>) {
-        if let DaemonMessage::CollabServerInfo(info) = message {
-            self.on_server_info(info);
-            return (true, None);
-        }
-        if matches!(message, DaemonMessage::Error { .. }) && self.pending.is_none() {
-            // An uncorrelated error while checking: treat the check as
-            // failed (v2 fallback) but let the error reach its owner.
-            self.discovering = None;
-            return (false, None);
+    /// Routes a wizard reply. Returns `(handled, follow_ups)`.
+    pub fn apply(&mut self, message: &DaemonMessage) -> (bool, Vec<ClientMessage>) {
+        match message {
+            DaemonMessage::CollabServerInfo(info) => {
+                self.on_server_info(info);
+                return (true, Vec::new());
+            }
+            DaemonMessage::ShareHistoryStatus { thread_id, entries } => {
+                self.history.apply(thread_id, entries);
+                return (true, Vec::new());
+            }
+            DaemonMessage::Shares(list) => self.history.apply_shares(list),
+            _ => {}
         }
         let r = route(
             message,
-            &mut self.pending,
+            &mut self.corr,
             self.share.as_mut(),
             self.join.as_mut(),
         );
-        (r.handled, r.follow_up)
+        if !r.handled && matches!(message, DaemonMessage::Error { .. }) {
+            // An uncorrelated error while checking: treat the check as
+            // failed (v2 fallback) but let the error reach its owner.
+            self.discovering = None;
+        }
+        (r.handled, r.follow_ups)
     }
 
     /// Marks `op` as awaiting a reply (for uncorrelated errors).
     pub fn sent(&mut self, op: WizardOp) {
-        self.pending = Some(op);
+        self.corr.sent(op);
     }
 
     pub fn fail(&mut self, op: WizardOp, message: String) {
@@ -254,6 +266,17 @@ impl CollabStore {
         cx.notify();
     }
 
+    /// Per-message share state of the selected thread (vNext servers).
+    pub(super) fn request_history(&mut self, cx: &mut Context<Self>) {
+        if !self.vnext.supported() {
+            return;
+        }
+        if let Some(thread_id) = self.selected.clone() {
+            self.send(ClientMessage::GetShareHistoryStatus { thread_id });
+            cx.notify();
+        }
+    }
+
     /// Hook for [`CollabStore::apply`]: status changes trigger discovery,
     /// wizard replies are routed. Returns whether the message is consumed.
     pub(super) fn apply_vnext(&mut self, message: &DaemonMessage, cx: &mut Context<Self>) -> bool {
@@ -268,12 +291,26 @@ impl CollabStore {
             return false;
         }
         let was_checking = self.vnext.support() == ServerSupport::Checking;
-        let (handled, follow_up) = self.vnext.apply(message);
+        let (handled, follow_ups) = self.vnext.apply(message);
+        if let DaemonMessage::ShareFailed {
+            share_id: Some(_), ..
+        } = message
+            && self.vnext.supported()
+        {
+            // The daemon re-checks access after a failure and may have
+            // closed the share locally: refresh share states.
+            self.send(ClientMessage::ListShares);
+        }
         if was_checking && self.vnext.support() != ServerSupport::Checking {
+            if self.vnext.supported() {
+                // Share states (closed shares) for the transcript banners.
+                self.send(ClientMessage::ListShares);
+                self.request_history(cx);
+            }
             cx.notify();
         }
-        if follow_up.is_some() {
-            self.dispatch_wizard(WizardOp::Share, follow_up, cx);
+        for message in follow_ups {
+            self.dispatch_wizard(WizardOp::Share, Some(message), cx);
         }
         if handled {
             cx.notify();

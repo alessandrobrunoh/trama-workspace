@@ -151,14 +151,18 @@ fn reopening_resumes_wizards() {
         ShareStep::Checking,
         "resumed"
     );
-    assert_eq!(v.pending, Some(WizardOp::Share), "reply still expected");
+    assert_eq!(
+        v.corr.pending,
+        Some(WizardOp::Share),
+        "reply still expected"
+    );
     v.open_share(ThreadId::from("u"), "U".into());
     assert_eq!(
         v.share.as_ref().unwrap().step,
         ShareStep::Scope,
         "other thread starts over"
     );
-    assert_eq!(v.pending, None);
+    assert_eq!(v.corr.pending, None);
 
     v.open_join(WorkspaceId::from("w"));
     v.join.as_mut().unwrap().start("s1");
@@ -192,4 +196,54 @@ fn slow_server_check_times_out_to_v2_with_a_note() {
     assert!(!v.time_out("https://a"));
     v.on_status(Some("https://b"), true);
     assert!(v.note.is_none());
+}
+
+#[test]
+fn history_marks_unleased_messages_and_closed_shares() {
+    use trama_domain::ids::MessageId;
+    use trama_protocol::{
+        ShareHistoryEntry, ShareHistoryState, ShareRole, ShareScope, ShareSnapshot, ShareStatus,
+    };
+    let mut v = VNextState::default();
+    let t = ThreadId::from("t");
+    let entries = vec![
+        ShareHistoryEntry {
+            message_id: MessageId::from("m1"),
+            state: ShareHistoryState::Shared,
+        },
+        ShareHistoryEntry {
+            message_id: MessageId::from("m2"),
+            state: ShareHistoryState::NotSharedNoLease,
+        },
+    ];
+    let (handled, _) = v.apply(&DaemonMessage::ShareHistoryStatus {
+        thread_id: t.clone(),
+        entries,
+    });
+    assert!(handled);
+    assert_eq!(
+        v.history.unshared(&t).into_iter().collect::<Vec<_>>(),
+        [MessageId::from("m2")]
+    );
+    v.apply(&DaemonMessage::ShareHistoryStatus {
+        thread_id: t.clone(),
+        entries: vec![],
+    });
+    assert!(v.history.unshared(&t).is_empty());
+
+    let share = |status| ShareSnapshot {
+        share_id: "s".into(),
+        scope: ShareScope::ThreadOnly,
+        status,
+        role: ShareRole::Reader,
+        server_url: None,
+        root_thread_id: Some(t.clone()),
+        snapshot_version: 1,
+        key_epoch: None,
+    };
+    let (handled, _) = v.apply(&DaemonMessage::Shares(vec![share(ShareStatus::Closed)]));
+    assert!(!handled, "the share list stays available to others");
+    assert!(v.history.ended(&t).is_some());
+    v.apply(&DaemonMessage::Shares(vec![share(ShareStatus::Ready)]));
+    assert!(v.history.ended(&t).is_none());
 }

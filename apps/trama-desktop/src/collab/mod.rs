@@ -20,6 +20,7 @@ pub(crate) mod wizard;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
+use trama_domain::ids::MessageId;
 
 use gpui_kit::*;
 use trama_domain::agent::AgentEvent;
@@ -453,6 +454,10 @@ pub struct ThreadCollab {
     /// Others' non-empty drafts, by username.
     pub drafts: Vec<(String, String)>,
     pub remote_turns: Vec<RemoteTurn>,
+    /// vNext: messages written without the writer lease (never shared).
+    pub unshared: HashSet<MessageId>,
+    /// vNext: why the share ended (closed or revoked), if it did.
+    pub ended: Option<String>,
 }
 
 pub struct CollabStore {
@@ -597,6 +602,8 @@ impl CollabStore {
                 })
                 .unwrap_or_default(),
             remote_turns: self.remote_turns.get(thread).cloned().unwrap_or_default(),
+            unshared: self.vnext.history.unshared(thread),
+            ended: self.vnext.history.ended(thread),
         }
     }
 
@@ -711,6 +718,7 @@ impl CollabStore {
             self.remote_turns.remove(&previous);
         }
         self.selected = thread.clone();
+        self.request_history(cx);
         let shared = thread.filter(|id| self.linked.contains(id));
         if let Some((previous, text)) = self.debounce.retarget(shared.clone()) {
             self.send(ClientMessage::SetCollabDraft {

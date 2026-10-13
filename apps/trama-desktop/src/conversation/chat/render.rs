@@ -50,6 +50,9 @@ impl Render for ChatPanel {
                 notice(&p, IconName::TriangleAlert, p.warning, error).into_any_element()
             ));
         }
+        if let Some(why) = &shared.ended {
+            rows.push(row(crate::collab::presence::ended_banner(&p, why)));
+        }
         if shared.revoked {
             rows.push(row(crate::collab::presence::revoked_banner(&p)));
         }
@@ -182,6 +185,20 @@ impl Render for ChatPanel {
                 .bg(p.accent_soft)
                 .child(element)
                 .into_any_element();
+        }
+
+        for id in &shared.unshared {
+            if let Some(&index) = row_of.get(id)
+                && let Some(slot) = rows.get_mut(index)
+            {
+                let element = std::mem::replace(slot, div().into_any_element());
+                *slot = v_flex()
+                    .w_full()
+                    .flex_shrink_0()
+                    .child(element)
+                    .child(crate::collab::presence::unshared_badge(&p))
+                    .into_any_element();
+            }
         }
 
         for turn in &shared.remote_turns {
