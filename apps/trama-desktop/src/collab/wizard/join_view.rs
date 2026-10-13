@@ -1,4 +1,4 @@
-//! GPUI view of the Join wizard: link input, then step-by-step progress.
+//! GPUI view of the Join wizard: share id, then staged progress.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -11,78 +11,84 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use trama_protocol::ClientMessage;
 
-use super::join_flow::{JOIN_STEPS, JoinFlow, JoinRemedy, StepMark, step_label};
-use super::model::WizardCommand;
+use super::WizardRequest;
+use super::join_flow::{JOIN_STAGES, JoinFlow, JoinStage, JoinStep, StageMark, stage_label};
 use super::widgets::{note, section};
 use crate::app::theme::{self, Palette};
 
 pub struct JoinWizard {
-    pub flow: JoinFlow,
+    pub flow: Option<JoinFlow>,
     input: Entity<InputState>,
 }
 
-impl EventEmitter<WizardCommand> for JoinWizard {}
+impl EventEmitter<WizardRequest> for JoinWizard {}
 
 impl JoinWizard {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Paste the share link"));
-        Self {
-            flow: JoinFlow::default(),
-            input,
-        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Share ID from the owner"));
+        Self { flow: None, input }
     }
 
-    pub fn update_flow(
+    pub fn open(&mut self, flow: JoinFlow, cx: &mut Context<Self>) {
+        self.flow = Some(flow);
+        cx.notify();
+    }
+
+    pub fn act(
         &mut self,
         cx: &mut Context<Self>,
-        f: impl FnOnce(&mut JoinFlow, &mut Vec<WizardCommand>),
+        f: impl FnOnce(&mut JoinFlow) -> Option<ClientMessage>,
     ) {
-        let mut out = Vec::new();
-        f(&mut self.flow, &mut out);
-        for command in out {
-            cx.emit(command);
+        let Some(flow) = self.flow.as_mut() else {
+            return;
+        };
+        if let Some(message) = f(flow) {
+            cx.emit(WizardRequest(message));
         }
         cx.notify();
     }
 
     fn start(&mut self, cx: &mut Context<Self>) {
-        let link = self.input.read(cx).value().to_string();
-        self.update_flow(cx, |f, out| {
-            f.start(&link, out);
-        });
+        let raw = self.input.read(cx).value().to_string();
+        self.act(cx, |f| f.start(&raw));
     }
 
-    fn step_row(&self, p: &Palette, step: trama_domain::share::JoinState) -> Div {
-        let mark = self.flow.mark(step);
+    fn stage_row(p: &Palette, flow: &JoinFlow, stage: JoinStage) -> Div {
+        let mark = flow.mark(stage);
         let (icon, color) = match mark {
-            StepMark::Done => (IconName::Check, p.success),
-            StepMark::Current => (IconName::RefreshCw, p.accent),
-            StepMark::Failed => (IconName::CircleX, p.danger),
-            StepMark::Pending => (IconName::ChevronRight, p.text_faint),
+            StageMark::Done => (IconName::Check, p.success),
+            StageMark::Current => (IconName::RefreshCw, p.accent),
+            StageMark::Failed => (IconName::CircleX, p.danger),
+            StageMark::Pending => (IconName::ChevronRight, p.text_faint),
         };
         h_flex()
             .gap(theme::sp(2.))
             .items_center()
             .text_size(theme::text_sm())
-            .text_color(if mark == StepMark::Pending {
+            .text_color(if mark == StageMark::Pending {
                 p.text_faint
             } else {
                 p.text
             })
             .child(Icon::new(icon).with_size(px(12.)).text_color(color))
-            .child(step_label(step))
+            .child(stage_label(stage))
     }
 }
 
 impl Render for JoinWizard {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = theme::palette(cx);
-        let Some(state) = self.flow.state else {
+        let Some(flow) = self.flow.clone() else {
+            return div().into_any_element();
+        };
+        let entering = matches!(flow.step, JoinStep::Enter);
+        if entering {
             return v_flex()
                 .gap(theme::sp(3.))
                 .child(section(&p, "Join a share", Input::new(&self.input)))
-                .when_some(self.flow.error.clone(), |this, e| {
+                .when_some(flow.error.clone(), |this, e| {
                     this.child(note(&p, IconName::TriangleAlert, p.danger, e))
                 })
                 .child(
@@ -95,69 +101,84 @@ impl Render for JoinWizard {
                     ),
                 )
                 .into_any_element();
-        };
-        let steps = v_flex()
+        }
+        let stages = v_flex()
             .gap(theme::sp(1.5))
-            .children(JOIN_STEPS.map(|s| self.step_row(&p, s)));
-        let remedy = self.flow.remedy();
+            .children(JOIN_STAGES.map(|s| Self::stage_row(&p, &flow, s)));
+        let busy = matches!(
+            flow.step,
+            JoinStep::Requesting | JoinStep::Completing { .. }
+        );
+        let message = match &flow.step {
+            JoinStep::AwaitingApproval { device_id } => Some(note(
+                &p,
+                IconName::Users,
+                p.text_muted,
+                format!("Ask the owner to admit device {device_id}, then check again."),
+            )),
+            JoinStep::RequestFailed(e) => {
+                Some(note(&p, IconName::TriangleAlert, p.danger, e.clone()))
+            }
+            JoinStep::Joined(_) => Some(note(
+                &p,
+                IconName::Check,
+                p.success,
+                "The shared threads are in your sidebar.".into(),
+            )),
+            _ => None,
+        };
         v_flex()
             .gap(theme::sp(3.))
-            .child(section(&p, "Joining", steps))
-            .when(state.is_error(), |this| {
-                this.child(note(
-                    &p,
-                    IconName::TriangleAlert,
-                    p.danger,
-                    step_label(state).into(),
-                ))
-            })
-            .when_some(self.flow.detail.clone(), |this, d| {
-                this.child(note(&p, IconName::Info, p.text_muted, d))
-            })
-            .when(self.flow.is_ready(), |this| {
-                this.child(note(
-                    &p,
-                    IconName::Check,
-                    p.success,
-                    "The shared threads are ready in your sidebar.".into(),
-                ))
+            .child(section(&p, &format!("Joining {}", flow.share_id), stages))
+            .children(message)
+            .when_some(flow.error.clone(), |this, e| {
+                this.child(note(&p, IconName::TriangleAlert, p.warning, e))
             })
             .child(
                 h_flex()
                     .gap(theme::sp(2.))
                     .justify_end()
-                    .when(!state.is_error() && !self.flow.is_ready(), |this| {
+                    .when(busy, |this| {
                         this.child(Spinner::new().small().color(p.accent))
                     })
-                    .when(!self.flow.is_ready(), |this| {
-                        this.child(Button::new("join-cancel").small().label("Cancel").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.update_flow(cx, |f, out| f.cancel(out))
-                            }),
-                        ))
+                    .when(!matches!(flow.step, JoinStep::Joined(_)) && !busy, |this| {
+                        this.child(
+                            Button::new("join-reset")
+                                .small()
+                                .label("Start over")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.act(cx, |f| {
+                                        f.reset();
+                                        None
+                                    })
+                                })),
+                        )
                     })
-                    .when(remedy == Some(JoinRemedy::Retry), |this| {
+                    .when(matches!(flow.step, JoinStep::RequestFailed(_)), |this| {
                         this.child(
                             Button::new("join-retry")
                                 .primary()
                                 .small()
                                 .label("Retry")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.update_flow(cx, |f, out| f.retry(out))
+                                    this.act(cx, JoinFlow::retry_request)
                                 })),
                         )
                     })
-                    .when(remedy == Some(JoinRemedy::ConnectGitHub), |this| {
-                        this.child(
-                            Button::new("join-github")
-                                .primary()
-                                .small()
-                                .label("Connect GitHub")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.update_flow(cx, |f, out| f.connect_github(out))
-                                })),
-                        )
-                    }),
+                    .when(
+                        matches!(flow.step, JoinStep::AwaitingApproval { .. }),
+                        |this| {
+                            this.child(
+                                Button::new("join-check")
+                                    .primary()
+                                    .small()
+                                    .label("Check again")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.act(cx, JoinFlow::complete)
+                                    })),
+                            )
+                        },
+                    ),
             )
             .into_any_element()
     }

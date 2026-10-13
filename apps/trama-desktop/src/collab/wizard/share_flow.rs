@@ -1,189 +1,271 @@
-//! Share wizard state machine: Scope → Access → Checks → Creating → Done.
+//! Share wizard state machine: Scope → People → Checks → Creating → Shared
+//! (then admitting devices that asked to join).
 
 use trama_domain::ids::ThreadId;
-use trama_domain::share::{Capability, CodeAccessMode, ShareRole, ShareScope, ShareStatus};
+use trama_domain::share::Capability;
+use trama_protocol::{
+    ClientMessage, ShareInvite, ShareJoinRequest, SharePreflightReport, ShareRole, ShareScope,
+    ShareSnapshot,
+};
 
-use super::model::{CreatedShare, PreflightReport, ShareRequest, WizardBackend, WizardCommand};
+use crate::collab::valid_name;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShareStep {
     Scope,
-    Access,
+    People,
     /// Preflight requested, no report yet.
     Checking,
-    /// Report received; `Share` is enabled only without blockers.
-    Checked(PreflightReport),
+    /// Report received; `Share` is enabled only when `ok`.
+    Checked(SharePreflightReport),
     Creating,
-    Created(CreatedShare),
+    Shared(ShareSnapshot),
     Failed(String),
 }
 
-/// Roles an owner may hand out (owner itself is never delegated).
-pub const INVITEE_ROLES: [ShareRole; 3] =
-    [ShareRole::Editor, ShareRole::Reviewer, ShareRole::Reader];
-
 #[derive(Debug, Clone)]
 pub struct ShareFlow {
-    pub root: ThreadId,
+    pub thread_id: ThreadId,
     pub title: String,
     pub step: ShareStep,
     pub scope: ShareScope,
-    pub include_future_descendants: bool,
-    pub role: ShareRole,
-    /// Capabilities removed from the role preset.
-    removed: Vec<Capability>,
-    pub code_access: CodeAccessMode,
+    pub invites: Vec<ShareInvite>,
+    /// Devices waiting for admission (owner side, after creation).
+    pub requests: Vec<ShareJoinRequest>,
+    /// Device being approved, to disable its button.
+    pub approving: Option<String>,
+    pub error: Option<String>,
+}
+
+/// What an invite with `role`/`read_code` may do (plan 01 §4 presets).
+pub fn invite_capabilities(invite: &ShareInvite) -> Vec<Capability> {
+    use Capability::*;
+    let mut caps = match invite.role {
+        ShareRole::Writer => vec![ReadHistory, PublishTurn, Comment, Review],
+        _ => vec![ReadHistory],
+    };
+    if invite.read_code {
+        caps.insert(1, ReadCode);
+    }
+    caps
 }
 
 impl ShareFlow {
-    /// Conservative defaults: only this thread, read-only role, code only
-    /// after a verified Git permission proof.
-    pub fn new(root: ThreadId, title: String) -> Self {
+    /// Conservative defaults: this thread only; invitees are readers
+    /// without code until the owner opts in.
+    pub fn new(thread_id: ThreadId, title: String) -> Self {
         Self {
-            root,
+            thread_id,
             title,
             step: ShareStep::Scope,
             scope: ShareScope::ThreadOnly,
-            include_future_descendants: false,
-            role: ShareRole::Reader,
-            removed: Vec::new(),
-            code_access: CodeAccessMode::GitAuthorizationRequired,
+            invites: Vec::new(),
+            requests: Vec::new(),
+            approving: None,
+            error: None,
         }
+    }
+
+    fn editable(&self) -> bool {
+        matches!(self.step, ShareStep::Scope | ShareStep::People)
     }
 
     pub fn set_scope(&mut self, scope: ShareScope) {
-        self.scope = scope;
-        if !scope.includes_descendants() {
-            self.include_future_descendants = false;
+        if self.editable() {
+            self.scope = scope;
         }
     }
 
-    pub fn set_future_descendants(&mut self, on: bool) {
-        self.include_future_descendants = on && self.scope.includes_descendants();
+    /// Adds usernames (space/comma separated) as reader invites.
+    pub fn add_invites(&mut self, raw: &str, me: Option<&str>) -> Result<(), String> {
+        if !self.editable() {
+            return Ok(());
+        }
+        let names: Vec<&str> = raw
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_start_matches('@'))
+            .collect();
+        if let Some(bad) = names.iter().find(|n| !valid_name(n)) {
+            return Err(format!("\u{201c}{bad}\u{201d} is not a valid username."));
+        }
+        if let Some(me) = me
+            && names.iter().any(|n| n.eq_ignore_ascii_case(me))
+        {
+            return Err("You are the owner of this share.".into());
+        }
+        for name in names {
+            if !self
+                .invites
+                .iter()
+                .any(|i| i.username.eq_ignore_ascii_case(name))
+            {
+                self.invites.push(ShareInvite {
+                    username: name.to_owned(),
+                    role: ShareRole::Reader,
+                    read_code: false,
+                });
+            }
+        }
+        Ok(())
     }
 
-    pub fn set_role(&mut self, role: ShareRole) {
-        if INVITEE_ROLES.contains(&role) {
-            self.role = role;
-            self.removed.clear();
+    fn invite_mut(&mut self, username: &str) -> Option<&mut ShareInvite> {
+        if !self.editable() {
+            return None;
+        }
+        self.invites.iter_mut().find(|i| i.username == username)
+    }
+
+    /// Owner is never delegated.
+    pub fn set_role(&mut self, username: &str, role: ShareRole) {
+        if role != ShareRole::Owner
+            && let Some(i) = self.invite_mut(username)
+        {
+            i.role = role;
         }
     }
 
-    /// Capabilities of the preset. `read_code` is listed when the mode
-    /// can grant it; with `GitAuthorizationRequired` it is only issued
-    /// after the proof, which the view states.
-    pub fn preset(&self) -> Vec<Capability> {
-        self.role.default_capabilities(true).0.into_iter().collect()
-    }
-
-    pub fn has(&self, cap: Capability) -> bool {
-        self.preset().contains(&cap) && !self.removed.contains(&cap)
-    }
-
-    /// Toggles a preset capability off/on. `read_history` is the base of
-    /// every share and cannot be removed; nothing outside the preset can
-    /// be added.
-    pub fn toggle(&mut self, cap: Capability) {
-        if cap == Capability::ReadHistory || !self.preset().contains(&cap) {
-            return;
-        }
-        if let Some(i) = self.removed.iter().position(|c| *c == cap) {
-            self.removed.remove(i);
-        } else {
-            self.removed.push(cap);
+    pub fn toggle_read_code(&mut self, username: &str) {
+        if let Some(i) = self.invite_mut(username) {
+            i.read_code = !i.read_code;
         }
     }
 
-    pub fn capabilities(&self) -> Vec<Capability> {
-        self.preset().into_iter().filter(|c| self.has(*c)).collect()
-    }
-
-    pub fn request(&self) -> ShareRequest {
-        ShareRequest {
-            root: self.root.clone(),
-            scope: self.scope,
-            include_future_descendants: self.include_future_descendants,
-            role: self.role,
-            capabilities: self.capabilities(),
-            code_access: self.code_access,
+    pub fn remove_invite(&mut self, username: &str) {
+        if self.editable() {
+            self.invites.retain(|i| i.username != username);
         }
     }
 
     pub fn can_go_back(&self) -> bool {
         matches!(
             self.step,
-            ShareStep::Access | ShareStep::Checked(_) | ShareStep::Failed(_)
+            ShareStep::People | ShareStep::Checked(_) | ShareStep::Failed(_)
         )
     }
 
-    /// Back also discards a preflight report: it described other choices.
+    /// Back also discards the report: it described other choices.
     pub fn back(&mut self) {
         self.step = match self.step {
-            ShareStep::Access => ShareStep::Scope,
-            ShareStep::Checked(_) | ShareStep::Failed(_) => ShareStep::Access,
+            ShareStep::People => ShareStep::Scope,
+            ShareStep::Checked(_) | ShareStep::Failed(_) => ShareStep::People,
             _ => return,
         };
-    }
-
-    /// Primary button. Returns whether a command was sent.
-    pub fn next(&mut self, backend: &mut dyn WizardBackend) -> bool {
-        match &self.step {
-            ShareStep::Scope => {
-                self.step = ShareStep::Access;
-                false
-            }
-            ShareStep::Access => self.run_checks(backend),
-            ShareStep::Checked(report) if !report.blocks() => {
-                self.step = ShareStep::Creating;
-                backend.send(WizardCommand::CreateShare(self.request()));
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// (Re)runs preflight, e.g. after the user fixed blockers.
-    pub fn run_checks(&mut self, backend: &mut dyn WizardBackend) -> bool {
-        if matches!(
-            self.step,
-            ShareStep::Checking | ShareStep::Creating | ShareStep::Created(_)
-        ) {
-            return false;
-        }
-        self.step = ShareStep::Checking;
-        backend.send(WizardCommand::Preflight(self.request()));
-        true
     }
 
     pub fn primary_label(&self) -> Option<&'static str> {
         match &self.step {
             ShareStep::Scope => Some("Continue"),
-            ShareStep::Access => Some("Run checks"),
-            ShareStep::Checked(r) if r.blocks() => None,
-            ShareStep::Checked(_) => Some("Share"),
+            ShareStep::People => Some("Run checks"),
+            ShareStep::Checked(r) if r.ok && r.blockers.is_empty() => Some("Share"),
             _ => None,
         }
     }
 
-    pub fn apply_preflight(&mut self, report: PreflightReport) {
-        if self.step == ShareStep::Checking {
+    /// Primary button.
+    pub fn next(&mut self) -> Option<ClientMessage> {
+        match &self.step {
+            ShareStep::Scope => {
+                self.step = ShareStep::People;
+                None
+            }
+            ShareStep::People => self.run_checks(),
+            ShareStep::Checked(r) if r.ok && r.blockers.is_empty() => {
+                self.step = ShareStep::Creating;
+                Some(ClientMessage::CreateShare {
+                    thread_id: self.thread_id.clone(),
+                    scope: self.scope,
+                    members: self.invites.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// (Re)runs preflight, e.g. after fixing blockers.
+    pub fn run_checks(&mut self) -> Option<ClientMessage> {
+        if !matches!(
+            self.step,
+            ShareStep::People | ShareStep::Checked(_) | ShareStep::Failed(_)
+        ) {
+            return None;
+        }
+        self.step = ShareStep::Checking;
+        Some(ClientMessage::SharePreflight {
+            thread_id: self.thread_id.clone(),
+            scope: self.scope,
+        })
+    }
+
+    /// Also the reply to a `CreateShare` the daemon found blocked.
+    pub fn apply_preflight(&mut self, report: SharePreflightReport) {
+        let pending = matches!(self.step, ShareStep::Checking | ShareStep::Creating);
+        if pending && report.thread_id == self.thread_id && report.scope == self.scope {
             self.step = ShareStep::Checked(report);
         }
     }
 
-    /// Daemon confirmed creation, or later status updates of the share.
-    pub fn apply_created(&mut self, created: CreatedShare) {
-        if matches!(self.step, ShareStep::Creating | ShareStep::Created(_)) {
-            let link = (created.status == ShareStatus::Ready)
-                .then_some(created.link)
-                .flatten();
-            self.step = ShareStep::Created(CreatedShare { link, ..created });
+    /// Created: load the admission queue.
+    pub fn apply_created(&mut self, share: ShareSnapshot) -> Option<ClientMessage> {
+        if self.step != ShareStep::Creating {
+            return None;
+        }
+        let share_id = share.share_id.clone();
+        self.step = ShareStep::Shared(share);
+        Some(ClientMessage::ListShareJoinRequests { share_id })
+    }
+
+    pub fn share_id(&self) -> Option<&str> {
+        match &self.step {
+            ShareStep::Shared(s) => Some(&s.share_id),
+            _ => None,
+        }
+    }
+
+    pub fn refresh_requests(&mut self) -> Option<ClientMessage> {
+        let share_id = self.share_id()?.to_owned();
+        Some(ClientMessage::ListShareJoinRequests { share_id })
+    }
+
+    pub fn apply_requests(&mut self, share_id: &str, requests: Vec<ShareJoinRequest>) {
+        if self.share_id() == Some(share_id) {
+            self.requests = requests;
+        }
+    }
+
+    pub fn approve(&mut self, device_id: &str) -> Option<ClientMessage> {
+        let share_id = self.share_id()?.to_owned();
+        if self.approving.is_some() || !self.requests.iter().any(|r| r.device_id == device_id) {
+            return None;
+        }
+        self.approving = Some(device_id.to_owned());
+        self.error = None;
+        Some(ClientMessage::ApproveShareJoin {
+            share_id,
+            device_id: device_id.to_owned(),
+        })
+    }
+
+    pub fn apply_approved(&mut self, share_id: &str, device_id: &str, key_epoch: u64) {
+        if self.share_id() != Some(share_id) {
+            return;
+        }
+        self.requests.retain(|r| r.device_id != device_id);
+        self.approving = None;
+        if let ShareStep::Shared(s) = &mut self.step {
+            s.key_epoch = Some(key_epoch);
         }
     }
 
     pub fn apply_error(&mut self, message: String) {
-        if matches!(self.step, ShareStep::Checking | ShareStep::Creating) {
-            self.step = ShareStep::Failed(message);
+        match self.step {
+            ShareStep::Checking | ShareStep::Creating => self.step = ShareStep::Failed(message),
+            ShareStep::Shared(_) => {
+                self.approving = None;
+                self.error = Some(message);
+            }
+            _ => {}
         }
     }
 }
