@@ -3,4 +3,5 @@
 pub mod archive;
 pub mod changes;
 pub mod checkout;
+pub mod conflicts;
 pub mod share_git;
