@@ -36,6 +36,17 @@ pub use composer::AgentCommands;
 pub use store::TramaDb;
 pub use subthreads::{ReviewVerdictRecord, SubthreadFork};
 
+/// Absolute test path on every platform: `/a/b` stays as is on Unix and
+/// becomes `C:/a/b` on Windows, where a leading `/` is not absolute.
+#[cfg(test)]
+pub(crate) fn test_abs_path(path: &str) -> std::path::PathBuf {
+    if cfg!(windows) {
+        std::path::PathBuf::from(format!("C:{path}"))
+    } else {
+        std::path::PathBuf::from(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,7 +131,7 @@ mod tests {
                 attach_mode: AttachMode::Isolated,
             }],
         };
-        let location = PathBuf::from("/src/repo/.trama/worktrees/t/r/c");
+        let location = crate::test_abs_path("/src/repo/.trama/worktrees/t/r/c");
         db.create_thread_with_locations(
             &thread,
             &[CheckoutLocation {
@@ -185,7 +196,7 @@ mod tests {
                 &[CheckoutLocation {
                     checkout_id: CheckoutId::from("checkout"),
                     repository_id: repository.repository_id.clone(),
-                    path: PathBuf::from("/different/checkout"),
+                    path: crate::test_abs_path("/different/checkout"),
                 }],
             )
             .await;

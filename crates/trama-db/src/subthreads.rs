@@ -346,8 +346,7 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let location =
-            std::path::PathBuf::from("/tmp/repo/.trama/worktrees/review/review-checkout");
+        let location = crate::test_abs_path("/tmp/repo/.trama/worktrees/review/review-checkout");
         db.create_subthread(
             &review,
             &fork,

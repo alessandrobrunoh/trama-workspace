@@ -35,7 +35,7 @@ jobs:
       - name: Check core crates
         run: cargo check -p trama-domain -p trama-infra -p trama-db -p trama-protocol -p trama-collab-protocol --all-targets
       - name: Test core crates
-        run: cargo test -p trama-domain -p trama-infra -p trama-db -p trama-protocol -p trama-collab-protocol
+        run: cargo test --no-fail-fast -p trama-domain -p trama-infra -p trama-db -p trama-protocol -p trama-collab-protocol
 
   # Full workspace (daemon, collab service, GPUI desktop). Linux/Windows
   # ports of the daemon IPC and desktop are tracked as follow-up milestones.

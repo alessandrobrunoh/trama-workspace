@@ -217,7 +217,7 @@ mod tests {
                 attach_mode: AttachMode::Isolated,
             }],
         };
-        let path = PathBuf::from("/src/repo/.trama/worktrees/t/checkout");
+        let path = crate::test_abs_path("/src/repo/.trama/worktrees/t/checkout");
         db.create_thread_with_locations(
             &thread,
             &[CheckoutLocation {
