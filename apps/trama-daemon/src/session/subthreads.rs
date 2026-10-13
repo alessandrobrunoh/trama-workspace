@@ -1899,7 +1899,11 @@ mod tests {
         .unwrap();
         assert_eq!(result, (LandOutcome::Landed, "merged into main".into()));
         let prompt = prompts(&fake).pop().unwrap();
-        assert!(prompt.contains(".claude/skills/ship/SKILL.md"), "{prompt}");
+        assert!(
+            prompt.contains(".claude/skills/ship/SKILL.md")
+                || prompt.contains(r".claude\skills\ship\SKILL.md"),
+            "{prompt}"
+        );
         assert!(prompt.contains(LAND_RESULT_MARKER));
         let events = mgr
             .db

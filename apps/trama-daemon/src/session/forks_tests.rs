@@ -181,15 +181,15 @@ async fn turns_record_checkpoints_and_forks_cut_conversation_and_files_at_a_mess
     let fork = mgr.db.get_subthread_fork(&child.id).await.unwrap().unwrap();
     assert_eq!(fork.fork_message_id.as_ref(), Some(&turn_answers[0].id));
     let copy = fork.parent_external_session_id.clone().unwrap();
+    // Component-wise, with or without the temp dir canonicalized
+    // (Windows short names and separators).
+    let forks_under = |root: &std::path::Path| {
+        std::path::Path::new(&copy).starts_with(root.join("managed").join("forks"))
+    };
     assert!(
-        copy.starts_with(
-            &fixture
-                .dir
-                .path()
-                .join("managed/forks")
-                .to_string_lossy()
-                .into_owned()
-        )
+        forks_under(fixture.dir.path())
+            || forks_under(&dunce::canonicalize(fixture.dir.path()).unwrap()),
+        "{copy}"
     );
     assert_eq!(uuids(&copy), ["u-1", "a-1"]);
     let events = mgr
