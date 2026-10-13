@@ -313,7 +313,10 @@ impl SessionManager {
         let watching = Arc::clone(terminal);
         std::thread::spawn(move || {
             let status = loop {
-                match lock(&watching.pty).try_wait() {
+                // Release the PTY lock before sleeping, so close/kill can
+                // take it between polls.
+                let polled = lock(&watching.pty).try_wait();
+                match polled {
                     Ok(Some(status)) => break exit_parts(status),
                     Ok(None) => std::thread::sleep(Duration::from_millis(40)),
                     Err(_) => break (None, None),
