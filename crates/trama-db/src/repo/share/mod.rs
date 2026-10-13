@@ -5,6 +5,7 @@
 //! No plaintext tokens, absolute source paths or session ids are stored.
 
 mod checkouts;
+mod heads;
 mod inventory;
 mod servers;
 mod shares;
@@ -12,8 +13,11 @@ mod threads;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_heads;
 
 pub use checkouts::ShareCheckoutStateRow;
+pub use heads::ShareDeviceHead;
 pub use inventory::{ObjectState, ShareObjectRow, SharePeerAck};
 pub use servers::CollaborationServerRow;
 pub use shares::{ShareRow, ShareStatus};

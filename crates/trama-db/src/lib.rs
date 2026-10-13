@@ -24,8 +24,8 @@ pub use repo::collab_history::{
 pub use repo::comments::CommentRecord;
 pub use repo::composer::AgentCommands;
 pub use repo::share::{
-    CollaborationServerRow, ObjectState, ShareCheckoutStateRow, ShareObjectRow, SharePeerAck,
-    ShareRow, ShareStatus, ShareThreadRow,
+    CollaborationServerRow, ObjectState, ShareCheckoutStateRow, ShareDeviceHead, ShareObjectRow,
+    SharePeerAck, ShareRow, ShareStatus, ShareThreadRow,
 };
 pub use repo::subthreads::{ReviewVerdictRecord, SubthreadFork};
 pub use store::TramaDb;
