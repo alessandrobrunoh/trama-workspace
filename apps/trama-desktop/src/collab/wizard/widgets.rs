@@ -1,0 +1,94 @@
+//! Small shared building blocks for the wizard views.
+
+use gpui_kit::assets::IconName;
+use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::*;
+
+use crate::app::theme::{self, Palette};
+
+pub fn section(p: &Palette, title: &str, body: impl IntoElement) -> Div {
+    v_flex()
+        .gap(theme::sp(2.))
+        .child(
+            div()
+                .text_size(theme::text_xs())
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(p.text_faint)
+                .child(title.to_uppercase()),
+        )
+        .child(body)
+}
+
+/// A selectable option card (radio-like). The caller attaches `on_click`.
+pub fn choice(
+    p: &Palette,
+    id: impl Into<ElementId>,
+    selected: bool,
+    label: &str,
+    detail: &str,
+) -> Stateful<Div> {
+    h_flex()
+        .id(id)
+        .gap(theme::sp(2.))
+        .items_start()
+        .p(theme::sp(2.))
+        .rounded(theme::radius())
+        .border_1()
+        .border_color(if selected { p.accent } else { p.border })
+        .bg(if selected { p.accent_soft } else { p.panel })
+        .cursor_pointer()
+        .hover(|s| s.bg(p.hover))
+        .child(
+            Icon::new(if selected {
+                IconName::Check
+            } else {
+                IconName::ChevronRight
+            })
+            .with_size(px(12.))
+            .text_color(if selected { p.accent } else { p.text_faint }),
+        )
+        .child(
+            v_flex()
+                .min_w_0()
+                .child(div().text_size(theme::text_sm()).child(label.to_owned()))
+                .child(
+                    div()
+                        .text_size(theme::text_xs())
+                        .text_color(p.text_muted)
+                        .child(detail.to_owned()),
+                ),
+        )
+}
+
+/// One blocker line with a danger icon.
+pub fn blocker(p: &Palette, title: String, detail: Option<String>) -> Div {
+    h_flex()
+        .gap(theme::sp(2.))
+        .items_start()
+        .child(
+            Icon::new(IconName::CircleX)
+                .with_size(px(12.))
+                .text_color(p.danger),
+        )
+        .child(
+            v_flex()
+                .min_w_0()
+                .child(div().text_size(theme::text_sm()).child(title))
+                .children(detail.map(|d| {
+                    div()
+                        .text_size(theme::text_xs())
+                        .text_color(p.text_muted)
+                        .child(d)
+                })),
+        )
+}
+
+pub fn note(p: &Palette, icon: IconName, color: Hsla, text: String) -> Div {
+    h_flex()
+        .gap(theme::sp(1.5))
+        .items_center()
+        .text_size(theme::text_xs())
+        .text_color(color)
+        .child(Icon::new(icon).with_size(px(12.)))
+        .child(div().min_w_0().text_color(p.text_muted).child(text))
+}

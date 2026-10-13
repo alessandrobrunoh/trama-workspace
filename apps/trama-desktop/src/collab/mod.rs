@@ -15,6 +15,7 @@
 pub(crate) mod account;
 pub(crate) mod presence;
 pub(crate) mod share_dialog;
+pub(crate) mod wizard;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
