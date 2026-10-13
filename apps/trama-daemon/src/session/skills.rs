@@ -89,11 +89,11 @@ pub(super) fn discover(roots: &SkillRoots) -> Vec<SkillInfo> {
 
 /// `true` when `path` resolves inside one of `allowed`.
 fn confined(path: &Path, allowed: &[PathBuf]) -> bool {
-    let Ok(real) = fs::canonicalize(path) else {
+    let Ok(real) = dunce::canonicalize(path) else {
         return false;
     };
     allowed.iter().any(|root| {
-        fs::canonicalize(root)
+        dunce::canonicalize(root)
             .map(|root| real.starts_with(root))
             .unwrap_or(false)
     })

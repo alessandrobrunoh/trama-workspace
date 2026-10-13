@@ -431,7 +431,7 @@ fn target_path(root: &Path, path: &str, create_parent: bool) -> Result<PathBuf, 
     } else if !parent.exists() {
         return Ok(target);
     }
-    let canonical_parent = fs::canonicalize(parent)?;
+    let canonical_parent = dunce::canonicalize(parent)?;
     if !canonical_parent.starts_with(root) {
         return Err(CheckoutError::Containment(target));
     }
@@ -558,7 +558,7 @@ pub fn pull(
     fork_commit: &str,
     parent: &Path,
 ) -> Result<Vec<PullFileResult>, CheckoutError> {
-    let parent = fs::canonicalize(parent)?;
+    let parent = dunce::canonicalize(parent)?;
     let current = snapshot_tree(subthread)?;
     let changed = git(
         subthread,
@@ -785,7 +785,7 @@ mod tests {
         // The copy is a valid repo-local checkout of the original source.
         assert_eq!(
             copy.path,
-            fs::canonicalize(&fixture.source)
+            dunce::canonicalize(&fixture.source)
                 .unwrap()
                 .join(".trama/worktrees/sub/sub-checkout")
         );

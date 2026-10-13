@@ -1507,9 +1507,11 @@ mod tests {
         assert_eq!(configs.len(), 1);
         assert!(configs[0].resume_external_session.is_none());
         assert!(
-            configs[0]
-                .cwd
-                .starts_with(source.canonicalize().unwrap().join(".trama/worktrees"))
+            configs[0].cwd.starts_with(
+                dunce::canonicalize(&source)
+                    .unwrap()
+                    .join(".trama/worktrees")
+            )
         );
     }
 }

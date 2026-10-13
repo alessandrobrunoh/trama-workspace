@@ -590,7 +590,7 @@ fn skill_discovery_covers_project_user_and_plugins_and_refuses_symlinks_out() {
     symlink(&outside, home.join(".claude/plugins/linked")).unwrap();
 
     let items = discover(&SkillRoots {
-        checkouts: vec![std::fs::canonicalize(&checkout).unwrap()],
+        checkouts: vec![dunce::canonicalize(&checkout).unwrap()],
         home: Some(home.clone()),
     });
     let land = find(&items, "land").unwrap();

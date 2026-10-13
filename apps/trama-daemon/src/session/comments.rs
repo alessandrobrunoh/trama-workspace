@@ -770,8 +770,8 @@ fn checkout_relative(rel: &Path) -> Result<()> {
 /// The file `rel` inside `root`, refusing paths (or symlinks) that leave it.
 fn checkout_file(root: &Path, rel: &Path) -> Result<PathBuf> {
     checkout_relative(rel)?;
-    let root = std::fs::canonicalize(root)?;
-    let file = std::fs::canonicalize(root.join(rel)).map_err(|error| {
+    let root = dunce::canonicalize(root)?;
+    let file = dunce::canonicalize(root.join(rel)).map_err(|error| {
         DaemonError::Invalid(format!(
             "{} is not in the thread's checkout: {error}",
             rel.display()

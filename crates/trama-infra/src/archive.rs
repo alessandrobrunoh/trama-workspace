@@ -169,7 +169,7 @@ impl CheckoutManager {
     /// exactly `<source>/.trama/worktrees/<thread>/<checkout>`. Never follows
     /// symbolic links.
     pub fn remove_repo_local(&self, source: &Path, checkout: &Path) -> Result<(), CheckoutError> {
-        let source = fs::canonicalize(source).map_err(|_| CheckoutError::Missing {
+        let source = dunce::canonicalize(source).map_err(|_| CheckoutError::Missing {
             path: source.to_path_buf(),
         })?;
         let (Some(thread), Some(id)) = (
@@ -187,7 +187,7 @@ impl CheckoutManager {
         if checkout != expected
             || metadata.file_type().is_symlink()
             || !metadata.is_dir()
-            || fs::canonicalize(checkout)? != expected
+            || dunce::canonicalize(checkout)? != expected
             || expected == source
         {
             return Err(CheckoutError::Containment(checkout.to_path_buf()));

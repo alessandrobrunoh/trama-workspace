@@ -1033,7 +1033,7 @@ fn same_canonical_path(stored: &Path, canonical: &Path) -> bool {
 }
 
 fn fs_canonicalize_exists(path: &Path) -> Option<PathBuf> {
-    std::fs::canonicalize(path).ok()
+    dunce::canonicalize(path).ok()
 }
 
 pub(crate) fn insert_message(conn: &rusqlite::Connection, message: &Message) -> Result<()> {

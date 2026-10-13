@@ -1419,7 +1419,7 @@ mod tests {
         (
             Fixture {
                 db_path,
-                source: source.canonicalize().unwrap(),
+                source: dunce::canonicalize(&source).unwrap(),
                 workspace: workspace.id,
                 dir,
             },

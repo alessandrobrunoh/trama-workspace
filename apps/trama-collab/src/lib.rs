@@ -286,7 +286,7 @@ impl AuthService {
             .ok_or_else(|| "backup path must be a plain, non-empty UTF-8 file path".to_owned())?;
         create_private_file(destination)
             .map_err(|e| format!("create backup file (it must not exist): {e}"))?;
-        let result = std::fs::canonicalize(destination)
+        let result = dunce::canonicalize(destination)
             .map_err(|e| format!("resolve backup path: {e}"))
             .and_then(|resolved| {
                 // SQLite is opened with NOFOLLOW, which also rejects symlinked
@@ -669,7 +669,7 @@ fn open_connection(path: &Path) -> Result<Connection, String> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let parent =
-        std::fs::canonicalize(parent).map_err(|e| format!("resolve database directory: {e}"))?;
+        dunce::canonicalize(parent).map_err(|e| format!("resolve database directory: {e}"))?;
     let filename = path
         .file_name()
         .ok_or_else(|| "database path must name a file".to_owned())?;
@@ -743,8 +743,7 @@ pub fn restore_database(database: &Path, backup: &Path) -> Result<(), String> {
     if !metadata.is_file() {
         return Err("backup path must be a regular file, not a symlink".into());
     }
-    let resolved =
-        std::fs::canonicalize(backup).map_err(|e| format!("resolve backup path: {e}"))?;
+    let resolved = dunce::canonicalize(backup).map_err(|e| format!("resolve backup path: {e}"))?;
     let source = Connection::open_with_flags(
         &resolved,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -788,7 +787,7 @@ pub fn restore_database(database: &Path, backup: &Path) -> Result<(), String> {
         error
     };
     create_private_file(database).map_err(|e| undo(format!("create database file: {e}")))?;
-    let target = std::fs::canonicalize(database)
+    let target = dunce::canonicalize(database)
         .ok()
         .and_then(|path| path.to_str().map(str::to_owned))
         .ok_or_else(|| undo("resolve database path".into()))?;

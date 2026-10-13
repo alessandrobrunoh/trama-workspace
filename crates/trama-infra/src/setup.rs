@@ -168,8 +168,8 @@ pub fn read_record(checkout: &Path) -> Option<SetupRecord> {
 /// returned unchanged. Never deletes or replaces anything in the checkout.
 pub fn run_checkout_setup(request: &SetupRequest<'_>) -> SetupRecord {
     let (source, checkout) = match (
-        fs::canonicalize(request.source),
-        fs::canonicalize(request.checkout),
+        dunce::canonicalize(request.source),
+        dunce::canonicalize(request.checkout),
     ) {
         (Ok(source), Ok(checkout)) => (source, checkout),
         _ => return SetupRecord::failed("checkout or source repository is missing".into()),
@@ -395,7 +395,7 @@ fn check_script(checkout: &Path, script: &Path) -> Result<(), String> {
     if !metadata.is_file() {
         return Err("must be a regular file".into());
     }
-    let canonical = fs::canonicalize(script).map_err(|error| error.to_string())?;
+    let canonical = dunce::canonicalize(script).map_err(|error| error.to_string())?;
     if !canonical.starts_with(checkout) {
         return Err("resolves outside the checkout".into());
     }
@@ -515,7 +515,7 @@ fn link_one(source: &Path, checkout: &Path, entry: &str) -> Result<(), String> {
     if !ignored.success() {
         return Err("is not ignored by git in the source repository".into());
     }
-    let resolved = fs::canonicalize(&target).map_err(|error| error.to_string())?;
+    let resolved = dunce::canonicalize(&target).map_err(|error| error.to_string())?;
     if !resolved.starts_with(source)
         || resolved == source
         || resolved.starts_with(source.join(".git"))
@@ -624,7 +624,7 @@ mod tests {
         }
         git(&source, &["add", "-f", "."]);
         git(&source, &["commit", "-q", "-m", "initial"]);
-        source.canonicalize().unwrap()
+        dunce::canonicalize(&source).unwrap()
     }
 
     fn checkout(root: &Path, source: &Path, thread: &str) -> PathBuf {

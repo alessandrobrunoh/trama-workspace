@@ -50,7 +50,12 @@ async fn fixture(script: &str) -> (SessionManager, WorkspaceId, PathBuf, tempfil
     let fake = FakeAdapter::new(scripted_events(), Duration::from_millis(1));
     let manager =
         SessionManager::with_checkout_root(db, Arc::new(fake), dir.path().join("managed"));
-    (manager, workspace.id, source.canonicalize().unwrap(), dir)
+    (
+        manager,
+        workspace.id,
+        dunce::canonicalize(&source).unwrap(),
+        dir,
+    )
 }
 
 #[tokio::test]

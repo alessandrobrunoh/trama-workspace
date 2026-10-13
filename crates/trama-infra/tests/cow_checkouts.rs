@@ -79,7 +79,7 @@ fn source_repo(root: &Path) -> PathBuf {
         &source,
         &["remote", "add", "origin", "git@example.invalid:org/app.git"],
     );
-    source.canonicalize().unwrap()
+    dunce::canonicalize(&source).unwrap()
 }
 
 fn ids(thread: &str) -> (ThreadId, RepositoryId, CheckoutId) {
@@ -349,7 +349,7 @@ fn a_linked_worktree_source_falls_back_to_git() {
     let main = source_repo(temp.path());
     let linked = temp.path().join("linked");
     git(&main, &["worktree", "add", "-q", linked.to_str().unwrap()]);
-    let linked = linked.canonicalize().unwrap();
+    let linked = dunce::canonicalize(&linked).unwrap();
     fs::write(linked.join("cache.local"), "ignored\n").unwrap();
     let manager = CheckoutManager::new(temp.path().join("data"));
     let checkout = provision(&manager, &linked, "t");
@@ -543,7 +543,7 @@ fn measure_real_repository() {
     let Some(source) = std::env::var_os("TRAMA_COW_MEASURE_SOURCE") else {
         return;
     };
-    let source = PathBuf::from(source).canonicalize().unwrap();
+    let source = dunce::canonicalize(PathBuf::from(source)).unwrap();
     let count: usize = std::env::var("TRAMA_COW_MEASURE_COUNT")
         .ok()
         .and_then(|value| value.parse().ok())

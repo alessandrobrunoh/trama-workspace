@@ -166,7 +166,7 @@ impl CheckoutManager {
     /// a dotfiles repo that contains Application Support). The comparison
     /// resolves only ancestors that already exist and runs before creating it.
     fn assert_not_nested(&self, source: &Path) -> Result<(), CheckoutError> {
-        let canonical_source = fs::canonicalize(source).map_err(|_| CheckoutError::Missing {
+        let canonical_source = dunce::canonicalize(source).map_err(|_| CheckoutError::Missing {
             path: source.to_path_buf(),
         })?;
         let managed_root = self.root.join("checkouts");
@@ -215,7 +215,7 @@ impl CheckoutManager {
         repository: &RepositoryId,
         checkout: &trama_domain::ids::CheckoutId,
     ) -> Result<ProvisionedCheckout, CheckoutError> {
-        let source = fs::canonicalize(source)?;
+        let source = dunce::canonicalize(source)?;
         if !source.is_dir() {
             return Err(CheckoutError::Invalid(source));
         }
@@ -228,12 +228,12 @@ impl CheckoutManager {
         let destination = self.path(thread, repository, checkout)?;
         let managed_root = self.root.join("checkouts");
         fs::create_dir_all(&managed_root)?;
-        let canonical_root = fs::canonicalize(&managed_root)?;
+        let canonical_root = dunce::canonicalize(&managed_root)?;
         let parent = destination
             .parent()
             .expect("managed destination has parent");
         fs::create_dir_all(parent)?;
-        let canonical_parent = fs::canonicalize(parent)?;
+        let canonical_parent = dunce::canonicalize(parent)?;
         let relative_parent = parent
             .strip_prefix(&managed_root)
             .map_err(|_| CheckoutError::Containment(destination.clone()))?;
@@ -324,9 +324,9 @@ impl CheckoutManager {
         checkout: &trama_domain::ids::CheckoutId,
         at: Option<&str>,
     ) -> Result<ProvisionedCopy, CheckoutError> {
-        let parent = fs::canonicalize(parent_checkout)
+        let parent = dunce::canonicalize(parent_checkout)
             .map_err(|_| CheckoutError::Invalid(parent_checkout.to_path_buf()))?;
-        let canonical_source = fs::canonicalize(source).map_err(|_| CheckoutError::Missing {
+        let canonical_source = dunce::canonicalize(source).map_err(|_| CheckoutError::Missing {
             path: source.to_path_buf(),
         })?;
         // The parent must be a managed checkout of this source, never the
@@ -334,7 +334,7 @@ impl CheckoutManager {
         let parent_local = git_text(&parent, ["remote", "get-url", "local"])
             .map_err(|_| CheckoutError::Invalid(parent.clone()))?;
         if parent == canonical_source
-            || fs::canonicalize(&parent_local).ok().as_ref() != Some(&canonical_source)
+            || dunce::canonicalize(&parent_local).ok().as_ref() != Some(&canonical_source)
         {
             return Err(CheckoutError::Invalid(parent));
         }
@@ -495,8 +495,8 @@ impl CheckoutManager {
     ) -> Result<(), CheckoutError> {
         self.assert_not_nested(source)?;
         let managed_root_path = self.root.join("checkouts");
-        let managed_root = fs::canonicalize(&managed_root_path)?;
-        let canonical_checkout = fs::canonicalize(checkout)
+        let managed_root = dunce::canonicalize(&managed_root_path)?;
+        let canonical_checkout = dunce::canonicalize(checkout)
             .map_err(|_| CheckoutError::Invalid(checkout.to_path_buf()))?;
         let relative_checkout = checkout
             .strip_prefix(&managed_root_path)
@@ -521,10 +521,10 @@ impl CheckoutManager {
             return Err(CheckoutError::Invalid(checkout.to_path_buf()));
         }
         let remote = text(git(&canonical_checkout, ["remote", "get-url", "local"])?);
-        let canonical_remote =
-            fs::canonicalize(remote).map_err(|_| CheckoutError::Invalid(checkout.to_path_buf()))?;
-        let canonical_source =
-            fs::canonicalize(source).map_err(|_| CheckoutError::Invalid(checkout.to_path_buf()))?;
+        let canonical_remote = dunce::canonicalize(remote)
+            .map_err(|_| CheckoutError::Invalid(checkout.to_path_buf()))?;
+        let canonical_source = dunce::canonicalize(source)
+            .map_err(|_| CheckoutError::Invalid(checkout.to_path_buf()))?;
         if canonical_remote != canonical_source {
             return Err(CheckoutError::Invalid(checkout.to_path_buf()));
         }
@@ -540,7 +540,7 @@ impl CheckoutManager {
         if !safe_id(&thread.0) || !safe_id(&checkout.0) {
             return Err(CheckoutError::Containment(source.join(".trama")));
         }
-        let source = fs::canonicalize(source).map_err(|_| CheckoutError::Missing {
+        let source = dunce::canonicalize(source).map_err(|_| CheckoutError::Missing {
             path: source.to_path_buf(),
         })?;
         Ok(source
@@ -563,7 +563,7 @@ impl CheckoutManager {
         if !safe_id(&repository.0) {
             return Err(CheckoutError::Containment(source.join(".trama")));
         }
-        let source = fs::canonicalize(source).map_err(|_| CheckoutError::Missing {
+        let source = dunce::canonicalize(source).map_err(|_| CheckoutError::Missing {
             path: source.to_path_buf(),
         })?;
         if !source.is_dir() {
@@ -583,7 +583,7 @@ impl CheckoutManager {
             if let Ok(metadata) = fs::symlink_metadata(path) {
                 if metadata.file_type().is_symlink()
                     || !metadata.is_dir()
-                    || fs::canonicalize(path)? != *path
+                    || dunce::canonicalize(path)? != *path
                 {
                     return Err(CheckoutError::Containment(path.to_path_buf()));
                 }
@@ -653,8 +653,8 @@ impl CheckoutManager {
         }
         fs::create_dir_all(&worktrees)?;
         fs::create_dir_all(worktrees.join(&thread.0))?;
-        if fs::canonicalize(&worktrees)? != worktrees
-            || fs::canonicalize(worktrees.join(&thread.0))? != worktrees.join(&thread.0)
+        if dunce::canonicalize(&worktrees)? != worktrees
+            || dunce::canonicalize(worktrees.join(&thread.0))? != worktrees.join(&thread.0)
         {
             return Err(CheckoutError::Containment(destination));
         }
@@ -721,7 +721,7 @@ impl CheckoutManager {
         checkout: &Path,
         base_revision: &str,
     ) -> Result<(), CheckoutError> {
-        let canonical_source = fs::canonicalize(source).map_err(|_| CheckoutError::Missing {
+        let canonical_source = dunce::canonicalize(source).map_err(|_| CheckoutError::Missing {
             path: source.to_path_buf(),
         })?;
         let thread_id = checkout
@@ -737,7 +737,7 @@ impl CheckoutManager {
             &trama_domain::ids::CheckoutId::from(checkout_id.to_string_lossy().as_ref()),
         )?;
         if checkout != expected
-            || fs::canonicalize(checkout)
+            || dunce::canonicalize(checkout)
                 .map_err(|_| CheckoutError::Invalid(checkout.to_path_buf()))?
                 != expected
         {
@@ -770,7 +770,8 @@ impl CheckoutManager {
             return Err(CheckoutError::Invalid(checkout.to_path_buf()));
         }
         let remote = text(git(checkout, ["remote", "get-url", "local"])?);
-        if fs::canonicalize(remote).map_err(|_| CheckoutError::Invalid(checkout.to_path_buf()))?
+        if dunce::canonicalize(remote)
+            .map_err(|_| CheckoutError::Invalid(checkout.to_path_buf()))?
             != source
         {
             return Err(CheckoutError::Invalid(checkout.to_path_buf()));
@@ -787,7 +788,7 @@ impl CheckoutManager {
                 path: path.to_path_buf(),
             });
         }
-        let canonical = fs::canonicalize(path).map_err(|_| CheckoutError::Missing {
+        let canonical = dunce::canonicalize(path).map_err(|_| CheckoutError::Missing {
             path: path.to_path_buf(),
         })?;
         if !canonical.is_dir() {
@@ -808,7 +809,7 @@ impl CheckoutManager {
             Err(_) => return Err(CheckoutError::NotWorktree { path: canonical }),
         };
         let toplevel_path =
-            fs::canonicalize(Path::new(&toplevel)).unwrap_or_else(|_| PathBuf::from(toplevel));
+            dunce::canonicalize(Path::new(&toplevel)).unwrap_or_else(|_| PathBuf::from(toplevel));
         if toplevel_path != canonical {
             return Err(CheckoutError::NotWorktree { path: canonical });
         }
@@ -840,7 +841,7 @@ impl CheckoutManager {
                 path: source.to_path_buf(),
             });
         }
-        let source = fs::canonicalize(source).map_err(|_| CheckoutError::Missing {
+        let source = dunce::canonicalize(source).map_err(|_| CheckoutError::Missing {
             path: source.to_path_buf(),
         })?;
         let status = git(&source, ["status", "--porcelain", "--untracked-files=all"])?;
@@ -1197,7 +1198,7 @@ fn ensure_local_exclude(source: &Path) -> Result<(), CheckoutError> {
 /// path that has not been created yet still compares truthfully (same resolved
 /// prefixes) against fully existing paths such as a source repository.
 fn canonicalize_deepest_existing(path: &Path) -> std::io::Result<PathBuf> {
-    if let Ok(canonical) = fs::canonicalize(path) {
+    if let Ok(canonical) = dunce::canonicalize(path) {
         return Ok(canonical);
     }
     let mut missing = Vec::new();
@@ -1220,7 +1221,7 @@ fn canonicalize_deepest_existing(path: &Path) -> std::io::Result<PathBuf> {
             )
         })?;
     }
-    let mut canonical = fs::canonicalize(&existing)?;
+    let mut canonical = dunce::canonicalize(&existing)?;
     while let Some(segment) = missing.pop() {
         canonical.push(segment);
     }
@@ -1289,7 +1290,7 @@ fn optional_origin(cwd: &Path) -> Option<String> {
     }
     let path = Path::new(&url);
     if path.is_absolute() {
-        if let Ok(canonical) = fs::canonicalize(path) {
+        if let Ok(canonical) = dunce::canonicalize(path) {
             return Some(canonical.to_string_lossy().into_owned());
         }
     }
@@ -1366,7 +1367,7 @@ mod tests {
         let marker = trama.join(".trama-workspace.json");
         let marker_text = format!(
             "trama-repo-local-v1\n{}\n",
-            source.canonicalize().unwrap().display()
+            dunce::canonicalize(&source).unwrap().display()
         );
         fs::write(&marker, &marker_text).unwrap();
         let outside = temp.path().join("outside");
@@ -1406,7 +1407,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             checkout.path,
-            fs::canonicalize(&source)
+            dunce::canonicalize(&source)
                 .unwrap()
                 .join(".trama/worktrees/thread-a/checkout-a")
         );
@@ -1618,7 +1619,7 @@ mod tests {
         assert!(remote.status.success());
         assert_eq!(
             String::from_utf8_lossy(&remote.stdout).trim(),
-            fs::canonicalize(&src1).unwrap().to_string_lossy()
+            dunce::canonicalize(&src1).unwrap().to_string_lossy()
         );
         assert_ne!(a.base_revision, String::new());
         assert!(b.path.exists());
@@ -1903,7 +1904,7 @@ mod tests {
             &["remote", "add", "origin", "git@example.com:org/app.git"],
         );
         let inspected = CheckoutManager::inspect_working_root(&source).unwrap();
-        assert_eq!(inspected.path, fs::canonicalize(&source).unwrap());
+        assert_eq!(inspected.path, dunce::canonicalize(&source).unwrap());
         assert_eq!(inspected.default_branch.as_deref(), Some("main"));
         assert!(!inspected.head.is_empty());
         assert_eq!(

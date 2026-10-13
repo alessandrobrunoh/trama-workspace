@@ -692,7 +692,7 @@ pub fn prepare_repository(
             "That directory is not a Git repository. Choose the repository root.".to_string(),
         );
     }
-    let path = std::fs::canonicalize(&path).unwrap_or(path);
+    let path = dunce::canonicalize(&path).unwrap_or(path);
     if existing
         .iter()
         .any(|repo| same_directory(&repo.path, &path))
@@ -756,10 +756,7 @@ fn is_remote_locator(raw: &str) -> bool {
 }
 
 fn same_directory(stored: &Path, candidate: &Path) -> bool {
-    match (
-        std::fs::canonicalize(stored),
-        std::fs::canonicalize(candidate),
-    ) {
+    match (dunce::canonicalize(stored), dunce::canonicalize(candidate)) {
         (Ok(left), Ok(right)) => left == right,
         _ => stored == candidate,
     }
@@ -965,7 +962,7 @@ mod tests {
         };
         assert_eq!(workspace_id, wid("w1"));
         assert_eq!(alias, "api");
-        assert_eq!(path, std::fs::canonicalize(&root).unwrap());
+        assert_eq!(path, dunce::canonicalize(&root).unwrap());
 
         onboarding.apply_repository_added(wid("w1"), repo("r1", "api", path.clone()));
         assert_eq!(onboarding.repositories.len(), 1);
@@ -993,7 +990,7 @@ mod tests {
         let mut onboarding = online();
         onboarding.apply_workspace_created(workspace("w1", "Demo", 0));
         let root = git_root("dup");
-        let canonical = std::fs::canonicalize(&root).unwrap();
+        let canonical = dunce::canonicalize(&root).unwrap();
         onboarding
             .submit_repository(root.to_str().unwrap(), "api")
             .unwrap();
@@ -1166,7 +1163,7 @@ mod tests {
         let root = git_root("count");
         onboarding.apply_repositories(
             wid("w1"),
-            vec![repo("r1", "api", std::fs::canonicalize(&root).unwrap())],
+            vec![repo("r1", "api", dunce::canonicalize(&root).unwrap())],
         );
         assert_eq!(
             onboarding.displayed_repo_count(&onboarding.workspaces[0]),
@@ -1174,7 +1171,7 @@ mod tests {
         );
         assert_eq!(onboarding.workspaces[0].repo_count, 1);
 
-        let mut disabled = repo("r2", "off", std::fs::canonicalize(&root).unwrap());
+        let mut disabled = repo("r2", "off", dunce::canonicalize(&root).unwrap());
         disabled.default_enabled = false;
         onboarding.repositories = vec![disabled];
         onboarding.repositories_for = Some(wid("w1"));

@@ -392,7 +392,7 @@ impl SessionManager {
                     attachment.repository_id
                 ))
             })?;
-            let source = std::fs::canonicalize(&source).unwrap_or(source);
+            let source = dunce::canonicalize(&source).unwrap_or(source);
             let removed = match attachment.checkout_id.as_ref() {
                 Some(id) => self.db.removed_checkout(id).await?.is_some(),
                 None => false,
@@ -2544,7 +2544,7 @@ fn usage_report_present(report: &UsageReport) -> bool {
 }
 
 fn same_directory(left: &std::path::Path, right: &std::path::Path) -> bool {
-    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+    match (dunce::canonicalize(left), dunce::canonicalize(right)) {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
     }
@@ -2725,7 +2725,7 @@ mod tests {
         assert_eq!(configs[1].extra_dirs.len(), 1);
         let sources: Vec<_> = sources
             .iter()
-            .map(|source| source.canonicalize().unwrap())
+            .map(|source| dunce::canonicalize(&source).unwrap())
             .collect();
         let first_paths = [&configs[0].cwd, &configs[0].extra_dirs[0]];
         let second_paths = [&configs[1].cwd, &configs[1].extra_dirs[0]];
@@ -3459,14 +3459,19 @@ mod tests {
         assert_eq!(configs.len(), 1);
         assert!(configs[0].resume_external_session.is_none());
         assert!(sources.iter().any(|source| {
-            configs[0]
-                .cwd
-                .starts_with(source.canonicalize().unwrap().join(".trama/worktrees"))
+            configs[0].cwd.starts_with(
+                dunce::canonicalize(&source)
+                    .unwrap()
+                    .join(".trama/worktrees"),
+            )
         }));
         assert_eq!(configs[0].extra_dirs.len(), 1);
         assert!(sources.iter().any(|source| {
-            configs[0].extra_dirs[0]
-                .starts_with(source.canonicalize().unwrap().join(".trama/worktrees"))
+            configs[0].extra_dirs[0].starts_with(
+                dunce::canonicalize(&source)
+                    .unwrap()
+                    .join(".trama/worktrees"),
+            )
         }));
         assert!(
             sources
@@ -3653,9 +3658,11 @@ mod tests {
         assert_eq!(configs.len(), 1);
         assert!(configs[0].resume_external_session.is_none());
         assert!(
-            configs[0]
-                .cwd
-                .starts_with(sources[0].canonicalize().unwrap().join(".trama/worktrees"))
+            configs[0].cwd.starts_with(
+                dunce::canonicalize(&sources[0])
+                    .unwrap()
+                    .join(".trama/worktrees")
+            )
         );
         assert_ne!(configs[0].cwd, sources[0]);
         assert_eq!(

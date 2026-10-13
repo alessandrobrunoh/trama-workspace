@@ -300,8 +300,8 @@ mod tests {
         };
         let paths: Vec<_> = repos.iter().filter_map(|r| r.local_path.clone()).collect();
         // Seeding stores the canonical path, like `add_repository`.
-        let canonical_backend = std::fs::canonicalize(&backend).unwrap();
-        let canonical_frontend = std::fs::canonicalize(&frontend).unwrap();
+        let canonical_backend = dunce::canonicalize(&backend).unwrap();
+        let canonical_frontend = dunce::canonicalize(&frontend).unwrap();
         assert!(paths.contains(&canonical_backend));
         assert!(paths.contains(&canonical_frontend));
         // Inspection-derived metadata is stored, like `add_repository`.

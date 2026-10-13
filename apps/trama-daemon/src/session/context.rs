@@ -335,7 +335,7 @@ fn confine(checkout: &Path, rel: &str) -> Result<PathBuf> {
             "mentioned path {rel:?} is not inside the thread's checkouts"
         )));
     }
-    let real = std::fs::canonicalize(checkout.join(rel_path))
+    let real = dunce::canonicalize(checkout.join(rel_path))
         .map_err(|_| DaemonError::Invalid(format!("mentioned path {rel:?} does not exist")))?;
     if !real.starts_with(checkout) {
         return Err(DaemonError::Invalid(format!(
@@ -398,7 +398,7 @@ impl SessionManager {
             .into_iter()
             .filter(|row| row.status == CheckoutStatus::Ready)
             .filter_map(|row| {
-                let path = std::fs::canonicalize(row.checkout_path?).ok()?;
+                let path = dunce::canonicalize(row.checkout_path?).ok()?;
                 Some(ReadyCheckout {
                     repository_id: row.repository_id,
                     title: row.title,
