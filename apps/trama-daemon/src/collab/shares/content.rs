@@ -5,8 +5,8 @@
 //! Git bundle without objects reachable from remote-tracking refs, sealed
 //! as an encrypted `content` object and listed in a signed
 //! `ContentManifestV1`. A `read_code` joiner downloads and verifies every
-//! object and keeps the bundles under the app directory. Restoring a
-//! bundle into a local checkout is not wired yet (release-blocker).
+//! object, keeps the bundles under the app directory and restores them
+//! (`restore.rs`).
 
 use std::path::{Path, PathBuf};
 
@@ -70,9 +70,14 @@ struct Exported {
     object: SealedObject,
 }
 
-fn export(worktree: PathBuf, share_id: String, state: String) -> Result<Exported> {
+fn export(worktree: PathBuf, share_id: String, state: String, thin: bool) -> Result<Exported> {
     let captured = capture(&worktree, &share_id, &state).map_err(collab)?;
-    let tips = remote_tips(&worktree);
+    // Without an origin hint the joiner restores from the bundle alone.
+    let tips = if thin {
+        remote_tips(&worktree)
+    } else {
+        Vec::new()
+    };
     let prereqs: Vec<&str> = tips.iter().map(String::as_str).collect();
     let path = std::env::temp_dir().join(format!("trama-{}.bundle", MessageId::generate()));
     let result = export_bundle(&worktree, &captured, &prereqs, &path)
@@ -119,8 +124,9 @@ impl CollabService {
                 continue;
             };
             let (path, id, state) = (co.path.clone(), share_id.clone(), format!("v{version}"));
+            let thin = remote_hint(&co.repository).is_some();
             let Exported { captured, object } =
-                tokio::task::spawn_blocking(move || export(path, id, state))
+                tokio::task::spawn_blocking(move || export(path, id, state, thin))
                     .await
                     .map_err(collab)??;
             upload(client, &share_id, ObjectClass::Content, &object).await?;
@@ -195,19 +201,19 @@ impl CollabService {
     }
 
     /// `read_code` joiner: verifies the content manifest of `snapshot` and
-    /// stores every bundle. Returns the stored paths.
+    /// stores every bundle (in `object_index` order). `None` without content.
     pub(crate) async fn fetch_share_content(
         &self,
         client: &ShareClient,
         share_id: &str,
         snapshot: &VerifiedSnapshot,
-    ) -> Result<Vec<PathBuf>> {
+    ) -> Result<Option<(ContentManifestV1, Vec<PathBuf>)>> {
         let blob = match client
             .manifest(share_id, snapshot.version, ManifestPart::Content)
             .await
         {
             Ok(blob) => blob,
-            Err(DaemonError::NotFound(_)) => return Ok(Vec::new()),
+            Err(DaemonError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
         let (cipher, id, epoch) = (
@@ -258,6 +264,6 @@ impl CollabService {
             std::fs::write(&path, plain).map_err(collab)?;
             stored.push(path);
         }
-        Ok(stored)
+        Ok(Some((manifest, stored)))
     }
 }

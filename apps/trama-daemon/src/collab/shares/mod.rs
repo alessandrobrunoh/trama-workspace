@@ -12,6 +12,7 @@ mod objects;
 mod outbound;
 mod outgoing;
 mod preflight;
+mod restore;
 mod retry;
 mod scan;
 mod slices;

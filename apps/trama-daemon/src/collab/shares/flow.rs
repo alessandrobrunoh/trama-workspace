@@ -204,7 +204,8 @@ impl CollabService {
         .await?;
         // Marks first: the snapshot's message slices end at them.
         self.init_history_marks(&share_id).await?;
-        self.publish_history_snapshot(&client, &share_id).await?;
+        self.publish_history_snapshot(&client, &share_id, false)
+            .await?;
         self.db()
             .set_share_status(&share, ShareStatus::Ready)
             .await?;
@@ -368,13 +369,7 @@ impl CollabService {
         blocking(move || joiner.finish_join(&id, &bytes)).await?;
         let info = client.info(share_id).await?;
         let snapshot = self.read_verified_snapshot(&client, share_id).await?;
-        if info.read_code {
-            // Bundles are kept for restore (not wired yet, release-blocker).
-            if let Err(e) = self.fetch_share_content(&client, share_id, &snapshot).await {
-                crate::log::warn(format!("share {share_id}: content not fetched: {e}"));
-            }
-        }
-        let manifest = snapshot.manifest;
+        let manifest = &snapshot.manifest;
         let mut rows = Vec::new();
         let mut local: Vec<(ThreadGid, ThreadId)> = Vec::new();
         for t in &manifest.threads {
@@ -429,6 +424,18 @@ impl CollabService {
             })
             .await?;
         self.db().upsert_share_threads(rows).await?;
+        if info.read_code {
+            // History stays usable when code cannot be restored.
+            if let Err(e) = self
+                .restore_share_content(&client, share_id, &snapshot)
+                .await
+            {
+                crate::log::warn(format!("share {share_id}: content not restored: {e}"));
+                self.db()
+                    .set_collab_setting(&format!("share_content_error:{share_id}"), &e.to_string())
+                    .await?;
+            }
+        }
         let role = serde_json::to_value(info.role)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
@@ -453,6 +460,7 @@ impl CollabService {
                 "earlier membership changes of this share are still being delivered".into(),
             ));
         }
-        self.publish_history_snapshot(&client, share_id).await
+        self.publish_history_snapshot(&client, share_id, false)
+            .await
     }
 }
