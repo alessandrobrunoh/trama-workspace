@@ -1,5 +1,7 @@
 # Codebase restructure (before M3)
 
+**Status: done** (all steps completed on `feat/new-structure`).
+
 Goal: no behavior change. Replace flat `src/` directories and multi-thousand-line
 files with cohesive modules grouped by area. Public crate APIs stay stable
 (re-exports keep old paths working while call sites migrate).
