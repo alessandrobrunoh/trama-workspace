@@ -7,6 +7,10 @@ impl Workspace {
         if !self.connected {
             return;
         }
+        if self.collab.read(cx).vnext_supported() {
+            self.open_share_wizard(window, cx);
+            return;
+        }
         let (thread, title) = {
             let sidebar = self.sidebar.read(cx);
             let onboarding = &sidebar.onboarding;
@@ -75,6 +79,10 @@ impl Workspace {
 
     pub(super) fn open_join(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.connected {
+            return;
+        }
+        if self.collab.read(cx).vnext_supported() {
+            self.open_join_wizard(window, cx);
             return;
         }
         window.close_all_dialogs(cx);

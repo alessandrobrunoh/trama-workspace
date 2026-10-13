@@ -1,5 +1,4 @@
-//! GPUI view of the Share wizard. Messages are emitted as
-//! [`WizardRequest`] events for the workspace to send to the daemon.
+//! GPUI view of the Share wizard; state lives in the collab store.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -15,21 +14,19 @@ use gpui_kit::*;
 use trama_domain::share::Capability;
 use trama_protocol::{ClientMessage, ShareInvite, ShareRole, ShareScope, ShareStatus};
 
-use super::WizardRequest;
 use super::blockers::report_view;
+use super::route::WizardOp;
 use super::share_flow::{ShareFlow, ShareStep, invite_capabilities};
 use super::widgets::{choice, note, section};
 use crate::app::theme::{self, Palette};
+use crate::collab::CollabStore;
 
+/// Renders `store.vnext.share`; actions go through the collab store.
 pub struct ShareWizard {
-    pub flow: Option<ShareFlow>,
-    /// Signed-in username, to refuse inviting oneself.
-    pub me: Option<String>,
+    store: Entity<CollabStore>,
     invite: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
-
-impl EventEmitter<WizardRequest> for ShareWizard {}
 
 pub fn scope_text(scope: ShareScope) -> (&'static str, &'static str) {
     match scope {
@@ -69,44 +66,42 @@ fn status_text(status: ShareStatus) -> &'static str {
 }
 
 impl ShareWizard {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(store: Entity<CollabStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let invite =
             cx.new(|cx| InputState::new(window, cx).placeholder("Invite by username, e.g. bob"));
-        let subscriptions =
-            vec![
-                cx.subscribe_in(&invite, window, |this, input, event, window, cx| {
-                    if let InputEvent::PressEnter { shift: false, .. } = event {
-                        let raw = input.read(cx).value().to_string();
-                        let me = this.me.clone();
-                        let mut added = false;
-                        this.act(cx, |f| {
-                            match f.add_invites(&raw, me.as_deref()) {
-                                Ok(()) => {
-                                    f.error = None;
-                                    added = true;
-                                }
-                                Err(e) => f.error = Some(e),
+        let subscriptions = vec![
+            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&invite, window, |this, input, event, window, cx| {
+                if let InputEvent::PressEnter { shift: false, .. } = event {
+                    let raw = input.read(cx).value().to_string();
+                    let me = this.store.read(cx).username().map(str::to_owned);
+                    let mut added = false;
+                    this.act(cx, |f| {
+                        match f.add_invites(&raw, me.as_deref()) {
+                            Ok(()) => {
+                                f.error = None;
+                                added = true;
                             }
-                            None
-                        });
-                        if added {
-                            input.update(cx, |i, cx| i.set_value("", window, cx));
+                            Err(e) => f.error = Some(e),
                         }
+                        None
+                    });
+                    if added {
+                        input.update(cx, |i, cx| i.set_value("", window, cx));
                     }
-                }),
-            ];
+                }
+            }),
+        ];
         Self {
-            flow: None,
-            me: None,
+            store,
             invite,
             _subscriptions: subscriptions,
         }
     }
 
-    pub fn open(&mut self, flow: ShareFlow, me: Option<String>, cx: &mut Context<Self>) {
-        self.flow = Some(flow);
-        self.me = me;
-        cx.notify();
+    /// Clears the invite field for a freshly opened wizard.
+    pub fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.invite.update(cx, |i, cx| i.set_value("", window, cx));
     }
 
     /// Runs an action on the flow and emits the message it returns.
@@ -115,13 +110,10 @@ impl ShareWizard {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut ShareFlow) -> Option<ClientMessage>,
     ) {
-        let Some(flow) = self.flow.as_mut() else {
-            return;
-        };
-        if let Some(message) = f(flow) {
-            cx.emit(WizardRequest(message));
-        }
-        cx.notify();
+        self.store.update(cx, |store, cx| {
+            let message = store.vnext.share.as_mut().and_then(f);
+            store.dispatch_wizard(WizardOp::Share, message, cx);
+        });
     }
 
     fn scope_step(&self, p: &Palette, flow: &ShareFlow, cx: &mut Context<Self>) -> Div {
@@ -308,7 +300,7 @@ impl ShareWizard {
 impl Render for ShareWizard {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = theme::palette(cx);
-        let Some(flow) = self.flow.clone() else {
+        let Some(flow) = self.store.read(cx).vnext.share.clone() else {
             return div().into_any_element();
         };
         let body: AnyElement = match &flow.step {

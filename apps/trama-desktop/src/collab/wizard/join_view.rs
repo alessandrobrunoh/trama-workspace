@@ -13,27 +13,33 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use trama_protocol::ClientMessage;
 
-use super::WizardRequest;
 use super::join_flow::{JOIN_STAGES, JoinFlow, JoinStage, JoinStep, StageMark, stage_label};
+use super::route::WizardOp;
 use super::widgets::{note, section};
 use crate::app::theme::{self, Palette};
+use crate::collab::CollabStore;
 
+/// Renders `store.vnext.join`; actions go through the collab store.
 pub struct JoinWizard {
-    pub flow: Option<JoinFlow>,
+    store: Entity<CollabStore>,
     input: Entity<InputState>,
+    _subscriptions: Vec<Subscription>,
 }
 
-impl EventEmitter<WizardRequest> for JoinWizard {}
-
 impl JoinWizard {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(store: Entity<CollabStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Share ID from the owner"));
-        Self { flow: None, input }
+        let subscriptions = vec![cx.observe(&store, |_, _, cx| cx.notify())];
+        Self {
+            store,
+            input,
+            _subscriptions: subscriptions,
+        }
     }
 
-    pub fn open(&mut self, flow: JoinFlow, cx: &mut Context<Self>) {
-        self.flow = Some(flow);
-        cx.notify();
+    pub fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |i, cx| i.set_value("", window, cx));
+        self.input.read(cx).focus_handle(cx).focus(window, cx);
     }
 
     pub fn act(
@@ -41,13 +47,10 @@ impl JoinWizard {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut JoinFlow) -> Option<ClientMessage>,
     ) {
-        let Some(flow) = self.flow.as_mut() else {
-            return;
-        };
-        if let Some(message) = f(flow) {
-            cx.emit(WizardRequest(message));
-        }
-        cx.notify();
+        self.store.update(cx, |store, cx| {
+            let message = store.vnext.join.as_mut().and_then(f);
+            store.dispatch_wizard(WizardOp::Join, message, cx);
+        });
     }
 
     fn start(&mut self, cx: &mut Context<Self>) {
@@ -80,7 +83,7 @@ impl JoinWizard {
 impl Render for JoinWizard {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = theme::palette(cx);
-        let Some(flow) = self.flow.clone() else {
+        let Some(flow) = self.store.read(cx).vnext.join.clone() else {
             return div().into_any_element();
         };
         let entering = matches!(flow.step, JoinStep::Enter);

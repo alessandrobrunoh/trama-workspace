@@ -4,10 +4,7 @@
 //! Each wizard is a pure state machine ([`share_flow`], [`join_flow`]) whose
 //! actions return the [`trama_protocol::ClientMessage`] to send, so it is
 //! tested without a window; the GPUI views only render and forward clicks,
-//! emitting [`WizardRequest`] for the owner to dispatch.
-
-// Views are not yet mounted in the workspace (see docs/plan/README.md).
-#![allow(dead_code)]
+//! sending through the collab store (`collab::vnext`).
 
 pub(crate) mod blockers;
 pub(crate) mod join_flow;
@@ -19,7 +16,3 @@ mod widgets;
 
 #[cfg(test)]
 mod tests;
-
-/// A message a wizard wants sent to the daemon.
-#[derive(Debug, Clone)]
-pub struct WizardRequest(pub trama_protocol::ClientMessage);

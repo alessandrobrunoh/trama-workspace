@@ -3,6 +3,7 @@ mod daemon;
 mod panes;
 mod render;
 mod sharing;
+mod wizards;
 #[allow(unused_imports)]
 pub(crate) use self::chrome::*;
 #[allow(unused_imports)]
@@ -41,6 +42,7 @@ use crate::app::theme::{self, Palette};
 use crate::collab::CollabStore;
 use crate::collab::account::{AccountView, JoinEvent, JoinView};
 use crate::collab::share_dialog::{ShareDialog, ShareDialogEvent};
+use crate::collab::wizard::{join_view::JoinWizard, share_view::ShareWizard};
 use crate::conversation::chat::{ChatEvent, ChatPanel};
 use crate::conversation::subthreads::{
     PullSummary, SubthreadBar, land_label, subthread_parent, title_from_prompt,
@@ -94,6 +96,9 @@ pub struct Workspace {
     subthread_bar: Entity<SubthreadBar>,
     collab: Entity<CollabStore>,
     share_dialog: Entity<ShareDialog>,
+    /// vNext wizards, used when the server supports them.
+    share_wizard: Entity<ShareWizard>,
+    join_wizard: Entity<JoinWizard>,
     account: Entity<AccountView>,
     join: Entity<JoinView>,
     palette: Entity<CommandState>,
@@ -155,6 +160,10 @@ impl Workspace {
         chat.update(cx, |chat, _| chat.set_collab(collab.clone()));
         let share_store = collab.clone();
         let share_dialog = cx.new(|cx| ShareDialog::new(share_store, window, cx));
+        let wizard_store = collab.clone();
+        let share_wizard = cx.new(|cx| ShareWizard::new(wizard_store, window, cx));
+        let wizard_store = collab.clone();
+        let join_wizard = cx.new(|cx| JoinWizard::new(wizard_store, window, cx));
         let account_store = collab.clone();
         let account = cx.new(|cx| AccountView::new(account_store, window, cx));
         let join_store = collab.clone();
@@ -392,6 +401,8 @@ impl Workspace {
             subthread_bar,
             collab,
             share_dialog,
+            share_wizard,
+            join_wizard,
             account,
             join,
             palette,

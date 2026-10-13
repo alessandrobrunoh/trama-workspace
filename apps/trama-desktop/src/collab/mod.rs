@@ -15,6 +15,7 @@
 pub(crate) mod account;
 pub(crate) mod presence;
 pub(crate) mod share_dialog;
+pub(crate) mod vnext;
 pub(crate) mod wizard;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -471,6 +472,7 @@ pub struct CollabStore {
     /// Shown in the join dialog.
     pub join_error: Option<String>,
     pub share: ShareState,
+    pub vnext: vnext::VNextState,
     selected: Option<ThreadId>,
     window_active: bool,
     presence_sent: Option<(ThreadId, CollabPresenceState)>,
@@ -495,6 +497,7 @@ impl CollabStore {
             account_error: None,
             join_error: None,
             share: ShareState::default(),
+            vnext: vnext::VNextState::default(),
             selected: None,
             window_active: true,
             presence_sent: None,
@@ -787,6 +790,9 @@ impl CollabStore {
     /// Apply a daemon message. Returns `true` when it is fully handled here;
     /// transcript messages and errors of other requests pass through.
     pub fn apply(&mut self, message: &DaemonMessage, cx: &mut Context<Self>) -> bool {
+        if self.apply_vnext(message, cx) {
+            return true;
+        }
         let handled = match message {
             DaemonMessage::CollabStatus(status) => {
                 let was_signed_in = self.signed_in();
