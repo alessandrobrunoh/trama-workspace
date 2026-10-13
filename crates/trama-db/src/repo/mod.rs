@@ -10,4 +10,5 @@ pub(crate) mod comments;
 pub(crate) mod composer;
 pub(crate) mod content;
 pub(crate) mod revision;
+pub(crate) mod share;
 pub(crate) mod subthreads;
