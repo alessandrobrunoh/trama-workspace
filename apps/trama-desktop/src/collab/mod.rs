@@ -12,6 +12,10 @@
 //! the machine of the person who pressed Send, with that person's own
 //! `claude` login. Other participants only see its output.
 
+pub(crate) mod account;
+pub(crate) mod presence;
+pub(crate) mod share_dialog;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 

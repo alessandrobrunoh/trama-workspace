@@ -1,3 +1,5 @@
+pub(crate) mod model_picker;
+pub(crate) mod popup;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     Disableable as _, Icon, Sizable as _,

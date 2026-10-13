@@ -1,45 +1,26 @@
-mod activity;
-mod agent;
-mod changes;
-mod chat;
+mod app;
 mod collab;
-mod collab_account;
-mod comments;
 mod composer;
-mod composer_popup;
-mod copies;
-mod demo;
-mod devhooks;
-mod dialog;
-mod diff;
-mod disk_usage;
-mod doc_text;
-mod document;
-mod editor;
-mod forks;
-mod keymap;
-mod mentions;
-mod model_picker;
-mod net;
-mod onboarding;
-mod presence;
-mod projects;
-mod share_dialog;
-mod side_pane;
-mod sidebar;
-mod slash;
-mod snapshot;
-mod startup;
-mod subagents;
-mod subthreads;
-mod terminal_view;
-mod theme;
-mod thread_tree;
-mod tools;
-mod trigger;
-mod turns;
-mod vt;
-mod workspace;
+mod conversation;
+mod review;
+mod shell;
+mod system;
+mod terminal;
+
+// Transitional flat paths (`crate::chat`, ...) while call sites migrate
+// to the area modules (docs/plan/restructure.md).
+#[allow(unused_imports)]
+use {
+    app::demo, app::devhooks, app::dialog, app::keymap, app::startup, app::theme,
+    collab::account as collab_account, collab::presence, collab::share_dialog,
+    composer::model_picker, composer::popup as composer_popup, conversation::activity,
+    conversation::agent, conversation::chat, conversation::forks, conversation::mentions,
+    conversation::slash, conversation::subagents, conversation::subthreads, conversation::tools,
+    conversation::trigger, conversation::turns, review::changes, review::comments, review::diff,
+    review::doc_text, review::document, shell::onboarding, shell::projects, shell::side_pane,
+    shell::sidebar, shell::thread_tree, shell::workspace, system::copies, system::disk_usage,
+    system::editor, system::net, system::snapshot, terminal::view as terminal_view, terminal::vt,
+};
 
 use std::borrow::Cow;
 
