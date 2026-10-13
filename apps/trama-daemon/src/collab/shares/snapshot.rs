@@ -20,6 +20,7 @@ use super::super::transport::{ShareClient, open_manifest, publish_manifests};
 use crate::error::{DaemonError, Result};
 use trama_collab_protocol::vnext::api::{ManifestPart, SigningKeyRequest};
 use trama_collab_protocol::vnext::cipher::PayloadKind;
+use trama_db::ShareThreadRow;
 use trama_domain::manifest::SignedEnvelope;
 
 pub(crate) fn kind_str(kind: SharedThreadKind) -> String {
@@ -58,6 +59,9 @@ impl CollabService {
         &self,
         client: &ShareClient,
         share_id: &str,
+        // Membership changes must re-key history even when code cannot be
+        // exported; other publishes refuse instead.
+        membership_change: bool,
     ) -> Result<u64> {
         let share = ShareId::from(share_id);
         let row = self
@@ -127,9 +131,16 @@ impl CollabService {
         .await
         .map_err(|e| DaemonError::Collab(e.to_string()))??;
         let epoch = self.share_epoch(share_id).await?;
-        let content = self
+        let content = match self
             .build_content(client, &row, &rows, &envelope, epoch)
-            .await?;
+            .await
+        {
+            Err(DaemonError::Invalid(why)) if membership_change => {
+                self.warn_content_skipped(share_id, &rows, &why).await;
+                None
+            }
+            other => other?,
+        };
         let (db, cipher, id) = (self.db().clone(), e2ee.cipher.clone(), share_id.to_owned());
         let expected = row
             .current_snapshot_version
@@ -267,5 +278,32 @@ impl CollabService {
             .and_then(|b| serde_json::from_slice::<(u64, SignedEnvelope)>(&b).ok())
             .filter(|(v, _)| *v == version)
             .map(|(_, envelope)| envelope))
+    }
+
+    /// History was republished without code: logged, recorded and pushed
+    /// to the root thread's subscribers as a `ShareFailed` warning.
+    async fn warn_content_skipped(&self, share_id: &str, rows: &[ShareThreadRow], why: &str) {
+        let message = format!("snapshot republished without code: {why}");
+        crate::log::warn(format!("share {share_id}: {message}"));
+        let _ = self
+            .db()
+            .set_collab_setting(&format!("share_content_warning:{share_id}"), &message)
+            .await;
+        let root = rows
+            .iter()
+            .find(|r| r.source_scope_root)
+            .and_then(|r| r.local_thread_id.clone());
+        if let Some(root) = root {
+            self.sessions().notify(
+                &root.into(),
+                trama_protocol::DaemonMessage::ShareFailed {
+                    operation: "publish_share_snapshot".into(),
+                    share_id: Some(share_id.to_owned()),
+                    correlation_id: format!("shr_{}", trama_domain::ids::MessageId::generate()),
+                    code: "content_skipped".into(),
+                    message,
+                },
+            );
+        }
     }
 }

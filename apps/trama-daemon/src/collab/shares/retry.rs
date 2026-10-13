@@ -62,7 +62,7 @@ impl CollabService {
                     _ => Err(DaemonError::Invalid("stored welcome is malformed".into())),
                 },
                 OP_SNAPSHOT => self
-                    .publish_history_snapshot(&client, &op.share_id)
+                    .publish_history_snapshot(&client, &op.share_id, true)
                     .await
                     .map(|_| ()),
                 other => Err(DaemonError::Invalid(format!("unknown share op {other}"))),
