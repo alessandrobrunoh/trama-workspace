@@ -201,6 +201,28 @@ pub enum DaemonMessage {
         devices: Vec<String>,
         key_epoch: u64,
     },
+    /// Reply to `ListShareMembers`.
+    ShareMembers {
+        share_id: String,
+        members: Vec<ShareMemberSnapshot>,
+    },
+    /// Reply to `GetShareHistoryStatus`, and pushed to the thread's
+    /// subscribers whenever messages are published or skipped.
+    ShareHistoryStatus {
+        thread_id: ThreadId,
+        entries: Vec<ShareHistoryEntry>,
+    },
+    /// A share command failed. Sent right before the matching `Error`
+    /// (whose message ends with `[ref <correlation_id>]`); the daemon log
+    /// carries the same id with the full cause.
+    ShareFailed {
+        /// The client message tag, e.g. `create_share`.
+        operation: String,
+        share_id: Option<String>,
+        correlation_id: String,
+        code: String,
+        message: String,
+    },
     /// A vNext durable share event that passed shape and replay checks,
     /// sent to the subscribers of `thread_id` (thread-scoped kinds) or to
     /// every connection (share-wide kinds). `cipher_payload` stays opaque.

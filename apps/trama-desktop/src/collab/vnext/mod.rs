@@ -13,6 +13,9 @@ use super::wizard::join_flow::JoinFlow;
 use super::wizard::route::{WizardOp, route};
 use super::wizard::share_flow::ShareFlow;
 
+/// How long Share/Join waits for the server check before using v2.
+pub const SERVER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// First collab protocol with `/v3` shares.
 pub const MIN_VNEXT_PROTOCOL: u32 = 3;
 
@@ -46,6 +49,8 @@ pub struct VNextState {
     pub server: Option<CollabServerInfo>,
     /// Server URL a discovery is in flight for.
     discovering: Option<String>,
+    /// Shown in the v2 dialogs when the check gave up (timeout).
+    pub note: Option<String>,
     pub share: Option<ShareFlow>,
     pub join: Option<JoinFlow>,
     pending: Option<WizardOp>,
@@ -76,6 +81,7 @@ impl VNextState {
             return None;
         }
         self.server = None;
+        self.note = None;
         self.discovering = Some(url.to_owned());
         Some(ClientMessage::DiscoverCollabServer {
             server_url: Some(url.to_owned()),
@@ -91,6 +97,17 @@ impl VNextState {
             self.discovering = None;
             self.server = Some(info.clone());
         }
+    }
+
+    /// The check for `url` took too long: fall back to v2 with a note. A
+    /// late answer is ignored until the next status change re-checks.
+    pub fn time_out(&mut self, url: &str) -> bool {
+        if self.discovering.as_deref() != Some(url) {
+            return false;
+        }
+        self.discovering = None;
+        self.note = Some("The server did not answer in time; using classic sharing.".into());
+        true
     }
 
     pub fn supported(&self) -> bool {
@@ -186,6 +203,20 @@ impl VNextState {
 }
 
 impl CollabStore {
+    fn arm_check_timeout(&mut self, cx: &mut Context<Self>) {
+        let Some(url) = self.vnext.discovering.clone() else {
+            return;
+        };
+        self._check_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SERVER_CHECK_TIMEOUT).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.vnext.time_out(&url) {
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
     pub fn server_support(&self) -> ServerSupport {
         self.vnext.support()
     }
@@ -232,6 +263,7 @@ impl CollabStore {
                 .on_status(status.server_url.as_deref(), status.signed_in)
             {
                 self.send(discover);
+                self.arm_check_timeout(cx);
             }
             return false;
         }
@@ -251,178 +283,4 @@ impl CollabStore {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use trama_protocol::NegotiatedProfile;
-
-    fn info(url: &str, protocol: u32, caps: Vec<CollabCapability>) -> CollabServerInfo {
-        CollabServerInfo {
-            server_url: url.into(),
-            discovery: None,
-            profile: Some(NegotiatedProfile {
-                server_id: "s".into(),
-                protocol,
-                capabilities: caps,
-                limits: Default::default(),
-                policy: Default::default(),
-            }),
-            error: None,
-        }
-    }
-
-    #[test]
-    fn vnext_needs_protocol_3_and_e2ee() {
-        assert!(!supports_vnext(None));
-        assert!(!supports_vnext(Some(&info(
-            "u",
-            2,
-            vec![CollabCapability::E2ee]
-        ))));
-        assert!(!supports_vnext(Some(&info("u", 3, vec![]))));
-        assert!(supports_vnext(Some(&info(
-            "u",
-            3,
-            vec![CollabCapability::E2ee]
-        ))));
-        let mut legacy = info("u", 3, vec![CollabCapability::E2ee]);
-        legacy.profile = None;
-        assert!(
-            !supports_vnext(Some(&legacy)),
-            "failed negotiation falls back to v2"
-        );
-    }
-
-    #[test]
-    fn discovery_runs_once_per_server_and_resets_on_sign_out() {
-        let mut v = VNextState::default();
-        assert!(v.on_status(Some("https://a"), false).is_none());
-        assert!(matches!(
-            v.on_status(Some("https://a"), true),
-            Some(ClientMessage::DiscoverCollabServer { server_url: Some(u) }) if u == "https://a"
-        ));
-        assert!(v.on_status(Some("https://a/"), true).is_none(), "in flight");
-        v.on_server_info(&info("https://other", 3, vec![CollabCapability::E2ee]));
-        assert!(!v.supported(), "reply for another server is ignored");
-        let (handled, _) = v.apply(&DaemonMessage::CollabServerInfo(info(
-            "https://a",
-            3,
-            vec![CollabCapability::E2ee],
-        )));
-        assert!(handled && v.supported());
-        assert!(v.on_status(Some("https://a"), true).is_none());
-        assert!(
-            v.on_status(Some("https://b"), true).is_some(),
-            "server changed"
-        );
-        assert!(!v.supported());
-        v.on_status(None, false);
-        assert!(!v.supported());
-    }
-
-    #[test]
-    fn errors_only_reach_a_wizard_that_is_waiting() {
-        let mut v = VNextState::default();
-        v.join = Some(JoinFlow::new(WorkspaceId::from("w")));
-        let err = DaemonMessage::Error {
-            code: "x".into(),
-            message: "boom".into(),
-        };
-        assert!(!v.apply(&err).0, "v2 errors pass through");
-        let start = v.join.as_mut().unwrap().start("s1");
-        assert!(start.is_some());
-        v.sent(WizardOp::Join);
-        assert!(v.apply(&err).0);
-        assert!(matches!(
-            v.join.as_ref().unwrap().step,
-            super::super::wizard::join_flow::JoinStep::RequestFailed(_)
-        ));
-        assert!(!v.apply(&err).0);
-    }
-
-    #[test]
-    fn dead_connection_fails_the_step() {
-        let mut v = VNextState::default();
-        v.share = Some(ShareFlow::new(ThreadId::from("t"), "T".into()));
-        let f = v.share.as_mut().unwrap();
-        f.next();
-        f.next();
-        v.fail(WizardOp::Share, "down".into());
-        assert!(matches!(
-            v.share.as_ref().unwrap().step,
-            super::super::wizard::share_flow::ShareStep::Failed(_)
-        ));
-    }
-
-    #[test]
-    fn support_is_checking_until_a_definitive_answer() {
-        let mut v = VNextState::default();
-        assert_eq!(v.support(), ServerSupport::Legacy, "signed out");
-        v.on_status(Some("https://a"), true);
-        assert_eq!(v.support(), ServerSupport::Checking);
-        v.deferred = Some(DeferredOpen::Share);
-        assert_eq!(v.take_deferred(), None, "still checking");
-        let mut failed = info("https://a", 3, vec![]);
-        failed.profile = None;
-        failed.error = Some("timeout".into());
-        v.apply(&DaemonMessage::CollabServerInfo(failed));
-        assert_eq!(v.support(), ServerSupport::Legacy);
-        assert_eq!(v.take_deferred(), Some(DeferredOpen::Share));
-        assert_eq!(v.take_deferred(), None);
-
-        v.on_status(Some("https://b"), true);
-        let err = DaemonMessage::Error {
-            code: "x".into(),
-            message: "y".into(),
-        };
-        assert!(!v.apply(&err).0, "error still reaches its owner");
-        assert_eq!(
-            v.support(),
-            ServerSupport::Legacy,
-            "failed check falls back"
-        );
-        v.on_status(Some("https://c"), true);
-        v.apply(&DaemonMessage::CollabServerInfo(info(
-            "https://c",
-            3,
-            vec![CollabCapability::E2ee],
-        )));
-        assert_eq!(v.support(), ServerSupport::VNext);
-    }
-
-    #[test]
-    fn reopening_resumes_wizards() {
-        use super::super::wizard::join_flow::JoinStep;
-        use super::super::wizard::share_flow::ShareStep;
-        let mut v = VNextState::default();
-        v.open_share(ThreadId::from("t"), "T".into());
-        let f = v.share.as_mut().unwrap();
-        f.next();
-        f.next();
-        v.sent(WizardOp::Share);
-        v.open_share(ThreadId::from("t"), "T".into());
-        assert_eq!(
-            v.share.as_ref().unwrap().step,
-            ShareStep::Checking,
-            "resumed"
-        );
-        assert_eq!(v.pending, Some(WizardOp::Share), "reply still expected");
-        v.open_share(ThreadId::from("u"), "U".into());
-        assert_eq!(
-            v.share.as_ref().unwrap().step,
-            ShareStep::Scope,
-            "other thread starts over"
-        );
-        assert_eq!(v.pending, None);
-
-        v.open_join(WorkspaceId::from("w"));
-        v.join.as_mut().unwrap().start("s1");
-        v.open_join(WorkspaceId::from("w"));
-        assert_eq!(v.join.as_ref().unwrap().step, JoinStep::Requesting);
-        v.join.as_mut().unwrap().reset();
-        v.open_join(WorkspaceId::from("w2"));
-        assert_eq!(
-            v.join.as_ref().unwrap().workspace_id,
-            WorkspaceId::from("w2")
-        );
-    }
-}
+mod tests;

@@ -82,9 +82,13 @@ impl Workspace {
 
     /// Collab store changed: run a deferred Share/Join once decided.
     pub(super) fn resume_deferred(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let open = self
-            .collab
-            .update(cx, |collab, _| collab.vnext.take_deferred());
+        let (open, note) = self.collab.update(cx, |collab, _| {
+            let open = collab.vnext.take_deferred();
+            (open, open.and(collab.vnext.note.clone()))
+        });
+        if let Some(note) = note {
+            window.push_notification(Notification::info(note), cx);
+        }
         match open {
             Some(DeferredOpen::Share) => self.open_share(window, cx),
             Some(DeferredOpen::Join) => self.open_join(window, cx),

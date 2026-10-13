@@ -108,3 +108,38 @@ pub struct ShareLeaseSnapshot {
     /// Unix seconds.
     pub expires_at: i64,
 }
+
+/// One device of a share member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareMemberDevice {
+    pub device_id: String,
+    /// In this device's MLS group view; `None` when this device is not in
+    /// the group itself.
+    pub in_group: Option<bool>,
+    /// The server binds a signing key for this device to the member.
+    pub signing_key_bound: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareMemberSnapshot {
+    pub username: String,
+    pub role: ShareRole,
+    pub read_code: bool,
+    pub devices: Vec<ShareMemberDevice>,
+}
+
+/// Whether a local message reached the share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareHistoryState {
+    Shared,
+    /// Written while this device did not hold the thread's writer lease;
+    /// it is never published.
+    NotSharedNoLease,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareHistoryEntry {
+    pub message_id: MessageId,
+    pub state: ShareHistoryState,
+}

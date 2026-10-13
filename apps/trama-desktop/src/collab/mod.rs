@@ -478,6 +478,8 @@ pub struct CollabStore {
     presence_sent: Option<(ThreadId, CollabPresenceState)>,
     debounce: DraftDebounce,
     _debounce_task: Option<Task<()>>,
+    /// Server-check timeout (see `vnext`).
+    _check_task: Option<Task<()>>,
 }
 
 impl CollabStore {
@@ -503,6 +505,7 @@ impl CollabStore {
             presence_sent: None,
             debounce: DraftDebounce::default(),
             _debounce_task: None,
+            _check_task: None,
         }
     }
 

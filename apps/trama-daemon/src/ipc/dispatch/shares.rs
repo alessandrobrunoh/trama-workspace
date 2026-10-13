@@ -1,9 +1,56 @@
-//! Share/Join flow (protocol 14); the work lives in `collab::shares`.
+//! Share/Join flow (protocols 14–16); the work lives in `collab::shares`.
+//! Failures get a correlation id: `ShareFailed` then `Error` (message
+//! suffixed with `[ref <id>]`), and the daemon log carries the same id.
 
 use super::*;
+use trama_domain::ids::MessageId;
+
+fn share_id_of(msg: &ClientMessage) -> Option<String> {
+    serde_json::to_value(msg)
+        .ok()?
+        .get("payload")?
+        .get("share_id")?
+        .as_str()
+        .map(str::to_owned)
+}
 
 pub(super) async fn handle(msg: ClientMessage, ctx: &mut Ctx<'_>) -> Result<ConnectionControl> {
-    let Ctx { collab, out_tx, .. } = ctx;
+    let operation = serde_json::to_value(&msg)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
+        .unwrap_or_default();
+    let share_id = share_id_of(&msg);
+    let reply = match run(msg, ctx.collab).await {
+        Ok(Some(reply)) => reply,
+        Ok(None) => return Ok(ConnectionControl::Continue),
+        Err(err) => {
+            let correlation_id = format!("shr_{}", MessageId::generate());
+            crate::log::warn(format!(
+                "share command {operation} failed [ref {correlation_id}]: {err}"
+            ));
+            if let Some(id) = &share_id {
+                ctx.collab.check_share_access(id).await;
+            }
+            let code = err.code().to_owned();
+            let message = err.to_string();
+            let _ = ctx.out_tx.send(DaemonMessage::ShareFailed {
+                operation,
+                share_id,
+                correlation_id: correlation_id.clone(),
+                code: code.clone(),
+                message: message.clone(),
+            });
+            DaemonMessage::Error {
+                code,
+                message: format!("{message} [ref {correlation_id}]"),
+            }
+        }
+    };
+    let _ = ctx.out_tx.send(reply);
+    Ok(ConnectionControl::Continue)
+}
+
+async fn run(msg: ClientMessage, collab: &CollabService) -> Result<Option<DaemonMessage>> {
     let reply = match msg {
         ClientMessage::SharePreflight { thread_id, scope } => {
             DaemonMessage::SharePreflightReport(collab.share_preflight(&thread_id, scope).await?)
@@ -81,8 +128,15 @@ pub(super) async fn handle(msg: ClientMessage, ctx: &mut Ctx<'_>) -> Result<Conn
                 key_epoch,
             }
         }
-        _ => return Ok(ConnectionControl::Continue),
+        ClientMessage::ListShareMembers { share_id } => {
+            let members = collab.list_share_members(&share_id).await?;
+            DaemonMessage::ShareMembers { share_id, members }
+        }
+        ClientMessage::GetShareHistoryStatus { thread_id } => {
+            let entries = collab.share_history_status(&thread_id).await?;
+            DaemonMessage::ShareHistoryStatus { thread_id, entries }
+        }
+        _ => return Ok(None),
     };
-    let _ = out_tx.send(reply);
-    Ok(ConnectionControl::Continue)
+    Ok(Some(reply))
 }

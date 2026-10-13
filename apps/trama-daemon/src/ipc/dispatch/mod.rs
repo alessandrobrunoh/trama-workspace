@@ -96,7 +96,9 @@ fn family(msg: &ClientMessage) -> Family {
         | ClientMessage::AcquireShareLease { .. }
         | ClientMessage::ReleaseShareLease { .. }
         | ClientMessage::ListShareLeases { .. }
-        | ClientMessage::RemoveShareMember { .. } => Family::Shares,
+        | ClientMessage::RemoveShareMember { .. }
+        | ClientMessage::ListShareMembers { .. }
+        | ClientMessage::GetShareHistoryStatus { .. } => Family::Shares,
         ClientMessage::Hello { .. }
         | ClientMessage::ApprovalHook { .. }
         | ClientMessage::McpToolCall { .. }

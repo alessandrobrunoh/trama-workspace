@@ -2,6 +2,7 @@
 //! create, join (MLS key package → Welcome), snapshots, leases, and the
 //! mapping of received events into local history.
 
+mod access;
 mod flow;
 mod inbound;
 mod leases;

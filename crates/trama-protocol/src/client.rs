@@ -314,6 +314,15 @@ pub enum ClientMessage {
         share_id: String,
         username: String,
     },
+    /// Members, roles and devices. Answered with `ShareMembers`.
+    ListShareMembers {
+        share_id: String,
+    },
+    /// Per-message share state of a local thread (only messages with a
+    /// recorded state). Answered with `ShareHistoryStatus`.
+    GetShareHistoryStatus {
+        thread_id: ThreadId,
+    },
     /// Share a top-level thread: create its collab thread on first use
     /// (access `invited`), then apply `access` when set and invite the
     /// `invite` usernames (owner only). Setting `link` (again) returns a fresh

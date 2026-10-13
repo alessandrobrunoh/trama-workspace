@@ -401,7 +401,7 @@ fn app_dir_prefers_trama_data_dir_over_home() {
 
 #[test]
 fn protocol_version_is_current() {
-    assert_eq!(PROTOCOL_VERSION, 15);
+    assert_eq!(PROTOCOL_VERSION, 16);
 }
 
 #[test]
