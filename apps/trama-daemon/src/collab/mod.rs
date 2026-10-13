@@ -49,8 +49,10 @@ mod runner;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+#[path = "tests/history.rs"]
 mod tests_history;
 #[cfg(test)]
+#[path = "tests/tls.rs"]
 mod tests_tls;
 mod tls;
 

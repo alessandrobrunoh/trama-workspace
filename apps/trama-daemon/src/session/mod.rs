@@ -20,22 +20,28 @@ pub(crate) use self::workspaces::*;
 
 mod activity;
 #[cfg(test)]
+#[path = "tests/activity.rs"]
 mod activity_tests;
 mod agents;
 #[cfg(test)]
+#[path = "tests/agents.rs"]
 mod agents_tests;
 mod archive;
 #[cfg(test)]
+#[path = "tests/archive.rs"]
 mod archive_tests;
 mod comments;
 // Unix-only: POSIX shell terminals, symlinks and executable scripts.
 #[cfg(all(test, unix))]
+#[path = "tests/composer.rs"]
 mod composer_tests;
 mod context;
 mod forks;
 #[cfg(test)]
+#[path = "tests/forks.rs"]
 mod forks_tests;
 #[cfg(all(test, unix))]
+#[path = "tests/setup.rs"]
 mod setup_tests;
 mod skills;
 mod subthreads;
