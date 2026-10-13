@@ -150,6 +150,15 @@ pub enum DaemonMessage {
     },
     /// Reply to `ConnectCollab`, `DisconnectCollab` and `GetCollabStatus`.
     CollabStatus(CollabStatusSnapshot),
+    /// Reply to `DiscoverCollabServer`.
+    CollabServerInfo(CollabServerInfo),
+    /// A vNext durable share event that passed shape and replay checks,
+    /// sent to the subscribers of `thread_id` (thread-scoped kinds) or to
+    /// every connection (share-wide kinds). `cipher_payload` stays opaque.
+    ShareEvent {
+        thread_id: Option<ThreadId>,
+        event: ShareEventEnvelope,
+    },
     /// Reply to `ShareThread`, `GetSharedThread`, `RemoveSharedThreadMember`.
     SharedThread(SharedThreadSnapshot),
     /// Reply to `JoinSharedThread`: the new local thread, already mirroring.

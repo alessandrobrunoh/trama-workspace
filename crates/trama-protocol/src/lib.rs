@@ -41,7 +41,10 @@
 //! checkout disk accounting and archiving ([`ClientMessage::GetDiskUsage`],
 //! [`ClientMessage::ArchiveThread`], [`ClientMessage::UnarchiveThread`],
 //! [`ClientMessage::DeleteThreadCheckouts`], their replies,
-//! `ThreadSnapshot.archived` and [`CheckoutStatus::Removed`]). Each bump is
+//! `ThreadSnapshot.archived` and [`CheckoutStatus::Removed`]). **12** shares a
+//! thread's whole family and history. **13** adds collab server discovery
+//! ([`ClientMessage::DiscoverCollabServer`], [`DaemonMessage::CollabServerInfo`])
+//! and vNext share events ([`DaemonMessage::ShareEvent`]). Each bump is
 //! transport-only. Persisted domain ids and SQLite rows are not rewritten.
 //!
 //! A version mismatch fails the handshake (`Welcome.accepted = false`). Extra object
@@ -54,6 +57,8 @@ mod payloads;
 mod snapshots;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_vnext;
 #[allow(unused_imports)]
 pub use self::client::*;
 #[allow(unused_imports)]
@@ -79,6 +84,11 @@ pub use trama_domain::subthread::{
 };
 pub use trama_domain::thread::ThreadKind;
 
+/// vNext discovery and share event types (collab protocol v3).
+pub use trama_collab_protocol::vnext::discovery::{
+    Capability as CollabCapability, NegotiatedProfile, ServerDiscovery,
+};
+pub use trama_collab_protocol::vnext::events::{ShareEventEnvelope, ShareEventKind};
 /// Shared-thread wire types reused from the collab service.
 pub use trama_collab_protocol::{
     AccessLevel as CollabAccess, EventEnvelope as CollabEventEnvelope,
@@ -88,6 +98,8 @@ pub use trama_collab_protocol::{
 
 /// Wire protocol version carried in `Hello` / `Welcome`.
 ///
+/// Version 13 adds collab server discovery (`DiscoverCollabServer` /
+/// `CollabServerInfo`) and vNext share events (`ShareEvent`).
 /// Version 12 (11 is checkout provisioning) shares a thread's whole family
 /// and history (ADR 0013): `GetRemoteChanges` / `RemoteChanges` (the changes
 /// snapshots other participants published), and `SharedThreadSnapshot`
@@ -128,7 +140,7 @@ pub use trama_collab_protocol::{
 /// Version 4 added the Claude approval channel and 3 thread checkout
 /// discovery. It does not migrate stored data; peers with a different version
 /// are rejected at handshake time.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Environment variable that relocates the whole app-data directory (socket,
 /// database, config, legacy checkouts). Use it for isolated test instances

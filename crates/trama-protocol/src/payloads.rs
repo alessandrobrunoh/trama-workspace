@@ -14,6 +14,17 @@ pub enum CollabRunnerState {
     Failed,
 }
 
+/// Reply to `DiscoverCollabServer`. `discovery` is `None` for a service
+/// that predates discovery (assumed collab protocol v2, no vNext
+/// capabilities); `profile` is `None` when negotiation failed (`error`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollabServerInfo {
+    pub server_url: String,
+    pub discovery: Option<ServerDiscovery>,
+    pub profile: Option<NegotiatedProfile>,
+    pub error: Option<String>,
+}
+
 /// Reply to the `*Collab*` commands. Never carries a token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollabStatusSnapshot {

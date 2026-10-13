@@ -18,6 +18,10 @@ pub(super) async fn handle(msg: ClientMessage, ctx: &mut Ctx<'_>) -> Result<Conn
             let status = collab.disconnect(forget).await?;
             let _ = out_tx.send(DaemonMessage::CollabStatus(status));
         }
+        ClientMessage::DiscoverCollabServer { server_url } => {
+            let info = collab.discover(server_url).await?;
+            let _ = out_tx.send(DaemonMessage::CollabServerInfo(info));
+        }
         ClientMessage::GetCollabStatus => {
             let _ = out_tx.send(DaemonMessage::CollabStatus(collab.status().await?));
         }

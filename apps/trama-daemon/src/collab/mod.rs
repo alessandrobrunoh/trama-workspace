@@ -40,12 +40,14 @@
 
 mod credentials;
 mod digest;
+mod discovery;
 pub(crate) mod family;
 mod history;
 mod http;
 mod mirror;
 mod outbox;
 mod runner;
+mod share_events;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -123,6 +125,9 @@ struct Inner {
     sync_lock: tokio::sync::Mutex<()>,
     /// Wakes the outbox worker.
     outbox_notify: tokio::sync::Notify,
+    /// vNext share event replay state.
+    #[allow(dead_code)] // fed by the M4 transport
+    share_events: share_events::ShareEventRouter,
 }
 
 struct State {
@@ -267,6 +272,7 @@ impl CollabService {
                 }),
                 sync_lock: tokio::sync::Mutex::new(()),
                 outbox_notify: tokio::sync::Notify::new(),
+                share_events: Default::default(),
             }),
         }
     }
@@ -286,6 +292,11 @@ impl CollabService {
 
     pub(crate) fn sessions(&self) -> &SessionManager {
         &self.inner.sessions
+    }
+
+    #[allow(dead_code)] // fed by the M4 transport
+    pub(crate) fn share_events(&self) -> &share_events::ShareEventRouter {
+        &self.inner.share_events
     }
 
     pub(crate) fn db(&self) -> &TramaDb {

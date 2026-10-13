@@ -19,6 +19,7 @@ Specifiche fornite da Alessandro Bruno. Ordine di lettura:
 - **UI:** si mantiene GPUI (anche per Linux e Windows).
 - **Crittografia E2EE (M4):** Messaging Layer Security, [RFC 9420](https://www.rfc-editor.org/rfc/rfc9420), tramite un'implementazione esistente (es. `openmls`); niente protocollo fatto in casa. Resta obbligatoria la security review prima di dichiarare Cloud E2EE.
 - **Piattaforme:** macOS, Linux e Windows sono tutti target di prima classe.
+- **Discovery/eventi vNext (M3, scelte conservative):** `GET /.well-known/trama-collab` è pubblico e oggi annuncia solo il protocollo collab `2..=2` senza capability vNext (una capability compare solo quando esistono le rotte); `server_id` è casuale e persistito nel DB del servizio; un 404 equivale a server v2 legacy; il daemon negozia con capability client vuote fino a M4. Gli eventi `ShareEvent*` hanno metadati di routing in chiaro e corpo `cipher_payload` opaco; intake idempotente su `event_id` con catena `author_seq` stretta per device (gap → backfill, riuso → rifiuto). Nessuna emissione dal server finché le rotte `/v3` non esistono (M4).
 
 ## Stato dell'implementazione
 

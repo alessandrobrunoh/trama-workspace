@@ -235,6 +235,13 @@ pub enum ClientMessage {
     },
     /// Answered with `CollabStatus`.
     GetCollabStatus,
+    /// Fetch `GET /.well-known/trama-collab` from `server_url` (or the
+    /// connected service when `None`) and negotiate a capability profile.
+    /// Needs no credential. Answered with `CollabServerInfo`.
+    DiscoverCollabServer {
+        #[serde(default)]
+        server_url: Option<String>,
+    },
     /// Share a top-level thread: create its collab thread on first use
     /// (access `invited`), then apply `access` when set and invite the
     /// `invite` usernames (owner only). Setting `link` (again) returns a fresh

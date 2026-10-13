@@ -74,6 +74,7 @@ fn family(msg: &ClientMessage) -> Family {
         ClientMessage::ConnectCollab { .. }
         | ClientMessage::DisconnectCollab { .. }
         | ClientMessage::GetCollabStatus { .. }
+        | ClientMessage::DiscoverCollabServer { .. }
         | ClientMessage::ShareThread { .. }
         | ClientMessage::GetSharedThread { .. }
         | ClientMessage::RemoveSharedThreadMember { .. }
