@@ -11,7 +11,7 @@ Specifiche fornite da Alessandro Bruno. Ordine di lettura:
 
 ## Esempi
 
-- [`examples/share-manifest.example.json`](examples/share-manifest.example.json) — manifest illustrativo (non firmato) citato in 03 §2.
+- [`examples/share-manifest.example.json`](examples/share-manifest.example.json) — coppia di `SignedEnvelope` (history + content) firmata con una chiave di test pubblica, verificata dal test `trama-domain::manifest::example_tests` (03 §2).
 - [`examples/collaboration-servers.example.toml`](examples/collaboration-servers.example.toml) — profili server e policy enterprise concettuali (01 §1.7, 06 §2); non è ancora uno schema `config.json` supportato.
 
 ## Decisioni prese
@@ -44,4 +44,3 @@ Scelte conservative prese dove la spec lascia aperto:
 - **Firmatario = publisher:** il device della chiave deve coincidere con `publisher_device_id`; il campo `publisher_signature` dell'esempio vive nell'envelope, non nel payload (campi sconosciuti rifiutati).
 - **Rollback:** `open_history` rifiuta versioni sotto il pin locale; nel DB `advance_share_snapshot` è CAS e solo crescente; uno share `closed` non si riapre.
 - **DB:** generazioni di checkout immutabili e appese con CAS su `previous_generation`; il fingerprint di un server già pinnato non si può cambiare né rimuovere con un upsert; `byte_len` di un oggetto noto è immutabile.
-- **Aperto:** l'esempio `examples/share-manifest.example.json` è ancora il manifest unico illustrativo (kind `plain`, non presente in `SharedThreadKind`); va riallineato ai due manifest quando la forma sarà confermata.

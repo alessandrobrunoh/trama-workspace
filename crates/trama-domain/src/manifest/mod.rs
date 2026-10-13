@@ -15,6 +15,8 @@ mod envelope;
 mod history;
 
 #[cfg(test)]
+mod example_tests;
+#[cfg(test)]
 mod tests;
 
 pub use content::{
