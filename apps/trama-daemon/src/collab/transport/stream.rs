@@ -102,7 +102,10 @@ impl CollabService {
         };
         let mut ws = match client.stream(share_id, cursor).await {
             Ok(ws) => ws,
-            Err(crate::error::DaemonError::NotFound(_)) => return End::Stop,
+            Err(crate::error::DaemonError::NotFound(_)) => {
+                self.check_share_access(share_id).await;
+                return End::Stop;
+            }
             Err(err) => {
                 crate::log::warn(format!("share {share_id}: stream unavailable: {err}"));
                 return End::Retry;

@@ -7,7 +7,8 @@ use trama_collab_protocol::vnext::api::{
     ShareInfo, ShareMemberRequest,
 };
 use trama_collab_protocol::vnext::api::{
-    KeyPackageRequest, PendingKeyPackage, RevokedMember, WelcomeBlob,
+    KeyPackageRequest, ObjectClass, PendingKeyPackage, RevokedMember, ShareMemberInfo,
+    SigningKeyBinding, SigningKeyRequest, WelcomeBlob,
 };
 use trama_collab_protocol::vnext::events::ShareEventEnvelope;
 
@@ -192,5 +193,59 @@ impl ShareClient {
         }
         let path = Self::path(share_id, &format!("/members/{username}/revoke"))?;
         self.call(Method::POST, &path, None::<&()>).await
+    }
+
+    pub async fn members(&self, share_id: &str) -> Result<Vec<ShareMemberInfo>> {
+        let path = Self::path(share_id, "/members")?;
+        self.call(Method::GET, &path, None::<&()>).await
+    }
+
+    pub async fn bind_signing_key(&self, body: &SigningKeyRequest) -> Result<()> {
+        self.call_empty(Method::POST, "/v3/signing-keys", Some(body))
+            .await
+    }
+
+    pub async fn signing_keys(&self, share_id: &str) -> Result<Vec<SigningKeyBinding>> {
+        let path = Self::path(share_id, "/signing-keys")?;
+        self.call(Method::GET, &path, None::<&()>).await
+    }
+
+    pub async fn put_part(
+        &self,
+        share_id: &str,
+        content_id: &str,
+        part: u32,
+        class: ObjectClass,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        validate_id(content_id)?;
+        let class = match class {
+            ObjectClass::History => "history",
+            ObjectClass::Content => "content",
+        };
+        let path = Self::path(
+            share_id,
+            &format!("/objects/{content_id}/parts/{part}?class={class}"),
+        )?;
+        self.endpoint
+            .request_raw(
+                Method::PUT,
+                &path,
+                Some(&self.token),
+                Some((bytes.into(), "application/octet-stream")),
+            )
+            .await
+            .map(|_| ())
+            .map_err(collab_error)
+    }
+
+    pub async fn get_part(&self, share_id: &str, content_id: &str, part: u32) -> Result<Vec<u8>> {
+        validate_id(content_id)?;
+        let path = Self::path(share_id, &format!("/objects/{content_id}/parts/{part}"))?;
+        self.endpoint
+            .request_raw(Method::GET, &path, Some(&self.token), None)
+            .await
+            .map(|b| b.to_vec())
+            .map_err(collab_error)
     }
 }

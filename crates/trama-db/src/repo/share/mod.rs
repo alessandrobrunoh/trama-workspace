@@ -10,6 +10,7 @@ mod inventory;
 mod sealed;
 mod servers;
 mod shares;
+mod states;
 mod threads;
 
 #[cfg(test)]
@@ -22,6 +23,7 @@ pub use heads::ShareDeviceHead;
 pub use inventory::{ObjectState, ShareObjectRow, SharePeerAck};
 pub use servers::CollaborationServerRow;
 pub use shares::{ShareRow, ShareStatus};
+pub use states::{ShareMessageState, SharePendingOp};
 pub use threads::ShareThreadRow;
 
 use trama_domain::DomainError;

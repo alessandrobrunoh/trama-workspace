@@ -17,10 +17,12 @@ use trama_collab_protocol::vnext::bodies::{
     HistoryAppendedBody, HistoryMessage, HistoryRole, MAX_HISTORY_MESSAGES,
 };
 use trama_collab_protocol::vnext::events::ShareEventKind;
+use trama_db::ShareMessageState;
 use trama_db::ShareStatus;
+use trama_domain::ids::MessageId;
 use trama_domain::ids::ThreadId;
 use trama_domain::message::{Actor, ContentBlock, Message, Role};
-use trama_protocol::ShareRole;
+use trama_protocol::{DaemonMessage, ShareHistoryEntry, ShareHistoryState, ShareRole};
 
 use super::super::{CollabService, REMOTE_ACTOR_PREFIX};
 use super::flow::role_key;
@@ -31,7 +33,7 @@ fn watermark_key(share_id: &str, gid: &str) -> String {
     format!("share_hist:{share_id}:{gid}")
 }
 
-fn shareable(message: &Message) -> Option<HistoryMessage> {
+pub(crate) fn shareable(message: &Message) -> Option<HistoryMessage> {
     let role = match message.role {
         Role::User => HistoryRole::User,
         Role::Assistant => HistoryRole::Assistant,
@@ -163,7 +165,56 @@ impl CollabService {
                 .await?;
             }
         }
+        let state = if holds_lease {
+            ShareHistoryState::Shared
+        } else {
+            ShareHistoryState::NotSharedNoLease
+        };
+        self.record_history_states(share_id, thread, &fresh, state)
+            .await?;
         self.db().set_collab_setting(&key, &last_id).await?;
         Ok(if holds_lease { fresh.len() } else { 0 })
+    }
+
+    async fn record_history_states(
+        &self,
+        share_id: &str,
+        thread: &ThreadId,
+        messages: &[HistoryMessage],
+        state: ShareHistoryState,
+    ) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let tag = match state {
+            ShareHistoryState::Shared => "shared",
+            ShareHistoryState::NotSharedNoLease => "not_shared_no_lease",
+        };
+        let rows = messages
+            .iter()
+            .map(|m| ShareMessageState {
+                message_id: m.origin.clone(),
+                share_id: share_id.to_owned(),
+                state: tag.into(),
+            })
+            .collect();
+        self.db()
+            .record_share_message_states(&thread.to_string(), rows)
+            .await?;
+        let entries = messages
+            .iter()
+            .map(|m| ShareHistoryEntry {
+                message_id: MessageId::from(m.origin.clone()),
+                state,
+            })
+            .collect();
+        self.sessions().notify(
+            thread,
+            DaemonMessage::ShareHistoryStatus {
+                thread_id: thread.clone(),
+                entries,
+            },
+        );
+        Ok(())
     }
 }
