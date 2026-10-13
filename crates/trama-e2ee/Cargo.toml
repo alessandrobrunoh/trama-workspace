@@ -12,6 +12,7 @@ openmls_rust_crypto = "0.5"
 openmls_basic_credential = "0.5"
 openmls_traits = "0.5"
 openmls_memory_storage = "0.5"
+trama-collab-protocol = { path = "../trama-collab-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

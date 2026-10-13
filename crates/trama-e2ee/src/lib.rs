@@ -15,6 +15,7 @@ mod error;
 mod group;
 mod identity;
 mod provider;
+mod seam;
 mod store;
 
 #[cfg(test)]
@@ -23,6 +24,7 @@ mod tests;
 pub use error::{E2eeError, Result};
 pub use group::{Inbound, MembershipChange, PendingJoin, ShareGroup};
 pub use identity::DeviceIdentity;
+pub use seam::MlsPayloadCipher;
 pub use store::{EpochStateStore, MemoryEpochStore};
 
 /// The only MLS ciphersuite Trama accepts (X25519, AES-128-GCM, SHA-256,
