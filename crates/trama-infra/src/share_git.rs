@@ -304,7 +304,15 @@ fn staging_git(staging: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<Ve
     command
         .arg("-C")
         .arg(staging)
-        .args(["-c", hooks.as_str(), "-c", "core.fsmonitor=false"])
+        // Byte-exact materialization: no line-ending conversion on checkout.
+        .args([
+            "-c",
+            hooks.as_str(),
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.autocrlf=false",
+        ])
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(if stdin.is_some() {
