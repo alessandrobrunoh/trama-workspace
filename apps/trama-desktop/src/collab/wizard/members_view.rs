@@ -22,6 +22,26 @@ pub fn remove_warning(username: &str) -> String {
     )
 }
 
+/// "writer · code · 2 devices" from the server roster, when loaded.
+pub fn member_detail(flow: &ShareFlow, username: &str) -> Option<String> {
+    let m = flow.member_info(username)?;
+    let role = match m.role {
+        trama_protocol::ShareRole::Writer => "writer",
+        trama_protocol::ShareRole::Reader => "reader",
+        trama_protocol::ShareRole::Owner => "owner",
+    };
+    let mut parts = vec![role.to_owned()];
+    if m.read_code {
+        parts.push("code".into());
+    }
+    parts.push(match m.devices.len() {
+        0 => "not joined yet".into(),
+        1 => "1 device".into(),
+        n => format!("{n} devices"),
+    });
+    Some(parts.join(" · "))
+}
+
 impl ShareWizard {
     pub(super) fn members_section(
         &self,
@@ -39,7 +59,15 @@ impl ShareWizard {
             ));
         }
         let busy = flow.removing.is_some();
+        if let Some(why) = &flow.ended {
+            return section(
+                p,
+                "People with access",
+                note(p, IconName::Lock, p.warning, why.clone()),
+            );
+        }
         for name in &flow.members {
+            let detail = member_detail(flow, name);
             let removing = flow.removing.as_deref() == Some(name.as_str());
             let n = name.clone();
             rows = rows.child(
@@ -47,11 +75,16 @@ impl ShareWizard {
                     .gap(theme::sp(2.))
                     .items_center()
                     .child(
-                        div()
+                        v_flex()
                             .flex_1()
                             .min_w_0()
-                            .text_size(theme::text_sm())
-                            .child(name.clone()),
+                            .child(div().text_size(theme::text_sm()).child(name.clone()))
+                            .children(detail.map(|d| {
+                                div()
+                                    .text_size(theme::text_xs())
+                                    .text_color(p.text_muted)
+                                    .child(d)
+                            })),
                     )
                     .child(
                         Button::new(SharedString::from(format!("member-remove-{name}")))

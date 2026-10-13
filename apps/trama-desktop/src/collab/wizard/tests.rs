@@ -134,10 +134,11 @@ fn created_share_loads_and_admits_join_requests() {
     to_checks(&mut f);
     f.apply_preflight(report(vec![]));
     f.next();
-    assert!(matches!(
-        f.apply_created(snapshot("s1")),
-        Some(ClientMessage::ListShareJoinRequests { share_id }) if share_id == "s1"
-    ));
+    let follow = f.apply_created(snapshot("s1"));
+    assert!(matches!(&follow[..], [
+        ClientMessage::ListShareMembers { share_id: a },
+        ClientMessage::ListShareJoinRequests { share_id: b },
+    ] if a == "s1" && b == "s1"));
     let req = ShareJoinRequest {
         username: "bob".into(),
         device_id: "d1".into(),
@@ -240,11 +241,12 @@ fn join_request_failure_can_retry_or_reset() {
 
 #[test]
 fn router_delivers_replies_and_errors_to_the_pending_wizard() {
-    use super::route::{WizardOp, route};
+    use super::route::{Correlation, WizardOp, route};
     use trama_protocol::DaemonMessage;
     let mut f = flow();
     let mut j = JoinFlow::new(WorkspaceId::from("w"));
-    let mut pending = Some(WizardOp::Share);
+    let mut pending = Correlation::default();
+    pending.sent(WizardOp::Share);
     to_checks(&mut f);
     let r = route(
         &DaemonMessage::SharePreflightReport(report(vec![])),
@@ -252,9 +254,9 @@ fn router_delivers_replies_and_errors_to_the_pending_wizard() {
         Some(&mut f),
         Some(&mut j),
     );
-    assert!(r.handled && pending.is_none());
+    assert!(r.handled && pending.pending.is_none());
     f.next();
-    pending = Some(WizardOp::Share);
+    pending.sent(WizardOp::Share);
     let r = route(
         &DaemonMessage::ShareCreated(snapshot("s1")),
         &mut pending,
@@ -262,13 +264,13 @@ fn router_delivers_replies_and_errors_to_the_pending_wizard() {
         None,
     );
     assert!(matches!(
-        r.follow_up,
-        Some(ClientMessage::ListShareJoinRequests { .. })
+        r.follow_ups.first(),
+        Some(ClientMessage::ListShareMembers { .. })
     ));
-    assert_eq!(pending, Some(WizardOp::Share));
+    assert_eq!(pending.pending, Some(WizardOp::Share));
 
     j.start("s9");
-    pending = Some(WizardOp::Join);
+    pending.sent(WizardOp::Join);
     let err = DaemonMessage::Error {
         code: "unsupported".into(),
         message: "nope".into(),
@@ -284,7 +286,7 @@ fn router_delivers_replies_and_errors_to_the_pending_wizard() {
 #[test]
 fn removing_a_member_needs_confirmation_and_updates_the_epoch() {
     use super::members_view::remove_warning;
-    use super::route::{WizardOp, route};
+    use super::route::{Correlation, WizardOp, route};
     use trama_protocol::DaemonMessage;
     let mut f = flow();
     f.add_invites("bob", None).unwrap();
@@ -318,7 +320,8 @@ fn removing_a_member_needs_confirmation_and_updates_the_epoch() {
     f.ask_remove("carol");
     assert!(f.confirm_remove.is_none(), "one removal at a time");
 
-    let mut pending = Some(WizardOp::Share);
+    let mut pending = Correlation::default();
+    pending.sent(WizardOp::Share);
     let removed = DaemonMessage::ShareMemberRemoved {
         share_id: "s1".into(),
         username: "bob".into(),
@@ -336,4 +339,158 @@ fn removing_a_member_needs_confirmation_and_updates_the_epoch() {
     assert!(f.removing.is_none() && f.error.is_some());
     assert_eq!(f.members, ["carol"], "failed removal keeps the member");
     assert!(remove_warning("carol").contains("new key"));
+}
+
+fn shared_flow() -> ShareFlow {
+    let mut f = flow();
+    f.add_invites("bob", None).unwrap();
+    to_checks(&mut f);
+    f.apply_preflight(report(vec![]));
+    f.next();
+    f.apply_created(snapshot("s1"));
+    f
+}
+
+#[test]
+fn roster_from_server_replaces_local_members() {
+    use super::members_view::member_detail;
+    use trama_protocol::{ShareMemberDevice, ShareMemberSnapshot};
+    let mut f = shared_flow();
+    let member = |u: &str, role, devices: usize| ShareMemberSnapshot {
+        username: u.into(),
+        role,
+        read_code: role == ShareRole::Writer,
+        devices: (0..devices)
+            .map(|i| ShareMemberDevice {
+                device_id: format!("d{i}"),
+                in_group: Some(true),
+                signing_key_bound: true,
+            })
+            .collect(),
+    };
+    f.apply_members("other", vec![member("eve", ShareRole::Reader, 1)]);
+    assert_eq!(f.members, ["bob"]);
+    f.apply_members(
+        "s1",
+        vec![
+            member("alice", ShareRole::Owner, 1),
+            member("carol", ShareRole::Writer, 2),
+            member("bob", ShareRole::Reader, 0),
+        ],
+    );
+    assert_eq!(f.members, ["carol", "bob"], "owner is not listed");
+    assert_eq!(
+        member_detail(&f, "carol").as_deref(),
+        Some("writer · code · 2 devices")
+    );
+    assert_eq!(
+        member_detail(&f, "bob").as_deref(),
+        Some("reader · not joined yet")
+    );
+    f.apply_requests(
+        "s1",
+        vec![ShareJoinRequest {
+            username: "dan".into(),
+            device_id: "d9".into(),
+        }],
+    );
+    f.approve("d9");
+    assert!(matches!(
+        f.apply_approved("s1", "d9", 3),
+        Some(ClientMessage::ListShareMembers { .. })
+    ));
+}
+
+#[test]
+fn share_failed_is_routed_by_operation_and_its_error_swallowed() {
+    use super::route::{Correlation, WizardOp, route};
+    use trama_protocol::DaemonMessage;
+    let mut f = shared_flow();
+    let mut j = JoinFlow::new(WorkspaceId::from("w"));
+    let mut corr = Correlation::default();
+    j.start("s9");
+    corr.sent(WizardOp::Join);
+    f.ask_remove("bob");
+    f.confirm_remove();
+    // The failure belongs to the Share wizard even though Join is pending.
+    let failed = DaemonMessage::ShareFailed {
+        operation: "remove_share_member".into(),
+        share_id: Some("s1".into()),
+        correlation_id: "c42".into(),
+        code: "forbidden".into(),
+        message: "not allowed".into(),
+    };
+    assert!(route(&failed, &mut corr, Some(&mut f), Some(&mut j)).handled);
+    assert!(f.error.as_deref().unwrap().contains("ref c42"));
+    assert!(f.removing.is_none());
+    assert_eq!(j.step, JoinStep::Requesting, "join untouched");
+    let dup = DaemonMessage::Error {
+        code: "forbidden".into(),
+        message: "not allowed [ref c42]".into(),
+    };
+    assert!(
+        route(&dup, &mut corr, Some(&mut f), Some(&mut j)).handled,
+        "duplicate swallowed"
+    );
+    assert_eq!(j.step, JoinStep::Requesting);
+    assert_eq!(
+        corr.pending,
+        Some(WizardOp::Join),
+        "join still awaits its reply"
+    );
+
+    let other = DaemonMessage::ShareFailed {
+        operation: "acquire_share_lease".into(),
+        share_id: None,
+        correlation_id: "c1".into(),
+        code: "x".into(),
+        message: "y".into(),
+    };
+    assert!(
+        !route(&other, &mut corr, Some(&mut f), Some(&mut j)).handled,
+        "not a wizard op"
+    );
+    let its_error = DaemonMessage::Error {
+        code: "x".into(),
+        message: "y [ref c1]".into(),
+    };
+    assert!(
+        route(&its_error, &mut corr, Some(&mut f), Some(&mut j)).handled,
+        "bare error to pending join"
+    );
+    assert!(matches!(j.step, JoinStep::RequestFailed(_)));
+}
+
+#[test]
+fn closed_or_revoked_share_ends_the_wizard() {
+    use super::route::{Correlation, route};
+    use trama_protocol::DaemonMessage;
+    let mut f = shared_flow();
+    let mut closed = snapshot("s1");
+    closed.status = ShareStatus::Closed;
+    let mut corr = Correlation::default();
+    assert!(
+        !route(
+            &DaemonMessage::Shares(vec![closed]),
+            &mut corr,
+            Some(&mut f),
+            None
+        )
+        .handled
+    );
+    assert_eq!(f.ended.as_deref(), Some("This share was closed."));
+    f.ask_remove("bob");
+    assert!(f.confirm_remove.is_none(), "no actions after the end");
+    assert!(f.refresh().len() == 2, "refresh still allowed to see state");
+
+    let mut g = shared_flow();
+    let revoked = DaemonMessage::ShareFailed {
+        operation: "list_share_members".into(),
+        share_id: Some("s1".into()),
+        correlation_id: "c2".into(),
+        code: "access_revoked".into(),
+        message: "gone".into(),
+    };
+    route(&revoked, &mut corr, Some(&mut g), None);
+    assert!(g.ended.as_deref().unwrap().contains("revoked"));
 }

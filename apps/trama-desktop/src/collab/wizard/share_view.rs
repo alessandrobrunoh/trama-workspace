@@ -116,6 +116,20 @@ impl ShareWizard {
         });
     }
 
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.store.update(cx, |store, cx| {
+            let messages = store
+                .vnext
+                .share
+                .as_ref()
+                .map(ShareFlow::refresh)
+                .unwrap_or_default();
+            for message in messages {
+                store.dispatch_wizard(WizardOp::Share, Some(message), cx);
+            }
+        });
+    }
+
     fn scope_step(&self, p: &Palette, flow: &ShareFlow, cx: &mut Context<Self>) -> Div {
         let mut options = v_flex().gap(theme::sp(1.5));
         for scope in [
@@ -331,7 +345,7 @@ impl Render for ShareWizard {
         };
         let blocked = matches!(&flow.step, ShareStep::Checked(_)) && flow.primary_label().is_none();
         let busy = matches!(flow.step, ShareStep::Checking | ShareStep::Creating);
-        let shared = matches!(flow.step, ShareStep::Shared(_));
+        let shared = matches!(flow.step, ShareStep::Shared(_)) && flow.ended.is_none();
         v_flex()
             .gap(theme::sp(4.))
             .child(
@@ -381,9 +395,7 @@ impl Render for ShareWizard {
                             Button::new("share-refresh")
                                 .small()
                                 .label("Refresh")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.act(cx, ShareFlow::refresh_requests)
-                                })),
+                                .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                         )
                     })
                     .when_some(flow.primary_label(), |this, label| {

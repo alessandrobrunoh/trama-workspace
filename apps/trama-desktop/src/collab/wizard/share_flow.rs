@@ -4,8 +4,8 @@
 use trama_domain::ids::ThreadId;
 use trama_domain::share::Capability;
 use trama_protocol::{
-    ClientMessage, ShareInvite, ShareJoinRequest, SharePreflightReport, ShareRole, ShareScope,
-    ShareSnapshot,
+    ClientMessage, ShareInvite, ShareJoinRequest, ShareMemberSnapshot, SharePreflightReport,
+    ShareRole, ShareScope, ShareSnapshot, ShareStatus,
 };
 
 use crate::collab::valid_name;
@@ -34,8 +34,13 @@ pub struct ShareFlow {
     pub requests: Vec<ShareJoinRequest>,
     /// Device being approved, to disable its button.
     pub approving: Option<String>,
-    /// Usernames with a grant (invited at creation or admitted since).
+    /// Usernames with a grant, owner excluded. From `ShareMembers` once
+    /// loaded; until then the invites and admitted devices seen locally.
     pub members: Vec<String>,
+    /// Server roster (roles, devices), when `ListShareMembers` answered.
+    pub roster: Vec<ShareMemberSnapshot>,
+    /// The share ended for this device (closed, or access revoked).
+    pub ended: Option<String>,
     /// Member whose removal awaits confirmation.
     pub confirm_remove: Option<String>,
     /// Removal in flight.
@@ -69,6 +74,8 @@ impl ShareFlow {
             requests: Vec::new(),
             approving: None,
             members: Vec::new(),
+            roster: Vec::new(),
+            ended: None,
             confirm_remove: None,
             removing: None,
             error: None,
@@ -215,15 +222,65 @@ impl ShareFlow {
         }
     }
 
-    /// Created: load the admission queue.
-    pub fn apply_created(&mut self, share: ShareSnapshot) -> Option<ClientMessage> {
+    /// Created: load the roster and the admission queue.
+    pub fn apply_created(&mut self, share: ShareSnapshot) -> Vec<ClientMessage> {
         if self.step != ShareStep::Creating {
-            return None;
+            return Vec::new();
         }
-        let share_id = share.share_id.clone();
         self.members = self.invites.iter().map(|i| i.username.clone()).collect();
         self.step = ShareStep::Shared(share);
-        Some(ClientMessage::ListShareJoinRequests { share_id })
+        self.refresh()
+    }
+
+    /// Reloads roster and join requests.
+    pub fn refresh(&self) -> Vec<ClientMessage> {
+        let Some(share_id) = self.share_id().map(str::to_owned) else {
+            return Vec::new();
+        };
+        vec![
+            ClientMessage::ListShareMembers {
+                share_id: share_id.clone(),
+            },
+            ClientMessage::ListShareJoinRequests { share_id },
+        ]
+    }
+
+    pub fn apply_members(&mut self, share_id: &str, members: Vec<ShareMemberSnapshot>) {
+        if self.share_id() != Some(share_id) {
+            return;
+        }
+        self.members = members
+            .iter()
+            .filter(|m| m.role != ShareRole::Owner)
+            .map(|m| m.username.clone())
+            .collect();
+        self.roster = members;
+    }
+
+    pub fn member_info(&self, username: &str) -> Option<&ShareMemberSnapshot> {
+        self.roster.iter().find(|m| m.username == username)
+    }
+
+    /// The share is over for this device: no further actions.
+    pub fn end(&mut self, why: String) {
+        if self.share_id().is_some() {
+            self.ended = Some(why);
+            self.confirm_remove = None;
+            self.removing = None;
+            self.approving = None;
+        }
+    }
+
+    pub fn apply_status(&mut self, share: &ShareSnapshot) {
+        if self.share_id() != Some(share.share_id.as_str()) {
+            return;
+        }
+        if share.status == ShareStatus::Closed {
+            self.end("This share was closed.".into());
+        }
+        if let ShareStep::Shared(s) = &mut self.step {
+            s.status = share.status;
+        }
     }
 
     pub fn share_id(&self) -> Option<&str> {
@@ -231,11 +288,6 @@ impl ShareFlow {
             ShareStep::Shared(s) => Some(&s.share_id),
             _ => None,
         }
-    }
-
-    pub fn refresh_requests(&mut self) -> Option<ClientMessage> {
-        let share_id = self.share_id()?.to_owned();
-        Some(ClientMessage::ListShareJoinRequests { share_id })
     }
 
     pub fn apply_requests(&mut self, share_id: &str, requests: Vec<ShareJoinRequest>) {
@@ -246,7 +298,10 @@ impl ShareFlow {
 
     pub fn approve(&mut self, device_id: &str) -> Option<ClientMessage> {
         let share_id = self.share_id()?.to_owned();
-        if self.approving.is_some() || !self.requests.iter().any(|r| r.device_id == device_id) {
+        if self.ended.is_some()
+            || self.approving.is_some()
+            || !self.requests.iter().any(|r| r.device_id == device_id)
+        {
             return None;
         }
         self.approving = Some(device_id.to_owned());
@@ -257,9 +312,15 @@ impl ShareFlow {
         })
     }
 
-    pub fn apply_approved(&mut self, share_id: &str, device_id: &str, key_epoch: u64) {
+    /// Returns a roster reload: the server is the source of truth.
+    pub fn apply_approved(
+        &mut self,
+        share_id: &str,
+        device_id: &str,
+        key_epoch: u64,
+    ) -> Option<ClientMessage> {
         if self.share_id() != Some(share_id) {
-            return;
+            return None;
         }
         if let Some(i) = self.requests.iter().position(|r| r.device_id == device_id) {
             let user = self.requests.remove(i).username;
@@ -271,11 +332,15 @@ impl ShareFlow {
         if let ShareStep::Shared(s) = &mut self.step {
             s.key_epoch = Some(key_epoch);
         }
+        Some(ClientMessage::ListShareMembers {
+            share_id: share_id.to_owned(),
+        })
     }
 
     /// First click on "Remove": ask for confirmation.
     pub fn ask_remove(&mut self, username: &str) {
         if self.share_id().is_some()
+            && self.ended.is_none()
             && self.removing.is_none()
             && self.members.iter().any(|m| m == username)
         {
@@ -301,6 +366,8 @@ impl ShareFlow {
             return;
         }
         self.members.retain(|m| !m.eq_ignore_ascii_case(username));
+        self.roster
+            .retain(|m| !m.username.eq_ignore_ascii_case(username));
         self.requests
             .retain(|r| !r.username.eq_ignore_ascii_case(username));
         if self.removing.as_deref() == Some(username) {
