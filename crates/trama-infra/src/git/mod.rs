@@ -5,3 +5,4 @@ pub mod changes;
 pub mod checkout;
 pub mod conflicts;
 pub mod share_git;
+pub mod share_staging;
