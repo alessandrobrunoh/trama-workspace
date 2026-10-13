@@ -29,7 +29,7 @@ fn seal(
     Ok(STANDARD.encode(sealed))
 }
 
-fn open(
+pub(crate) fn open_manifest(
     cipher: &dyn PayloadCipher,
     share_id: &str,
     key_epoch: u64,
@@ -96,6 +96,7 @@ pub(crate) struct FetchedManifests {
 }
 
 /// Fetches `version` (0 = latest). `with_content` needs a `read_code` grant.
+#[cfg_attr(not(test), allow(dead_code))] // content path, deferred
 pub(crate) async fn fetch_manifests(
     client: &ShareClient,
     cipher: &dyn PayloadCipher,
@@ -111,7 +112,7 @@ pub(crate) async fn fetch_manifests(
         let blob = client
             .manifest(share_id, history.version, ManifestPart::Content)
             .await?;
-        Some(open(
+        Some(open_manifest(
             cipher,
             share_id,
             key_epoch,
@@ -123,7 +124,7 @@ pub(crate) async fn fetch_manifests(
     };
     Ok(FetchedManifests {
         version: history.version,
-        history: open(
+        history: open_manifest(
             cipher,
             share_id,
             key_epoch,

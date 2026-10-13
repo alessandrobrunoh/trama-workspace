@@ -6,7 +6,9 @@ use trama_collab_protocol::vnext::api::{
     PublishShareEventsRequest, PublishShareEventsResponse, RegisterShareRequest, ShareEventsPage,
     ShareInfo, ShareMemberRequest,
 };
-use trama_collab_protocol::vnext::api::{KeyPackageRequest, PendingKeyPackage, WelcomeBlob};
+use trama_collab_protocol::vnext::api::{
+    KeyPackageRequest, PendingKeyPackage, RevokedMember, WelcomeBlob,
+};
 use trama_collab_protocol::vnext::events::ShareEventEnvelope;
 
 use super::super::http::{Endpoint, Ws};
@@ -178,5 +180,17 @@ impl ShareClient {
         validate_id(device_id)?;
         let path = Self::path(share_id, &format!("/welcomes/{device_id}"))?;
         self.call(Method::GET, &path, None::<&()>).await
+    }
+
+    pub async fn revoke_member(&self, share_id: &str, username: &str) -> Result<RevokedMember> {
+        if username.is_empty()
+            || !username
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err(DaemonError::Invalid("invalid username".into()));
+        }
+        let path = Self::path(share_id, &format!("/members/{username}/revoke"))?;
+        self.call(Method::POST, &path, None::<&()>).await
     }
 }

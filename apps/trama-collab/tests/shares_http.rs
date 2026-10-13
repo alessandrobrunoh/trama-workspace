@@ -383,3 +383,45 @@ async fn key_packages_and_welcomes_flow_between_owner_and_device() {
     let (status, _) = h.call("POST", "/v3/shares/sh1/key-packages", &c, kp).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn owner_revokes_a_member_and_gets_their_devices() {
+    let h = H::new().await;
+    let (a, b, _c) = h.share().await;
+    let kp = json!({"device_id": "db", "key_package": "a3A="});
+    let (status, _) = h.call("POST", "/v3/shares/sh1/key-packages", &b, kp).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = h
+        .call(
+            "POST",
+            "/v3/shares/sh1/members/alice/revoke",
+            &b,
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = h
+        .call(
+            "POST",
+            "/v3/shares/sh1/members/alice/revoke",
+            &a,
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, got) = h
+        .call("POST", "/v3/shares/sh1/members/bob/revoke", &a, Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got["devices"], json!(["db"]));
+    let (status, _) = h.call("GET", "/v3/shares/sh1", &b, Value::Null).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, pending) = h
+        .call("GET", "/v3/shares/sh1/key-packages", &a, Value::Null)
+        .await;
+    assert!(pending.as_array().unwrap().is_empty());
+    let (status, _) = h
+        .call("POST", "/v3/shares/sh1/members/bob/revoke", &a, Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

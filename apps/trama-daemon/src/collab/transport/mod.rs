@@ -14,7 +14,9 @@ mod manifests;
 mod stream;
 
 pub(crate) use client::ShareClient;
-pub(crate) use manifests::{fetch_manifests, publish_manifests};
+#[cfg(test)]
+pub(crate) use manifests::fetch_manifests;
+pub(crate) use manifests::{open_manifest, publish_manifests};
 
 #[cfg(test)]
 mod tests;

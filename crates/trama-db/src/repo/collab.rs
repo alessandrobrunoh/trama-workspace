@@ -365,6 +365,22 @@ impl TramaDb {
         .await
     }
 
+    /// Write a daemon-wide value.
+    pub async fn set_collab_setting(&self, key: &str, value: &str) -> Result<()> {
+        let key = key.to_owned();
+        let value = value.to_owned();
+        self.blocking(move |conn| {
+            conn.execute(
+                "INSERT INTO collab_settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .map(|_| ())
+            .map_err(sql_err)
+        })
+        .await
+    }
+
     /// Read a daemon-wide value, inserting `default` first when it is absent.
     pub async fn collab_setting_or_insert(&self, key: &str, default: &str) -> Result<String> {
         let key = key.to_owned();

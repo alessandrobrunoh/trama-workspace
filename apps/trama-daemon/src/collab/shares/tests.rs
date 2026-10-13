@@ -225,6 +225,97 @@ async fn owner_shares_device_joins_and_history_flows_encrypted() {
         .await;
     assert_eq!(shares.len(), 1);
     assert_eq!(shares[0].key_epoch, Some(1));
+
+    // Bob holds the lease: his local turn is published to Alice.
+    bob.sessions
+        .db()
+        .append_message(&local_message(&bob_root, "hi from bob"))
+        .await
+        .unwrap();
+    assert_eq!(
+        bob.collab.publish_local_history(&bob_root).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        bob.collab.publish_local_history(&bob_root).await.unwrap(),
+        0
+    );
+    eventually("bob's turn reached alice", || async {
+        alice
+            .messages(&root)
+            .await
+            .iter()
+            .any(|m| format!("{:?}", m.content).contains("hi from bob"))
+    })
+    .await;
+    // Alice has no lease on her root: nothing is published.
+    alice
+        .sessions
+        .db()
+        .append_message(&local_message(&root, "unleased"))
+        .await
+        .unwrap();
+    assert_eq!(alice.collab.publish_local_history(&root).await.unwrap(), 0);
+
+    // Snapshots re-read from the sealed cache (an MLS message opens once).
+    let (_, bob_client) = bob.collab.share_client().unwrap();
+    for _ in 0..2 {
+        let m = bob
+            .collab
+            .read_history_snapshot(&bob_client, &share_id)
+            .await
+            .unwrap();
+        assert_eq!(m.snapshot_version, 2);
+    }
+    let (_, alice_client) = alice.collab.share_client().unwrap();
+    alice
+        .collab
+        .read_history_snapshot(&alice_client, &share_id)
+        .await
+        .unwrap();
+
+    // Revocation: grant gone, device out of the group, new epoch.
+    let (devices, key_epoch) = a
+        .request(
+            ClientMessage::RemoveShareMember {
+                share_id: share_id.clone(),
+                username: "bob".into(),
+            },
+            "member removed",
+            |m| {
+                fail(m);
+                match m {
+                    DaemonMessage::ShareMemberRemoved {
+                        devices, key_epoch, ..
+                    } => Some((devices.clone(), *key_epoch)),
+                    _ => None,
+                }
+            },
+        )
+        .await;
+    assert_eq!(devices, vec![device]);
+    assert_eq!(key_epoch, 2);
+    assert!(bob_client.info(&share_id).await.is_err());
+    let snapshot = alice.collab.share_snapshot(&share_id).await.unwrap();
+    assert_eq!(snapshot.snapshot_version, 3);
+}
+
+fn local_message(
+    thread: &trama_domain::ids::ThreadId,
+    text: &str,
+) -> trama_domain::message::Message {
+    use trama_domain::message::{Actor, ContentBlock, Message, Role};
+    Message {
+        id: trama_domain::ids::MessageId::generate(),
+        thread_id: thread.clone(),
+        parent_id: None,
+        actor: Actor::Human { id: "local".into() },
+        role: Role::User,
+        content: vec![ContentBlock::Text { text: text.into() }],
+        created_at: chrono::Utc::now(),
+        claude_uuid: None,
+        annotation: None,
+    }
 }
 
 fn repo(dir: &Path) {

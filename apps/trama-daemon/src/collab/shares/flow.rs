@@ -36,7 +36,7 @@ pub(crate) const REQUIRED: &[Capability] = &[
     Capability::WriterLeases,
 ];
 
-fn role_key(share_id: &str) -> String {
+pub(crate) fn role_key(share_id: &str) -> String {
     format!("share_role:{share_id}")
 }
 
@@ -206,6 +206,7 @@ impl CollabService {
         self.db()
             .set_share_status(&share, ShareStatus::Ready)
             .await?;
+        self.init_history_marks(&share_id).await?;
         self.ensure_share_stream(&share_id, connection.generation);
         Ok(Ok(self.share_snapshot(&share_id).await?))
     }
@@ -414,6 +415,7 @@ impl CollabService {
         self.db()
             .collab_setting_or_insert(&role_key(share_id), &role)
             .await?;
+        self.init_history_marks(share_id).await?;
         self.ensure_share_stream(share_id, connection.generation);
         self.share_snapshot(share_id).await
     }
@@ -426,18 +428,5 @@ impl CollabService {
             ));
         }
         self.publish_history_snapshot(&client, share_id).await
-    }
-}
-
-impl CollabService {
-    /// Owner: revokes a member (filled in by the revoke flow).
-    pub(crate) async fn remove_share_member(
-        &self,
-        _share_id: &str,
-        _username: &str,
-    ) -> Result<(Vec<String>, u64)> {
-        Err(DaemonError::Invalid(
-            "member removal is not available yet".into(),
-        ))
     }
 }

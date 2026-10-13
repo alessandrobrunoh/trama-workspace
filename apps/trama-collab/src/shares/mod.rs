@@ -10,6 +10,7 @@ mod keys;
 mod leases;
 mod manifests;
 mod members;
+mod revoke;
 mod stream;
 
 use axum::{
@@ -84,6 +85,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/v3/shares", post(members::register))
         .route("/v3/shares/{share_id}", get(members::info))
         .route("/v3/shares/{share_id}/members", post(members::add_member))
+        .route(
+            "/v3/shares/{share_id}/members/{username}/revoke",
+            post(revoke::revoke),
+        )
         .route(
             "/v3/shares/{share_id}/events",
             post(events::publish).get(events::list),

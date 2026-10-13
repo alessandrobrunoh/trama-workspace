@@ -5,7 +5,9 @@
 mod flow;
 mod inbound;
 mod leases;
+mod members;
 mod outbound;
+mod outgoing;
 mod preflight;
 mod scan;
 mod snapshot;

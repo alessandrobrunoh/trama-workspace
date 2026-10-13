@@ -16,8 +16,11 @@ use trama_domain::share::{DeviceId, ShareId, SharedThreadKind};
 
 use super::super::CollabService;
 use super::super::e2ee::mls_err;
-use super::super::transport::{ShareClient, fetch_manifests, publish_manifests};
+use super::super::transport::{ShareClient, open_manifest, publish_manifests};
 use crate::error::{DaemonError, Result};
+use trama_collab_protocol::vnext::api::ManifestPart;
+use trama_collab_protocol::vnext::cipher::PayloadKind;
+use trama_domain::manifest::SignedEnvelope;
 
 pub(crate) fn kind_str(kind: SharedThreadKind) -> String {
     serde_json::to_value(kind)
@@ -105,7 +108,7 @@ impl CollabService {
         let expected = row
             .current_snapshot_version
             .max(info.latest_manifest_version);
-        publish_manifests(
+        let version = publish_manifests(
             client,
             &db,
             cipher.as_ref(),
@@ -115,7 +118,10 @@ impl CollabService {
             &envelope,
             None,
         )
-        .await
+        .await?;
+        // MLS cannot decrypt our own ciphertext: keep the plaintext.
+        self.cache_snapshot(share_id, version, &envelope).await?;
+        Ok(version)
     }
 
     /// Joiner: fetches, decrypts and verifies the latest history snapshot.
@@ -126,9 +132,29 @@ impl CollabService {
     ) -> Result<HistoryManifestV1> {
         let e2ee = self.e2ee()?;
         let epoch = self.share_epoch(share_id).await?;
-        let fetched =
-            fetch_manifests(client, e2ee.cipher.as_ref(), share_id, epoch, 0, false).await?;
-        let envelope = fetched.history;
+        let blob = client.manifest(share_id, 0, ManifestPart::History).await?;
+        let envelope = match self.cached_snapshot(share_id, blob.version).await? {
+            Some(envelope) => envelope,
+            None => {
+                // An MLS message decrypts once; the cache makes re-reads work.
+                let (cipher, id) = (e2ee.cipher.clone(), share_id.to_owned());
+                let text = blob.ciphertext.clone();
+                let envelope = tokio::task::spawn_blocking(move || {
+                    open_manifest(
+                        cipher.as_ref(),
+                        &id,
+                        epoch,
+                        PayloadKind::HistoryManifest,
+                        &text,
+                    )
+                })
+                .await
+                .map_err(|e| DaemonError::Collab(e.to_string()))??;
+                self.cache_snapshot(share_id, blob.version, &envelope)
+                    .await?;
+                envelope
+            }
+        };
         let key_id = envelope.key_id.clone();
         let raw = key_id
             .strip_prefix("ed25519:")
@@ -148,5 +174,38 @@ impl CollabService {
             .await
             .map_err(|e| DaemonError::Collab(e.to_string()))??;
         Ok(manifest)
+    }
+
+    /// Decrypted snapshot of `version`, sealed at rest; only the latest is
+    /// kept. The signature is re-checked on every read.
+    pub(crate) async fn cache_snapshot(
+        &self,
+        share_id: &str,
+        version: u64,
+        envelope: &SignedEnvelope,
+    ) -> Result<()> {
+        let e2ee = self.e2ee()?;
+        let body = serde_json::to_vec(&(version, envelope))
+            .map_err(|e| DaemonError::Invalid(e.to_string()))?;
+        let name = format!("snapshot:{share_id}");
+        tokio::task::spawn_blocking(move || e2ee.put_sealed(&name, &body))
+            .await
+            .map_err(|e| DaemonError::Collab(e.to_string()))?
+    }
+
+    pub(crate) async fn cached_snapshot(
+        &self,
+        share_id: &str,
+        version: u64,
+    ) -> Result<Option<SignedEnvelope>> {
+        let e2ee = self.e2ee()?;
+        let name = format!("snapshot:{share_id}");
+        let body = tokio::task::spawn_blocking(move || e2ee.get_sealed(&name))
+            .await
+            .map_err(|e| DaemonError::Collab(e.to_string()))??;
+        Ok(body
+            .and_then(|b| serde_json::from_slice::<(u64, SignedEnvelope)>(&b).ok())
+            .filter(|(v, _)| *v == version)
+            .map(|(_, envelope)| envelope))
     }
 }

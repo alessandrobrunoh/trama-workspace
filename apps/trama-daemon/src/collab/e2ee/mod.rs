@@ -101,6 +101,15 @@ impl E2ee {
         }
     }
 
+    /// Generic sealed blobs (snapshot cache). Blocking.
+    pub(crate) fn put_sealed(&self, name: &str, value: &[u8]) -> Result<()> {
+        self.store.put(name, value)
+    }
+
+    pub(crate) fn get_sealed(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.store.get(name)
+    }
+
     pub(crate) fn device_id(&self) -> &str {
         self.identity.device_id()
     }

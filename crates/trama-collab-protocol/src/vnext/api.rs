@@ -191,3 +191,12 @@ pub struct WelcomeBlob {
     /// Group epoch the Welcome joins at.
     pub epoch: u64,
 }
+
+/// Reply to `POST /v3/shares/{id}/members/{username}/revoke` (owner):
+/// the grant, device bindings, key packages and leases of that user are
+/// gone; `devices` must now be removed from the MLS group by the owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokedMember {
+    pub username: String,
+    pub devices: Vec<String>,
+}
