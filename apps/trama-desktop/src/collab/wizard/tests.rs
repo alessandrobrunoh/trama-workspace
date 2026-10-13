@@ -237,3 +237,46 @@ fn join_request_failure_can_retry_or_reset() {
     j.reset();
     assert_eq!(j.step, JoinStep::Enter);
 }
+
+#[test]
+fn router_delivers_replies_and_errors_to_the_pending_wizard() {
+    use super::route::{WizardOp, route};
+    use trama_protocol::DaemonMessage;
+    let mut f = flow();
+    let mut j = JoinFlow::new(WorkspaceId::from("w"));
+    let mut pending = Some(WizardOp::Share);
+    to_checks(&mut f);
+    let r = route(
+        &DaemonMessage::SharePreflightReport(report(vec![])),
+        &mut pending,
+        Some(&mut f),
+        Some(&mut j),
+    );
+    assert!(r.handled && pending.is_none());
+    f.next();
+    pending = Some(WizardOp::Share);
+    let r = route(
+        &DaemonMessage::ShareCreated(snapshot("s1")),
+        &mut pending,
+        Some(&mut f),
+        None,
+    );
+    assert!(matches!(
+        r.follow_up,
+        Some(ClientMessage::ListShareJoinRequests { .. })
+    ));
+    assert_eq!(pending, Some(WizardOp::Share));
+
+    j.start("s9");
+    pending = Some(WizardOp::Join);
+    let err = DaemonMessage::Error {
+        code: "unsupported".into(),
+        message: "nope".into(),
+    };
+    assert!(route(&err, &mut pending, Some(&mut f), Some(&mut j)).handled);
+    assert!(matches!(j.step, JoinStep::RequestFailed(_)));
+    assert!(
+        !route(&err, &mut pending, Some(&mut f), Some(&mut j)).handled,
+        "unowned errors pass through"
+    );
+}
