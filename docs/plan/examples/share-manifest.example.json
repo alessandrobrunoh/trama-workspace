@@ -1,0 +1,109 @@
+{
+  "$comment": "ESEMPIO ILLUSTRATIVO, NON FIRMATO, NON VALIDO PER UN SERVER v2 REALE. Le stringhe OID sono segnaposto e NON hash Git utilizzabili.",
+  "schema_version": 1,
+  "share_id": "share_demo_payments_01",
+  "scope": "subtree",
+  "root_thread_gids": ["thread_main"],
+  "include_future_descendants": true,
+  "snapshot_version": 4,
+  "created_at": "2026-10-13T08:00:00Z",
+  "publisher_device_id": "device_alice_demo",
+  "history_cursor": "cursor_demo_220",
+  "repositories": [
+    {
+      "repo_gid": "repo_backend",
+      "alias": "backend",
+      "origin_hint": "git@github.com:acme/payments-backend.git",
+      "origin_identity_hint": "acme/payments-backend",
+      "git_object_format": "sha1",
+      "requires_git_clone_permission": true,
+      "lfs_policy": "fetch_from_origin_if_required",
+      "submodule_policy": "explicit_consent_required"
+    },
+    {
+      "repo_gid": "repo_frontend",
+      "alias": "frontend",
+      "origin_hint": "git@github.com:acme/payments-frontend.git",
+      "origin_identity_hint": "acme/payments-frontend",
+      "git_object_format": "sha1",
+      "requires_git_clone_permission": true,
+      "lfs_policy": "fetch_from_origin_if_required",
+      "submodule_policy": "explicit_consent_required"
+    }
+  ],
+  "threads": [
+    {"thread_gid": "thread_main", "parent_gid": null, "kind": "plain", "title": "Main Thread", "fork_origin": null},
+    {"thread_gid": "thread_auth", "parent_gid": "thread_main", "kind": "plain", "title": "Auth", "fork_origin": {"parent_thread_gid": "thread_main", "checkpoint_id": "checkpoint_01"}},
+    {"thread_gid": "thread_review", "parent_gid": "thread_auth", "kind": "review", "title": "Auth Review", "fork_origin": {"parent_thread_gid": "thread_auth", "checkpoint_id": "checkpoint_09"}}
+  ],
+  "checkouts": [
+    {
+      "thread_gid": "thread_main",
+      "repo_gid": "repo_backend",
+      "checkout_mode": "independent",
+      "owner_thread_gid": "thread_main",
+      "generation": 4,
+      "state_id": "state_main_backend_4",
+      "base_commit": "OID_BASE_MAIN_BACKEND",
+      "head_commit": "OID_HEAD_MAIN_BACKEND",
+      "index_tree": "OID_INDEX_MAIN_BACKEND",
+      "working_tree": "OID_WORK_MAIN_BACKEND",
+      "branch_ref": "refs/heads/main",
+      "fork_point": null,
+      "object_index_refs": ["content_backend_001"]
+    },
+    {
+      "thread_gid": "thread_main",
+      "repo_gid": "repo_frontend",
+      "checkout_mode": "independent",
+      "owner_thread_gid": "thread_main",
+      "generation": 4,
+      "state_id": "state_main_frontend_4",
+      "base_commit": "OID_BASE_MAIN_FRONTEND",
+      "head_commit": "OID_HEAD_MAIN_FRONTEND",
+      "index_tree": "OID_INDEX_MAIN_FRONTEND",
+      "working_tree": "OID_WORK_MAIN_FRONTEND",
+      "branch_ref": "refs/heads/main",
+      "fork_point": null,
+      "object_index_refs": ["content_frontend_001"]
+    },
+    {
+      "thread_gid": "thread_auth",
+      "repo_gid": "repo_backend",
+      "checkout_mode": "independent",
+      "owner_thread_gid": "thread_auth",
+      "generation": 2,
+      "state_id": "state_auth_backend_2",
+      "base_commit": "OID_BASE_AUTH_BACKEND",
+      "head_commit": "OID_HEAD_AUTH_BACKEND",
+      "index_tree": "OID_INDEX_AUTH_BACKEND",
+      "working_tree": "OID_WORK_AUTH_BACKEND",
+      "branch_ref": "refs/heads/feature-auth",
+      "fork_point": "OID_FORK_POINT_AUTH_BACKEND",
+      "object_index_refs": ["content_backend_001", "content_backend_002"]
+    },
+    {
+      "thread_gid": "thread_review",
+      "repo_gid": "repo_backend",
+      "checkout_mode": "independent",
+      "owner_thread_gid": "thread_review",
+      "generation": 1,
+      "state_id": "state_review_backend_1",
+      "base_commit": "OID_BASE_REVIEW_BACKEND",
+      "head_commit": "OID_HEAD_REVIEW_BACKEND",
+      "index_tree": "OID_INDEX_REVIEW_BACKEND",
+      "working_tree": "OID_WORK_REVIEW_BACKEND",
+      "branch_ref": null,
+      "fork_point": "OID_FORK_POINT_REVIEW_BACKEND",
+      "object_index_refs": ["content_backend_003"]
+    }
+  ],
+  "object_index": [
+    {"content_id": "content_backend_001", "ciphertext_hash": "HASH_CIPHERTEXT_001", "byte_len": 1024, "key_epoch": 3, "parts": ["chunk_001"]},
+    {"content_id": "content_backend_002", "ciphertext_hash": "HASH_CIPHERTEXT_002", "byte_len": 2048, "key_epoch": 3, "parts": ["chunk_002"]},
+    {"content_id": "content_backend_003", "ciphertext_hash": "HASH_CIPHERTEXT_003", "byte_len": 256, "key_epoch": 3, "parts": ["chunk_003"]},
+    {"content_id": "content_frontend_001", "ciphertext_hash": "HASH_CIPHERTEXT_004", "byte_len": 512, "key_epoch": 3, "parts": ["chunk_004"]}
+  ],
+  "content_policy": {"ignored_files_exported": false, "untracked": "review_required", "excluded_path_classes": ["secrets", "build_cache", "machine_local"]},
+  "signed_envelope": "OMITTED: il payload di esempio va cifrato e firmato con un envelope canonico prima dell'uso reale"
+}
