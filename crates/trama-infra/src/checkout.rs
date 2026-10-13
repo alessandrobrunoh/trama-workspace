@@ -616,8 +616,10 @@ impl CheckoutManager {
                 !entries.is_empty()
                     && entries.into_iter().all(|entry| {
                         entry.is_ok_and(|entry| {
-                            let path = Path::new(".trama").join(entry.file_name());
-                            TRACKED_TRAMA_CONFIG.contains(&path.as_os_str().as_encoded_bytes())
+                            // Git-style `/` on every platform (as `ls-files` prints).
+                            let mut path = b".trama/".to_vec();
+                            path.extend_from_slice(entry.file_name().as_encoded_bytes());
+                            TRACKED_TRAMA_CONFIG.contains(&path.as_slice())
                                 && entry.file_type().is_ok_and(|kind| kind.is_file())
                         })
                     })
