@@ -173,6 +173,9 @@ impl Workspace {
         let disk_usage = cx.new(|_| DiskUsageView::new());
 
         let subscriptions = vec![
+            cx.observe_in(&collab, window, |this, _, window, cx| {
+                this.resume_deferred(window, cx);
+            }),
             cx.observe(&collab, |this, collab, cx| {
                 let view = collab.read(cx).sidebar();
                 this.sidebar.update(cx, |sidebar, cx| {

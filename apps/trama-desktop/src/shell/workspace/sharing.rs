@@ -7,8 +7,7 @@ impl Workspace {
         if !self.connected {
             return;
         }
-        if self.collab.read(cx).vnext_supported() {
-            self.open_share_wizard(window, cx);
+        if self.route_share(window, cx) {
             return;
         }
         let (thread, title) = {
@@ -81,8 +80,7 @@ impl Workspace {
         if !self.connected {
             return;
         }
-        if self.collab.read(cx).vnext_supported() {
-            self.open_join_wizard(window, cx);
+        if self.route_join(window, cx) {
             return;
         }
         window.close_all_dialogs(cx);

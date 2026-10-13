@@ -21,8 +21,27 @@ pub fn supports_vnext(info: Option<&CollabServerInfo>) -> bool {
         .is_some_and(|p| p.protocol >= MIN_VNEXT_PROTOCOL && p.supports(CollabCapability::E2ee))
 }
 
+/// What the Share/Join actions should open right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerSupport {
+    /// Discovery in flight: show "Checking server…", never the v2 dialog.
+    Checking,
+    VNext,
+    /// Definitive answer (v2, no e2ee, failed negotiation) or signed out.
+    Legacy,
+}
+
+/// A Share/Join action waiting for the server check to finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredOpen {
+    Share,
+    Join,
+}
+
 #[derive(Debug, Default)]
 pub struct VNextState {
+    /// Action to open once [`ServerSupport`] is no longer `Checking`.
+    pub deferred: Option<DeferredOpen>,
     /// Last discovery result, for the server it names.
     pub server: Option<CollabServerInfo>,
     /// Server URL a discovery is in flight for.
@@ -78,6 +97,52 @@ impl VNextState {
         supports_vnext(self.server.as_ref())
     }
 
+    pub fn support(&self) -> ServerSupport {
+        if self.discovering.is_some() {
+            ServerSupport::Checking
+        } else if self.supported() {
+            ServerSupport::VNext
+        } else {
+            ServerSupport::Legacy
+        }
+    }
+
+    /// The deferred action, once the check is over.
+    pub fn take_deferred(&mut self) -> Option<DeferredOpen> {
+        if self.support() == ServerSupport::Checking {
+            return None;
+        }
+        self.deferred.take()
+    }
+
+    /// Opens (or resumes) the Share wizard for `thread`. A wizard for the
+    /// same thread is kept, including a request in flight.
+    pub fn open_share(&mut self, thread: ThreadId, title: String) {
+        if self.share.as_ref().is_some_and(|f| f.thread_id == thread) {
+            return;
+        }
+        if self.pending == Some(WizardOp::Share) {
+            self.pending = None;
+        }
+        self.share = Some(ShareFlow::new(thread, title));
+    }
+
+    /// Opens (or resumes) the Join wizard. An unfinished join is resumed;
+    /// a finished one starts over.
+    pub fn open_join(&mut self, workspace: WorkspaceId) {
+        use super::wizard::join_flow::JoinStep;
+        let resumable = self
+            .join
+            .as_ref()
+            .is_some_and(|f| !matches!(f.step, JoinStep::Enter | JoinStep::Joined(_)));
+        if !resumable {
+            if self.pending == Some(WizardOp::Join) {
+                self.pending = None;
+            }
+            self.join = Some(JoinFlow::new(workspace));
+        }
+    }
+
     /// Routes a wizard reply. Returns `(handled, follow_up)`.
     pub fn apply(&mut self, message: &DaemonMessage) -> (bool, Option<ClientMessage>) {
         if let DaemonMessage::CollabServerInfo(info) = message {
@@ -85,6 +150,9 @@ impl VNextState {
             return (true, None);
         }
         if matches!(message, DaemonMessage::Error { .. }) && self.pending.is_none() {
+            // An uncorrelated error while checking: treat the check as
+            // failed (v2 fallback) but let the error reach its owner.
+            self.discovering = None;
             return (false, None);
         }
         let r = route(
@@ -118,24 +186,23 @@ impl VNextState {
 }
 
 impl CollabStore {
-    pub fn vnext_supported(&self) -> bool {
-        self.vnext.supported()
+    pub fn server_support(&self) -> ServerSupport {
+        self.vnext.support()
     }
 
     pub fn open_share_wizard(&mut self, thread: ThreadId, title: String, cx: &mut Context<Self>) {
-        self.vnext.share = Some(ShareFlow::new(thread, title));
+        self.vnext.open_share(thread, title);
         cx.notify();
     }
 
     pub fn open_join_wizard(&mut self, workspace: WorkspaceId, cx: &mut Context<Self>) {
-        self.vnext.join = Some(JoinFlow::new(workspace));
+        self.vnext.open_join(workspace);
         cx.notify();
     }
 
-    pub fn close_wizards(&mut self, cx: &mut Context<Self>) {
-        self.vnext.share = None;
-        self.vnext.join = None;
-        self.vnext.pending = None;
+    /// Remember an action to open once the server check is over.
+    pub fn defer_open(&mut self, open: DeferredOpen, cx: &mut Context<Self>) {
+        self.vnext.deferred = Some(open);
         cx.notify();
     }
 
@@ -168,7 +235,11 @@ impl CollabStore {
             }
             return false;
         }
+        let was_checking = self.vnext.support() == ServerSupport::Checking;
         let (handled, follow_up) = self.vnext.apply(message);
+        if was_checking && self.vnext.support() != ServerSupport::Checking {
+            cx.notify();
+        }
         if follow_up.is_some() {
             self.dispatch_wizard(WizardOp::Share, follow_up, cx);
         }
@@ -280,5 +351,78 @@ mod tests {
             v.share.as_ref().unwrap().step,
             super::super::wizard::share_flow::ShareStep::Failed(_)
         ));
+    }
+
+    #[test]
+    fn support_is_checking_until_a_definitive_answer() {
+        let mut v = VNextState::default();
+        assert_eq!(v.support(), ServerSupport::Legacy, "signed out");
+        v.on_status(Some("https://a"), true);
+        assert_eq!(v.support(), ServerSupport::Checking);
+        v.deferred = Some(DeferredOpen::Share);
+        assert_eq!(v.take_deferred(), None, "still checking");
+        let mut failed = info("https://a", 3, vec![]);
+        failed.profile = None;
+        failed.error = Some("timeout".into());
+        v.apply(&DaemonMessage::CollabServerInfo(failed));
+        assert_eq!(v.support(), ServerSupport::Legacy);
+        assert_eq!(v.take_deferred(), Some(DeferredOpen::Share));
+        assert_eq!(v.take_deferred(), None);
+
+        v.on_status(Some("https://b"), true);
+        let err = DaemonMessage::Error {
+            code: "x".into(),
+            message: "y".into(),
+        };
+        assert!(!v.apply(&err).0, "error still reaches its owner");
+        assert_eq!(
+            v.support(),
+            ServerSupport::Legacy,
+            "failed check falls back"
+        );
+        v.on_status(Some("https://c"), true);
+        v.apply(&DaemonMessage::CollabServerInfo(info(
+            "https://c",
+            3,
+            vec![CollabCapability::E2ee],
+        )));
+        assert_eq!(v.support(), ServerSupport::VNext);
+    }
+
+    #[test]
+    fn reopening_resumes_wizards() {
+        use super::super::wizard::join_flow::JoinStep;
+        use super::super::wizard::share_flow::ShareStep;
+        let mut v = VNextState::default();
+        v.open_share(ThreadId::from("t"), "T".into());
+        let f = v.share.as_mut().unwrap();
+        f.next();
+        f.next();
+        v.sent(WizardOp::Share);
+        v.open_share(ThreadId::from("t"), "T".into());
+        assert_eq!(
+            v.share.as_ref().unwrap().step,
+            ShareStep::Checking,
+            "resumed"
+        );
+        assert_eq!(v.pending, Some(WizardOp::Share), "reply still expected");
+        v.open_share(ThreadId::from("u"), "U".into());
+        assert_eq!(
+            v.share.as_ref().unwrap().step,
+            ShareStep::Scope,
+            "other thread starts over"
+        );
+        assert_eq!(v.pending, None);
+
+        v.open_join(WorkspaceId::from("w"));
+        v.join.as_mut().unwrap().start("s1");
+        v.open_join(WorkspaceId::from("w"));
+        assert_eq!(v.join.as_ref().unwrap().step, JoinStep::Requesting);
+        v.join.as_mut().unwrap().reset();
+        v.open_join(WorkspaceId::from("w2"));
+        assert_eq!(
+            v.join.as_ref().unwrap().workspace_id,
+            WorkspaceId::from("w2")
+        );
     }
 }
