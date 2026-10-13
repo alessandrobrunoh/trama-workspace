@@ -35,7 +35,9 @@ async fn disk_usage_lists_checkouts_by_private_size() {
         .await
         .unwrap();
     let big_checkout = checkout(&mgr, &big.id).await;
-    // Build output only this thread has.
+    // Build output only this thread has. (`target/` is cloned copy-on-write
+    // on macOS; the portable plain-clone fallback has no ignored files.)
+    std::fs::create_dir_all(big_checkout.join("target")).unwrap();
     std::fs::write(big_checkout.join("target/new.bin"), vec![2u8; 1 << 20]).unwrap();
 
     let items = mgr.disk_usage(Some(&fixture.workspace)).await.unwrap();
@@ -47,7 +49,9 @@ async fn disk_usage_lists_checkouts_by_private_size() {
     assert!(items[0].private_bytes >= 1 << 20, "{:?}", items[0]);
     assert!(items[1].private_bytes < 256 * 1024, "{:?}", items[1]);
     // Both see the cloned build output in their apparent size.
-    assert!(items[1].apparent_bytes >= 512 * 1024);
+    if cfg!(target_os = "macos") {
+        assert!(items[1].apparent_bytes >= 512 * 1024);
+    }
     assert!(items.iter().all(|item| item.last_active.is_some()));
     assert!(mgr.disk_usage(None).await.unwrap().len() >= 2);
 }
