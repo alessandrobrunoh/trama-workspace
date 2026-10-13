@@ -591,7 +591,7 @@ pub(super) fn tail_lines(text: &str, max_lines: usize, max_bytes: usize) -> (Str
 }
 
 /// Used by tests to wait for a terminal's exit.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn exit_of(manager: &SessionManager, terminal_id: &str) -> Option<TerminalExitStatus> {
     manager
         .terminals()

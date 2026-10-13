@@ -686,6 +686,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn tempfile_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "trama-claude-{label}-{}-{}",

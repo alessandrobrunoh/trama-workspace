@@ -542,7 +542,8 @@ impl SessionManager {
             })?;
             match attachment.attach_mode {
                 AttachMode::Isolated => {
-                    let checkout_id = attachment.checkout_id.as_ref().ok_or_else(|| {
+                    // Only validated here: legacy threads must be migrated first.
+                    let _checkout_id = attachment.checkout_id.as_ref().ok_or_else(|| {
                         DaemonError::Invalid(format!(
                             "thread {} predates managed checkouts. Migrate it explicitly (migrate_legacy_thread) before sending. The original files are left untouched, and this prompt was not run",
                             thread.id

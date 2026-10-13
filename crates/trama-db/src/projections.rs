@@ -4,7 +4,7 @@ use crate::codec::{
 };
 use crate::store::TramaDb;
 use chrono::Utc;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use std::path::{Path, PathBuf};
 use trama_domain::Result;
 use trama_domain::agent::{AgentSession, UsageReport};

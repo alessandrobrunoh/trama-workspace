@@ -60,6 +60,7 @@ pub(super) fn stored_assistant_transition(lifecycle: TurnLifecycle) -> TurnLifec
     }
 }
 
+#[cfg(test)]
 pub(super) fn record_message_id(seen: &mut HashSet<MessageId>, id: MessageId) -> bool {
     seen.insert(id)
 }

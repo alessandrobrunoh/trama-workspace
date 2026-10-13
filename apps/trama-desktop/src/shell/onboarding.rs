@@ -91,6 +91,7 @@ impl OnboardingRequest {
         }
     }
 
+    #[cfg(test)]
     pub fn sends_prompt(&self) -> bool {
         matches!(
             self.client_message(),

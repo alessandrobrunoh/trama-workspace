@@ -358,8 +358,9 @@ async fn net_loop(
                     .await;
                 break;
             }
-            Err(ConnectFailure::Unavailable(_)) => {
+            Err(ConnectFailure::Unavailable(reason)) => {
                 if announce_offline {
+                    eprintln!("trama daemon unavailable: {reason}");
                     announce_offline = false;
                     let _ = events.send(NetEvent::Disconnected).await;
                 }

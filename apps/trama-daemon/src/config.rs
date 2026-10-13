@@ -370,7 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn seeded_workspace_with_no_repos_is_created() {
-        let dir = tempdir().unwrap();
+        let _dir = tempdir().unwrap();
         let db = TramaDb::open_in_memory().unwrap();
         seed_from_config(
             &db,
