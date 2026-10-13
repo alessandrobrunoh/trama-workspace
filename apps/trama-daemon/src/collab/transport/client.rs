@@ -6,6 +6,7 @@ use trama_collab_protocol::vnext::api::{
     PublishShareEventsRequest, PublishShareEventsResponse, RegisterShareRequest, ShareEventsPage,
     ShareInfo, ShareMemberRequest,
 };
+use trama_collab_protocol::vnext::api::{KeyPackageRequest, PendingKeyPackage, WelcomeBlob};
 use trama_collab_protocol::vnext::events::ShareEventEnvelope;
 
 use super::super::http::{Endpoint, Ws};
@@ -105,6 +106,7 @@ impl ShareClient {
             .await
     }
 
+    #[allow(dead_code)] // catch-up without a socket; tests use it
     pub async fn events(&self, share_id: &str, after: u64) -> Result<ShareEventsPage> {
         let path = Self::path(share_id, &format!("/events?after={after}"))?;
         self.call(Method::GET, &path, None::<&()>).await
@@ -155,5 +157,26 @@ impl ShareClient {
             .websocket(&path, &self.token)
             .await
             .map_err(collab_error)
+    }
+
+    pub async fn post_key_package(&self, share_id: &str, body: &KeyPackageRequest) -> Result<()> {
+        let path = Self::path(share_id, "/key-packages")?;
+        self.call_empty(Method::POST, &path, Some(body)).await
+    }
+
+    pub async fn pending_key_packages(&self, share_id: &str) -> Result<Vec<PendingKeyPackage>> {
+        let path = Self::path(share_id, "/key-packages")?;
+        self.call(Method::GET, &path, None::<&()>).await
+    }
+
+    pub async fn post_welcome(&self, share_id: &str, body: &WelcomeBlob) -> Result<()> {
+        let path = Self::path(share_id, "/welcomes")?;
+        self.call_empty(Method::POST, &path, Some(body)).await
+    }
+
+    pub async fn welcome(&self, share_id: &str, device_id: &str) -> Result<WelcomeBlob> {
+        validate_id(device_id)?;
+        let path = Self::path(share_id, &format!("/welcomes/{device_id}"))?;
+        self.call(Method::GET, &path, None::<&()>).await
     }
 }

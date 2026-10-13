@@ -13,7 +13,7 @@ use super::super::CollabService;
 use crate::error::Result;
 
 impl CollabService {
-    async fn seed_share(&self, share_id: &str) -> Result<()> {
+    pub(crate) async fn seed_share(&self, share_id: &str) -> Result<()> {
         if self.share_events().is_tracked(share_id) {
             return Ok(());
         }
@@ -34,7 +34,11 @@ impl CollabService {
     }
 
     /// The local thread for `thread_gid`, else the share root's.
-    async fn local_thread(&self, share: &ShareId, gid: Option<&str>) -> Result<Option<ThreadId>> {
+    pub(crate) async fn local_thread(
+        &self,
+        share: &ShareId,
+        gid: Option<&str>,
+    ) -> Result<Option<ThreadId>> {
         let rows = self.db().share_threads(share).await?;
         let root = self.db().share(share).await?.and_then(|s| s.root_gid);
         let wanted: Option<ThreadGid> = gid.map(ThreadGid::from).or(root);
@@ -67,6 +71,9 @@ impl CollabService {
                 event.server_seq,
             )
             .await?;
+        if let Err(err) = self.apply_share_payload(&event).await {
+            crate::log::warn(format!("share event {} not applied: {err}", event.event_id));
+        }
         if let Some(thread) = self
             .local_thread(&share, event.thread_gid.as_deref())
             .await?

@@ -45,6 +45,22 @@ impl TramaDb {
         })
         .await
     }
+
+    /// The thread that owns `checkout_id`, if recorded.
+    pub async fn checkout_owner(&self, checkout_id: &CheckoutId) -> Result<Option<ThreadId>> {
+        let checkout = checkout_id.to_string();
+        self.blocking(move |conn| {
+            conn.query_row(
+                "SELECT thread_id FROM checkout_locations WHERE checkout_id=?1",
+                [checkout],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map(|owner| owner.map(ThreadId::from))
+            .map_err(sql_err)
+        })
+        .await
+    }
 }
 
 pub(crate) fn insert_locations(

@@ -19,10 +19,10 @@ use crate::error::{DaemonError, Result};
 /// Collab protocol versions this daemon speaks.
 pub(crate) const CLIENT_MIN_PROTOCOL: u32 = COLLAB_PROTOCOL_VERSION;
 pub(crate) const CLIENT_MAX_PROTOCOL: u32 = trama_collab_protocol::vnext::VNEXT_PROTOCOL_VERSION;
-/// vNext capabilities this daemon implements (the transport). E2EE is
-/// added when the MLS cipher is wired: the app must not offer features the
-/// client lacks.
+/// vNext capabilities this daemon implements: the transport and MLS
+/// payload encryption. The app must not offer features the client lacks.
 pub(crate) const CLIENT_CAPABILITIES: &[Capability] = &[
+    Capability::E2ee,
     Capability::EventStream,
     Capability::ManifestStore,
     Capability::WriterLeases,

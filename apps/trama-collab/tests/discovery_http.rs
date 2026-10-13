@@ -43,6 +43,7 @@ async fn discovery_is_public_stable_and_advertises_existing_v3_routes() {
     assert_eq!(
         first.capabilities,
         vec![
+            Capability::E2ee,
             Capability::EventStream,
             Capability::ManifestStore,
             Capability::WriterLeases

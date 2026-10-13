@@ -70,6 +70,8 @@ pub(crate) fn document(server_id: String) -> ServerDiscovery {
         min_client_protocol: COLLAB_PROTOCOL_VERSION,
         max_client_protocol: VNEXT_PROTOCOL_VERSION,
         capabilities: vec![
+            // Key package / Welcome relay; the server never sees plaintext.
+            Capability::E2ee,
             Capability::EventStream,
             Capability::ManifestStore,
             Capability::WriterLeases,

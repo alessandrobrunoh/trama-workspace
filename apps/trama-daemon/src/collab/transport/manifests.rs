@@ -88,6 +88,7 @@ pub(crate) async fn publish_manifests(
     Ok(version)
 }
 
+#[allow(dead_code)] // content: checkout export, deferred
 pub(crate) struct FetchedManifests {
     pub version: u64,
     pub history: SignedEnvelope,

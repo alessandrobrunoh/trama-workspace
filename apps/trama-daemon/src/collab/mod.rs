@@ -41,6 +41,7 @@
 mod credentials;
 mod digest;
 mod discovery;
+pub(crate) mod e2ee;
 pub(crate) mod family;
 mod history;
 mod http;
@@ -48,6 +49,7 @@ mod mirror;
 mod outbox;
 mod runner;
 mod share_events;
+mod shares;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -128,6 +130,8 @@ struct Inner {
     outbox_notify: tokio::sync::Notify,
     /// vNext share event replay state.
     share_events: share_events::ShareEventRouter,
+    /// MLS identity and groups, set by `start` (or tests).
+    e2ee: std::sync::OnceLock<Arc<e2ee::E2ee>>,
 }
 
 struct State {
@@ -273,6 +277,7 @@ impl CollabService {
                 sync_lock: tokio::sync::Mutex::new(()),
                 outbox_notify: tokio::sync::Notify::new(),
                 share_events: Default::default(),
+                e2ee: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -298,6 +303,17 @@ impl CollabService {
         &self.inner.share_events
     }
 
+    pub(crate) fn set_e2ee(&self, e2ee: e2ee::E2ee) {
+        let _ = self.inner.e2ee.set(Arc::new(e2ee));
+    }
+
+    /// The device's E2EE state; shares need it.
+    pub(crate) fn e2ee(&self) -> Result<Arc<e2ee::E2ee>> {
+        self.inner.e2ee.get().cloned().ok_or_else(|| {
+            DaemonError::Collab("end-to-end encryption is not available in this daemon".into())
+        })
+    }
+
     pub(crate) fn db(&self) -> &TramaDb {
         self.inner.sessions.db()
     }
@@ -318,7 +334,17 @@ impl CollabService {
             .db()
             .collab_setting_or_insert(INSTALL_KEY, &MessageId::generate().to_string())
             .await?;
-        self.lock().install_id = install;
+        self.lock().install_id = install.clone();
+        if let Some(app_dir) = path.parent().map(Path::to_path_buf) {
+            let db = self.db().clone();
+            let device = format!("dev_{install}");
+            match tokio::task::spawn_blocking(move || e2ee::E2ee::open(db, &app_dir, &device)).await
+            {
+                Ok(Ok(e2ee)) => self.set_e2ee(e2ee),
+                Ok(Err(err)) => crate::log::warn(format!("e2ee unavailable: {err}")),
+                Err(err) => crate::log::warn(format!("e2ee unavailable: {err}")),
+            }
+        }
         self.settle_interrupted_turns().await;
         let (signals, rx) = mpsc::unbounded_channel();
         self.inner.sessions.set_collab_observer(Some(signals));
@@ -453,7 +479,7 @@ impl CollabService {
         })
     }
 
-    fn require_connection(&self) -> Result<Connection> {
+    pub(crate) fn require_connection(&self) -> Result<Connection> {
         self.credentials_path()?;
         self.connection(None).ok_or_else(|| {
             DaemonError::Collab("not connected to a collab service; connect first".into())

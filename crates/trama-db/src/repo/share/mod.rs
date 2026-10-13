@@ -7,6 +7,7 @@
 mod checkouts;
 mod heads;
 mod inventory;
+mod sealed;
 mod servers;
 mod shares;
 mod threads;

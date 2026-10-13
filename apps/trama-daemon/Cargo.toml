@@ -22,6 +22,12 @@ async-trait = { workspace = true }
 async-channel = { workspace = true }
 base64 = "0.22"
 trama-collab-protocol = { path = "../../crates/trama-collab-protocol" }
+trama-e2ee = { path = "../../crates/trama-e2ee" }
+# At-rest key for sealed E2EE state: OS keychain, file fallback (see
+# collab/e2ee/at_rest.rs). ring seals the blobs.
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
+ring = "0.17"
+ed25519-dalek = "2"
 # Collab client: HTTP/1.1 and WebSocket to a collab service, plain only to
 # loopback and TLS (rustls with the `ring` provider, which the workspace
 # already builds; system roots via rustls-native-certs) for anything else.
