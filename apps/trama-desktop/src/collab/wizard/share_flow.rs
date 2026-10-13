@@ -34,6 +34,12 @@ pub struct ShareFlow {
     pub requests: Vec<ShareJoinRequest>,
     /// Device being approved, to disable its button.
     pub approving: Option<String>,
+    /// Usernames with a grant (invited at creation or admitted since).
+    pub members: Vec<String>,
+    /// Member whose removal awaits confirmation.
+    pub confirm_remove: Option<String>,
+    /// Removal in flight.
+    pub removing: Option<String>,
     pub error: Option<String>,
 }
 
@@ -62,6 +68,9 @@ impl ShareFlow {
             invites: Vec::new(),
             requests: Vec::new(),
             approving: None,
+            members: Vec::new(),
+            confirm_remove: None,
+            removing: None,
             error: None,
         }
     }
@@ -212,6 +221,7 @@ impl ShareFlow {
             return None;
         }
         let share_id = share.share_id.clone();
+        self.members = self.invites.iter().map(|i| i.username.clone()).collect();
         self.step = ShareStep::Shared(share);
         Some(ClientMessage::ListShareJoinRequests { share_id })
     }
@@ -251,8 +261,51 @@ impl ShareFlow {
         if self.share_id() != Some(share_id) {
             return;
         }
-        self.requests.retain(|r| r.device_id != device_id);
+        if let Some(i) = self.requests.iter().position(|r| r.device_id == device_id) {
+            let user = self.requests.remove(i).username;
+            if !self.members.iter().any(|m| m.eq_ignore_ascii_case(&user)) {
+                self.members.push(user);
+            }
+        }
         self.approving = None;
+        if let ShareStep::Shared(s) = &mut self.step {
+            s.key_epoch = Some(key_epoch);
+        }
+    }
+
+    /// First click on "Remove": ask for confirmation.
+    pub fn ask_remove(&mut self, username: &str) {
+        if self.share_id().is_some()
+            && self.removing.is_none()
+            && self.members.iter().any(|m| m == username)
+        {
+            self.confirm_remove = Some(username.to_owned());
+        }
+    }
+
+    pub fn cancel_remove(&mut self) {
+        self.confirm_remove = None;
+    }
+
+    /// Confirmed: revoke the grant and evict every device of the member.
+    pub fn confirm_remove(&mut self) -> Option<ClientMessage> {
+        let share_id = self.share_id()?.to_owned();
+        let username = self.confirm_remove.take()?;
+        self.removing = Some(username.clone());
+        self.error = None;
+        Some(ClientMessage::RemoveShareMember { share_id, username })
+    }
+
+    pub fn apply_removed(&mut self, share_id: &str, username: &str, key_epoch: u64) {
+        if self.share_id() != Some(share_id) {
+            return;
+        }
+        self.members.retain(|m| !m.eq_ignore_ascii_case(username));
+        self.requests
+            .retain(|r| !r.username.eq_ignore_ascii_case(username));
+        if self.removing.as_deref() == Some(username) {
+            self.removing = None;
+        }
         if let ShareStep::Shared(s) = &mut self.step {
             s.key_epoch = Some(key_epoch);
         }
@@ -263,6 +316,7 @@ impl ShareFlow {
             ShareStep::Checking | ShareStep::Creating => self.step = ShareStep::Failed(message),
             ShareStep::Shared(_) => {
                 self.approving = None;
+                self.removing = None;
                 self.error = Some(message);
             }
             _ => {}

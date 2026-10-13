@@ -290,6 +290,7 @@ impl ShareWizard {
                             }),
                     ),
             ))
+            .child(self.members_section(p, flow, cx))
             .child(section(p, "Waiting to join", requests))
             .when_some(flow.error.clone(), |this, e| {
                 this.child(note(p, IconName::TriangleAlert, p.danger, e))

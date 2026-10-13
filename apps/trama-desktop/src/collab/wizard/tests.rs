@@ -280,3 +280,60 @@ fn router_delivers_replies_and_errors_to_the_pending_wizard() {
         "unowned errors pass through"
     );
 }
+
+#[test]
+fn removing_a_member_needs_confirmation_and_updates_the_epoch() {
+    use super::members_view::remove_warning;
+    use super::route::{WizardOp, route};
+    use trama_protocol::DaemonMessage;
+    let mut f = flow();
+    f.add_invites("bob", None).unwrap();
+    to_checks(&mut f);
+    f.apply_preflight(report(vec![]));
+    f.next();
+    f.apply_created(snapshot("s1"));
+    assert_eq!(f.members, ["bob"]);
+    f.apply_requests(
+        "s1",
+        vec![ShareJoinRequest {
+            username: "carol".into(),
+            device_id: "d2".into(),
+        }],
+    );
+    f.approve("d2");
+    f.apply_approved("s1", "d2", 1);
+    assert_eq!(f.members, ["bob", "carol"]);
+
+    assert!(f.confirm_remove().is_none(), "nothing to confirm yet");
+    f.ask_remove("nobody");
+    assert!(f.confirm_remove.is_none());
+    f.ask_remove("bob");
+    f.cancel_remove();
+    assert!(f.confirm_remove().is_none(), "cancelled");
+    f.ask_remove("bob");
+    assert!(matches!(
+        f.confirm_remove(),
+        Some(ClientMessage::RemoveShareMember { share_id, username }) if share_id == "s1" && username == "bob"
+    ));
+    f.ask_remove("carol");
+    assert!(f.confirm_remove.is_none(), "one removal at a time");
+
+    let mut pending = Some(WizardOp::Share);
+    let removed = DaemonMessage::ShareMemberRemoved {
+        share_id: "s1".into(),
+        username: "bob".into(),
+        devices: vec!["d1".into()],
+        key_epoch: 2,
+    };
+    assert!(route(&removed, &mut pending, Some(&mut f), None).handled);
+    assert_eq!(f.members, ["carol"]);
+    assert!(f.removing.is_none());
+    assert!(matches!(&f.step, ShareStep::Shared(s) if s.key_epoch == Some(2)));
+
+    f.ask_remove("carol");
+    f.confirm_remove();
+    f.apply_error("forbidden".into());
+    assert!(f.removing.is_none() && f.error.is_some());
+    assert_eq!(f.members, ["carol"], "failed removal keeps the member");
+    assert!(remove_warning("carol").contains("new key"));
+}

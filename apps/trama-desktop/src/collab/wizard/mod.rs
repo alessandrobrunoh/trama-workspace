@@ -9,6 +9,7 @@
 pub(crate) mod blockers;
 pub(crate) mod join_flow;
 pub(crate) mod join_view;
+pub(crate) mod members_view;
 pub(crate) mod route;
 pub(crate) mod share_flow;
 pub(crate) mod share_view;

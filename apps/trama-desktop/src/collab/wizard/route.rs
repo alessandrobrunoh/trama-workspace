@@ -56,6 +56,17 @@ pub fn route(
                 out.handled = true;
             }
         }
+        DaemonMessage::ShareMemberRemoved {
+            share_id,
+            username,
+            key_epoch,
+            ..
+        } => {
+            if let Some(f) = share {
+                f.apply_removed(share_id, username, *key_epoch);
+                out.handled = true;
+            }
+        }
         DaemonMessage::ShareJoinRequested {
             share_id,
             device_id,
