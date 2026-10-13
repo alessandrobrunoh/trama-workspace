@@ -306,6 +306,14 @@ pub enum ClientMessage {
     ListShareLeases {
         share_id: String,
     },
+    /// Owner only: revokes `username`'s grant, removes every device of
+    /// theirs from the MLS group (a `membership_changed` commit each) and
+    /// republishes the snapshot at the new epoch. Answered with
+    /// `ShareMemberRemoved`.
+    RemoveShareMember {
+        share_id: String,
+        username: String,
+    },
     /// Share a top-level thread: create its collab thread on first use
     /// (access `invited`), then apply `access` when set and invite the
     /// `invite` usernames (owner only). Setting `link` (again) returns a fresh

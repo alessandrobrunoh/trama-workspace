@@ -428,3 +428,16 @@ impl CollabService {
         self.publish_history_snapshot(&client, share_id).await
     }
 }
+
+impl CollabService {
+    /// Owner: revokes a member (filled in by the revoke flow).
+    pub(crate) async fn remove_share_member(
+        &self,
+        _share_id: &str,
+        _username: &str,
+    ) -> Result<(Vec<String>, u64)> {
+        Err(DaemonError::Invalid(
+            "member removal is not available yet".into(),
+        ))
+    }
+}

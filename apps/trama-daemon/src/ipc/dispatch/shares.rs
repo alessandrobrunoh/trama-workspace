@@ -72,6 +72,15 @@ pub(super) async fn handle(msg: ClientMessage, ctx: &mut Ctx<'_>) -> Result<Conn
             let leases = collab.list_share_leases(&share_id).await?;
             DaemonMessage::ShareLeases { share_id, leases }
         }
+        ClientMessage::RemoveShareMember { share_id, username } => {
+            let (devices, key_epoch) = collab.remove_share_member(&share_id, &username).await?;
+            DaemonMessage::ShareMemberRemoved {
+                share_id,
+                username,
+                devices,
+                key_epoch,
+            }
+        }
         _ => return Ok(ConnectionControl::Continue),
     };
     let _ = out_tx.send(reply);

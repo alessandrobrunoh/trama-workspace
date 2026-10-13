@@ -193,6 +193,14 @@ pub enum DaemonMessage {
         share_id: String,
         leases: Vec<ShareLeaseSnapshot>,
     },
+    /// Reply to `RemoveShareMember`.
+    ShareMemberRemoved {
+        share_id: String,
+        username: String,
+        /// Devices removed from the MLS group.
+        devices: Vec<String>,
+        key_epoch: u64,
+    },
     /// A vNext durable share event that passed shape and replay checks,
     /// sent to the subscribers of `thread_id` (thread-scoped kinds) or to
     /// every connection (share-wide kinds). `cipher_payload` stays opaque.

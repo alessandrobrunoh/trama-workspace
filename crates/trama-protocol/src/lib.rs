@@ -45,7 +45,8 @@
 //! thread's whole family and history. **13** adds collab server discovery
 //! ([`ClientMessage::DiscoverCollabServer`], [`DaemonMessage::CollabServerInfo`])
 //! and vNext share events ([`DaemonMessage::ShareEvent`]). **14** adds the
-//! Share/Join flow (see the `shares` payloads). Each bump is
+//! Share/Join flow (see the `shares` payloads); **15** adds
+//! `RemoveShareMember`. Each bump is
 //! transport-only. Persisted domain ids and SQLite rows are not rewritten.
 //!
 //! A version mismatch fails the handshake (`Welcome.accepted = false`). Extra object
@@ -102,6 +103,7 @@ pub use trama_collab_protocol::{
 
 /// Wire protocol version carried in `Hello` / `Welcome`.
 ///
+/// Version 15 adds `RemoveShareMember` / `ShareMemberRemoved`.
 /// Version 14 adds the Share/Join flow (`SharePreflight`, `CreateShare`,
 /// `ListShares`, join requests and approval, `CompleteShareJoin`,
 /// `PublishShareSnapshot`, writer leases and their replies).
@@ -147,7 +149,7 @@ pub use trama_collab_protocol::{
 /// Version 4 added the Claude approval channel and 3 thread checkout
 /// discovery. It does not migrate stored data; peers with a different version
 /// are rejected at handshake time.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Default writer lease length for `AcquireShareLease`.
 pub const DEFAULT_LEASE_TTL_SECS: u64 = 120;
