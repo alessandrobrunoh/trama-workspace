@@ -367,7 +367,14 @@ impl CollabService {
         let (joiner, id) = (e2ee.clone(), share_id.to_owned());
         blocking(move || joiner.finish_join(&id, &bytes)).await?;
         let info = client.info(share_id).await?;
-        let manifest = self.read_history_snapshot(&client, share_id).await?;
+        let snapshot = self.read_verified_snapshot(&client, share_id).await?;
+        if info.read_code {
+            // Bundles are kept for restore (not wired yet, release-blocker).
+            if let Err(e) = self.fetch_share_content(&client, share_id, &snapshot).await {
+                crate::log::warn(format!("share {share_id}: content not fetched: {e}"));
+            }
+        }
+        let manifest = snapshot.manifest;
         let mut rows = Vec::new();
         let mut local: Vec<(ThreadGid, ThreadId)> = Vec::new();
         for t in &manifest.threads {

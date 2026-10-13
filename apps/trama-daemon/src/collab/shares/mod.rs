@@ -3,6 +3,7 @@
 //! mapping of received events into local history.
 
 mod access;
+mod content;
 mod flow;
 mod inbound;
 mod leases;

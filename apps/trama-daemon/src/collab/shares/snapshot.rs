@@ -34,6 +34,14 @@ pub(crate) fn parse_kind(kind: &str) -> SharedThreadKind {
         .unwrap_or(SharedThreadKind::Child)
 }
 
+pub(crate) struct VerifiedSnapshot {
+    pub manifest: HistoryManifestV1,
+    pub envelope: SignedEnvelope,
+    pub keyring: Keyring,
+    pub version: u64,
+    pub epoch: u64,
+}
+
 impl CollabService {
     /// Current MLS epoch of `share_id` on this device.
     pub(crate) async fn share_epoch(&self, share_id: &str) -> Result<u64> {
@@ -119,6 +127,9 @@ impl CollabService {
         .await
         .map_err(|e| DaemonError::Collab(e.to_string()))??;
         let epoch = self.share_epoch(share_id).await?;
+        let content = self
+            .build_content(client, &row, &rows, &envelope, epoch)
+            .await?;
         let (db, cipher, id) = (self.db().clone(), e2ee.cipher.clone(), share_id.to_owned());
         let expected = row
             .current_snapshot_version
@@ -131,7 +142,7 @@ impl CollabService {
             epoch,
             expected,
             &envelope,
-            None,
+            content.as_ref(),
         )
         .await?;
         // MLS cannot decrypt our own ciphertext: keep the plaintext.
@@ -140,11 +151,25 @@ impl CollabService {
     }
 
     /// Joiner: fetches, decrypts and verifies the latest history snapshot.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn read_history_snapshot(
         &self,
         client: &ShareClient,
         share_id: &str,
     ) -> Result<HistoryManifestV1> {
+        Ok(self
+            .read_verified_snapshot(client, share_id)
+            .await?
+            .manifest)
+    }
+
+    /// As [`Self::read_history_snapshot`], keeping the envelope and the
+    /// verified keyring (content manifests are checked against both).
+    pub(crate) async fn read_verified_snapshot(
+        &self,
+        client: &ShareClient,
+        share_id: &str,
+    ) -> Result<VerifiedSnapshot> {
         let e2ee = self.e2ee()?;
         let epoch = self.share_epoch(share_id).await?;
         let blob = client.manifest(share_id, 0, ManifestPart::History).await?;
@@ -202,7 +227,13 @@ impl CollabService {
         tokio::task::spawn_blocking(move || pin.pin_manifest_key(&id, &key_id))
             .await
             .map_err(|e| DaemonError::Collab(e.to_string()))??;
-        Ok(manifest)
+        Ok(VerifiedSnapshot {
+            manifest,
+            envelope,
+            keyring,
+            version: blob.version,
+            epoch,
+        })
     }
 
     /// Decrypted snapshot of `version`, sealed at rest; only the latest is
