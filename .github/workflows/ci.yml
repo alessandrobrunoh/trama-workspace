@@ -7,7 +7,9 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Let every run finish: the Windows job is slow and each push should
+  # get a full result.
+  cancel-in-progress: false
 
 jobs:
   fmt:
