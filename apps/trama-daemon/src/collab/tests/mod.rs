@@ -3,7 +3,7 @@
 
 use super::http::Endpoint;
 use super::*;
-use crate::connection::handle_connection;
+use crate::ipc::handle_connection;
 use crate::testing::{FakeAdapter, scripted_events};
 use ::http::Method;
 use std::net::SocketAddr;

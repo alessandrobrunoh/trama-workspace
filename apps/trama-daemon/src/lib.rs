@@ -3,8 +3,8 @@
 mod claude;
 mod collab;
 mod config;
-mod connection;
 mod error;
+mod ipc;
 mod log;
 mod session;
 
@@ -114,7 +114,7 @@ pub async fn serve_on_socket_with(
                         let collab = collab.clone();
                         let shutdown_tx = shutdown_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = connection::handle_connection(
+                            if let Err(err) = ipc::handle_connection(
                                 stream,
                                 sessions,
                                 collab,
