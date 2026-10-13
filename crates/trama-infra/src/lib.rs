@@ -12,5 +12,6 @@ pub mod cow;
 #[cfg(unix)]
 pub mod pty;
 pub mod setup;
+pub mod share_git;
 
 pub use claude::adapter::ClaudeAdapter;

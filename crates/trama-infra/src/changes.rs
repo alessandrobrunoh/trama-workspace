@@ -25,7 +25,7 @@ pub const CHECKPOINT_REF_PREFIX: &str = "refs/trama/checkpoints/";
 /// Diff text above this size is truncated (stats stay complete).
 pub const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
 
-const SNAPSHOT_IDENTITY: [(&str, &str); 4] = [
+pub(crate) const SNAPSHOT_IDENTITY: [(&str, &str); 4] = [
     ("GIT_AUTHOR_NAME", "Trama"),
     ("GIT_AUTHOR_EMAIL", "trama@localhost"),
     ("GIT_COMMITTER_NAME", "Trama"),
@@ -771,8 +771,11 @@ mod tests {
         );
         assert!(!copy.path.join("gone.txt").exists());
         // Ignored files (build output, local secrets) are cloned
-        // copy-on-write from the parent.
-        assert!(copy.path.join("token.secret").exists());
+        // copy-on-write from the parent where the filesystem supports
+        // clones (APFS); the portable fallback is a plain Git clone.
+        if cfg!(target_os = "macos") {
+            assert!(copy.path.join("token.secret").exists());
+        }
         assert_eq!(
             resolve_commit(&copy.path, FORK_POINT_REF)
                 .unwrap()
