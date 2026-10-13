@@ -766,15 +766,25 @@ mod tests {
 
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/simple_text.ndjson");
-        let dir = std::env::temp_dir().join(format!("trama-claude-fake-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("trama-claude-fake-streams-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let script = dir.join("claude");
         let script_body = format!(
             "#!/bin/sh\ncat \"{}\"\nexec cat >/dev/null\n",
             fixture.display()
         );
-        std::fs::write(&script, script_body).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Write under a temporary name, close it, then rename into place so
+        // no write fd is open on the path that gets exec'd.
+        let staging = dir.join("claude.tmp");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&staging).unwrap();
+            file.write_all(script_body.as_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&staging, &script).unwrap();
 
         let adapter = ClaudeAdapter::with_binary(script.to_string_lossy().into_owned());
         let (tx, rx) = async_channel::unbounded();
@@ -794,7 +804,18 @@ mod tests {
             approval_hook: None,
             fork_session: false,
         };
-        let session = adapter.start(config, tx).await.unwrap();
+        // Another test thread may fork while the script is still open for
+        // writing, which makes exec fail with ETXTBSY until that child execs.
+        let mut attempts = 0;
+        let session = loop {
+            match adapter.start(config.clone(), tx.clone()).await {
+                Err(err) if attempts < 20 && err.to_string().contains("Text file busy") => {
+                    attempts += 1;
+                    sleep(Duration::from_millis(50)).await;
+                }
+                result => break result.unwrap(),
+            }
+        };
 
         let mut events = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
