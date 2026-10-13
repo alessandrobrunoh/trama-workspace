@@ -18,10 +18,15 @@ use crate::error::{DaemonError, Result};
 
 /// Collab protocol versions this daemon speaks.
 pub(crate) const CLIENT_MIN_PROTOCOL: u32 = COLLAB_PROTOCOL_VERSION;
-pub(crate) const CLIENT_MAX_PROTOCOL: u32 = COLLAB_PROTOCOL_VERSION;
-/// vNext capabilities this daemon implements. Empty until transport and
-/// E2EE land (M4): the app must not offer features the client lacks.
-pub(crate) const CLIENT_CAPABILITIES: &[Capability] = &[];
+pub(crate) const CLIENT_MAX_PROTOCOL: u32 = trama_collab_protocol::vnext::VNEXT_PROTOCOL_VERSION;
+/// vNext capabilities this daemon implements (the transport). E2EE is
+/// added when the MLS cipher is wired: the app must not offer features the
+/// client lacks.
+pub(crate) const CLIENT_CAPABILITIES: &[Capability] = &[
+    Capability::EventStream,
+    Capability::ManifestStore,
+    Capability::WriterLeases,
+];
 
 /// Fetches and negotiates. Transport failures are errors; a malformed or
 /// incompatible document is reported in `CollabServerInfo.error`.
@@ -91,17 +96,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn evaluate_negotiates_v2_and_reports_bad_documents() {
+    fn evaluate_negotiates_and_reports_bad_documents() {
         let ok = evaluate(
             "u".into(),
             br#"{"server_id":"s","min_client_protocol":2,"max_client_protocol":3,"capabilities":["e2ee"]}"#,
         );
         let profile = ok.profile.unwrap();
-        assert_eq!(profile.protocol, COLLAB_PROTOCOL_VERSION);
+        assert_eq!(profile.protocol, 3);
         assert!(profile.capabilities.is_empty());
         let newer = evaluate(
             "u".into(),
-            br#"{"server_id":"s","min_client_protocol":3,"max_client_protocol":3}"#,
+            br#"{"server_id":"s","min_client_protocol":4,"max_client_protocol":4}"#,
         );
         assert!(newer.profile.is_none() && newer.error.is_some() && newer.discovery.is_some());
         let junk = evaluate("u".into(), b"<html>");
@@ -132,7 +137,8 @@ mod tests {
         let info = discover(&endpoint).await.unwrap();
         assert!(info.error.is_none(), "{:?}", info.error);
         let profile = info.profile.unwrap();
-        assert_eq!(profile.protocol, COLLAB_PROTOCOL_VERSION);
+        assert_eq!(profile.protocol, 3);
+        assert!(profile.supports(Capability::EventStream));
         assert!(profile.server_id.starts_with("srv_"));
     }
 }

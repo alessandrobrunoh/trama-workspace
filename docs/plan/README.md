@@ -38,7 +38,7 @@ Requisito trasversale aggiunto: l'app deve essere **cross-platform**
 | M2 | Full-workspace builds on Linux/Windows/macOS; `trama-ipc` (Unix sockets / Windows named pipes); ConPTY terminals on Windows; per-OS data dir; `dunce` paths; CI on 3 OSes | done |
 | Restructure | Codebase grouped into area modules, large files split, transitional re-exports removed ([restructure.md](restructure.md)) | done |
 | M3 | Repository DB `trama-db::share`, manifest firmato (`SignedEnvelope`), protocollo vNext/discovery | fatto |
-| M4 | Trasporto, E2EE MLS/openmls (dopo security review), wizard Share/Join | da fare |
+| M4 | Trasporto, E2EE MLS/openmls (dopo security review), wizard Share/Join | in corso: trasporto `/v3` (eventi, stream, manifest CAS, lease) fatto |
 
 ## Decisioni M3 (DB share e manifest firmati)
 
@@ -50,3 +50,12 @@ Scelte conservative prese dove la spec lascia aperto:
 - **Firmatario = publisher:** il device della chiave deve coincidere con `publisher_device_id`; il campo `publisher_signature` dell'esempio vive nell'envelope, non nel payload (campi sconosciuti rifiutati).
 - **Rollback:** `open_history` rifiuta versioni sotto il pin locale; nel DB `advance_share_snapshot` è CAS e solo crescente; uno share `closed` non si riapre.
 - **DB:** generazioni di checkout immutabili e appese con CAS su `previous_generation`; il fingerprint di un server già pinnato non si può cambiare né rimuovere con un upsert; `byte_len` di un oggetto noto è immutabile.
+
+## Decisioni M4 (trasporto, scelte conservative)
+
+- **Rotte `/v3/shares`:** registrazione (chi registra è owner), grant `writer`/`reader` + `read_code` solo dall'owner (un solo owner, non trasferibile), eventi sequenziati, stream WebSocket, commit manifest CAS, fetch manifest, writer lease. Discovery annuncia `2..=3` e solo `event_stream`, `manifest_store`, `writer_leases`; niente `e2ee`, `content_transfer`, `chunk_resume`, `direct_transport` finché non esistono.
+- **Ammissione eventi lato server:** stesse regole di forma e replay del client (catena `author_seq` per device, idempotenza su `event_id`, batch tutto-o-niente); un device è legato al primo utente che lo usa; kind owner-only solo dall'owner; i reader possono pubblicare solo `peer_acknowledged`; `history_appended` è rifiutato (409) se un altro device detiene la lease del thread.
+- **Lease:** esclusiva per (share, thread), TTL 1–600 s, rinnovabile dal detentore, rilascio solo dal detentore; scade da sola.
+- **Manifest:** history e content sono blob base64 opachi separati; il content è servito solo con `read_code`; versione `expected + 1` con CAS; il pin locale avanza solo dopo l'accettazione del server. La verifica della firma resta al chiamante (keyring).
+- **Cifratura:** trait `PayloadCipher` (seal/open per share, epoch e tipo di payload) dove si innesta MLS; default `NoCipher` che rifiuta tutto, quindi nessun manifest esce in chiaro. Il corpo degli eventi (`cipher_payload`) è già opaco.
+- **Daemon:** uno stream per share non chiusa/in pausa legata al server connesso (`shares.server_id` → `collaboration_servers.base_url`); cursore e head per device persistiti (migration `0013_share_transport`); gap/reject → riconnessione dal cursore salvato con backoff 1–60 s. Gli eventi arrivano via IPC come `ShareEvent` al thread locale mappato (o alla radice dello share). L'API publish/manifest/lease del daemon non è ancora esposta via IPC: la userà il flusso Share/Join.

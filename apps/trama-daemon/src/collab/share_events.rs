@@ -1,13 +1,9 @@
 //! vNext share event intake: shape and replay checks, then IPC fan-out as
 //! `DaemonMessage::ShareEvent` to the subscribers of the local thread.
 //!
-//! The transport that receives events (M4) and the share DB that persists
-//! device heads are outside this module: callers restore heads with
-//! [`ShareEventRouter::restore_head`] and hand every received or locally
-//! authored event to [`CollabService::deliver_share_event`].
-
-// Wired to a transport in M4; until then only tests drive it.
-#![allow(dead_code)]
+//! In-memory replay state per share. `transport::apply` seeds it from the
+//! persisted device heads before the first event of a share and records
+//! every accepted event back to the database.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -25,6 +21,8 @@ const MAX_TRACKED_SHARES: usize = 1024;
 #[derive(Default)]
 pub(crate) struct ShareEventRouter {
     guards: Mutex<HashMap<String, ReplayGuard>>,
+    /// Running stream tasks by share id, with their connection generation.
+    pub(crate) streams: Mutex<HashMap<String, (u64, tokio::task::JoinHandle<()>)>>,
 }
 
 impl ShareEventRouter {
@@ -49,7 +47,18 @@ impl ShareEventRouter {
             .unwrap_or_else(|| Admission::Reject("too many shares tracked".into()))
     }
 
+    pub(crate) fn is_tracked(&self, share_id: &str) -> bool {
+        let guards = self.guards.lock().unwrap_or_else(|e| e.into_inner());
+        guards.contains_key(share_id)
+    }
+
+    /// Starts tracking a share with no known heads (seeding marker).
+    pub(crate) fn track(&self, share_id: &str) {
+        self.with_guard(share_id, |_| ());
+    }
+
     /// Drops a share's state (share closed or unlinked).
+    #[allow(dead_code)]
     pub(crate) fn forget(&self, share_id: &str) {
         let mut guards = self.guards.lock().unwrap_or_else(|e| e.into_inner());
         guards.remove(share_id);
@@ -61,6 +70,7 @@ impl CollabService {
     /// `local_thread` (the local thread the share or `thread_gid` maps to).
     /// Duplicates are dropped silently; gaps and rejects are returned for
     /// the caller to backfill or log. Never forwards rejected events.
+    #[allow(dead_code)]
     pub(crate) fn deliver_share_event(
         &self,
         local_thread: &ThreadId,

@@ -57,6 +57,7 @@ mod tests_history;
 #[path = "tests/tls.rs"]
 mod tests_tls;
 mod tls;
+mod transport;
 
 use crate::error::{DaemonError, Result};
 use crate::session::SessionManager;
@@ -126,7 +127,6 @@ struct Inner {
     /// Wakes the outbox worker.
     outbox_notify: tokio::sync::Notify,
     /// vNext share event replay state.
-    #[allow(dead_code)] // fed by the M4 transport
     share_events: share_events::ShareEventRouter,
 }
 
@@ -294,7 +294,6 @@ impl CollabService {
         &self.inner.sessions
     }
 
-    #[allow(dead_code)] // fed by the M4 transport
     pub(crate) fn share_events(&self) -> &share_events::ShareEventRouter {
         &self.inner.share_events
     }
@@ -400,7 +399,10 @@ impl CollabService {
             generation
         };
         let service = self.clone();
-        tokio::spawn(async move { service.start_mirrors(generation).await });
+        tokio::spawn(async move {
+            service.start_mirrors(generation).await;
+            service.start_share_streams(generation).await;
+        });
     }
 
     /// Drop every connection without touching stored state, as if the
