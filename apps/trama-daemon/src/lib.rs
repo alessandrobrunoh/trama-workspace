@@ -1,17 +1,16 @@
 //! Local TramaWorkspace daemon: Unix-socket JSON-lines server and real sessions.
 
-pub mod approval;
 mod claude;
 mod collab;
 mod config;
 mod connection;
 mod error;
 mod log;
-pub mod mcp;
 mod session;
 
-#[cfg(test)]
-mod approval_tests;
+// Paths kept stable: `trama_daemon::approval` and `trama_daemon::mcp`.
+pub use claude::{approval, mcp};
+
 #[cfg(test)]
 mod testing;
 

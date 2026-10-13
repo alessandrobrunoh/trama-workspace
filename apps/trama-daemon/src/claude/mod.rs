@@ -1,6 +1,12 @@
 //! Production adapter: resolve `claude` lazily so the daemon can still serve
 //! lists when the binary is missing. Failure surfaces on `start`.
 
+pub mod approval;
+#[cfg(test)]
+#[path = "tests/approval.rs"]
+mod approval_tests;
+pub mod mcp;
+
 use async_channel::Sender;
 use tokio::sync::Mutex;
 use trama_domain::agent::{
