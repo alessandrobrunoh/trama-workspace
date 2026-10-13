@@ -68,6 +68,9 @@ pub struct AuthConfig {
     pub max_throttle_keys: usize,
     /// Sliding window for both attempt limits.
     pub login_window: Duration,
+    /// Operator-chosen `server_id` for `/.well-known/trama-collab`; `None`
+    /// uses a random id persisted in the database.
+    pub server_id: Option<String>,
     /// Injected clock (seconds since the Unix epoch) so limits are testable.
     pub clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
@@ -80,6 +83,7 @@ impl Default for AuthConfig {
             max_peer_attempts: 100,
             max_throttle_keys: 10_000,
             login_window: Duration::from_secs(60),
+            server_id: None,
             clock: Arc::new(unix_time),
         }
     }

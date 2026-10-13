@@ -93,6 +93,10 @@ enum Command {
             default_value = "x-forwarded-for"
         )]
         forwarded_header: ForwardedHeader,
+        /// Public server identity in `/.well-known/trama-collab`. Default: a
+        /// random id generated once and kept in the database.
+        #[arg(long, env = "TRAMA_COLLAB_SERVER_ID")]
+        server_id: Option<String>,
     },
 }
 
@@ -177,6 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             behind_proxy,
             trusted_proxies,
             forwarded_header,
+            server_id,
         } => {
             let proxy = if behind_proxy {
                 let networks = if trusted_proxies.is_empty() {
@@ -197,7 +202,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 validate_bind(bind)?;
                 None
             };
-            let auth = AuthService::open(args.db, AuthConfig::default())?;
+            let auth = AuthService::open(
+                args.db,
+                AuthConfig {
+                    server_id,
+                    ..AuthConfig::default()
+                },
+            )?;
             let listener = tokio::net::TcpListener::bind(bind).await?;
             match &proxy {
                 Some(trust) => println!(

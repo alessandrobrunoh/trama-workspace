@@ -19,7 +19,7 @@ Specifiche fornite da Alessandro Bruno. Ordine di lettura:
 - **UI:** si mantiene GPUI (anche per Linux e Windows).
 - **Crittografia E2EE (M4):** Messaging Layer Security, [RFC 9420](https://www.rfc-editor.org/rfc/rfc9420), tramite un'implementazione esistente (es. `openmls`); niente protocollo fatto in casa. Resta obbligatoria la security review prima di dichiarare Cloud E2EE.
 - **Piattaforme:** macOS, Linux e Windows sono tutti target di prima classe.
-- **Discovery/eventi vNext (M3, scelte conservative):** `GET /.well-known/trama-collab` è pubblico e oggi annuncia solo il protocollo collab `2..=2` senza capability vNext (una capability compare solo quando esistono le rotte); `server_id` è casuale e persistito nel DB del servizio; un 404 equivale a server v2 legacy; il daemon negozia con capability client vuote fino a M4. Gli eventi `ShareEvent*` hanno metadati di routing in chiaro e corpo `cipher_payload` opaco; intake idempotente su `event_id` con catena `author_seq` stretta per device (gap → backfill, riuso → rifiuto). Nessuna emissione dal server finché le rotte `/v3` non esistono (M4).
+- **Discovery/eventi vNext (M3, scelte conservative):** `GET /.well-known/trama-collab` è pubblico e oggi annuncia solo il protocollo collab `2..=2` senza capability vNext (una capability compare solo quando esistono le rotte); `server_id` è impostabile dall'operatore (`--server-id` / `TRAMA_COLLAB_SERVER_ID`, 1–128 caratteri `[A-Za-z0-9-_.:]`), altrimenti casuale e persistito nel DB del servizio; la risposta ha `Cache-Control: public, max-age=300` (5 minuti, confermato); un 404 equivale a server v2 legacy; il daemon negozia con capability client vuote fino a M4. Gli eventi `ShareEvent*` hanno metadati di routing in chiaro e corpo `cipher_payload` opaco; intake idempotente su `event_id` con catena `author_seq` stretta per device (gap → backfill, riuso → rifiuto). Nessuna emissione dal server finché le rotte `/v3` non esistono (M4). Kind riservati all'owner (`ShareEventKind::owner_only`, confermato): `share_created`, `scope_expanded`, `thread_removed_from_scope`, `membership_changed`, `key_epoch_advanced`, `share_paused`, `share_closed`; gli altri possono essere scritti da membri con la capability adeguata. Kind con `thread_gid` obbligatorio: `thread_added`, `thread_removed_from_scope`, `history_appended`, `comment_changed`, `review_verdict_posted`.
 
 ## Stato dell'implementazione
 
@@ -31,7 +31,7 @@ Requisito trasversale aggiunto: l'app deve essere **cross-platform**
 | M1 | Contratti di dominio (`trama-domain::share`, `checkout_state`), snapshot/restore Git esatto (`trama-infra::share_git`), migration `0012_share_vnext`, CI matrice ubuntu/windows/macos sui crate core | fatto |
 | M2 | Full-workspace builds on Linux/Windows/macOS; `trama-ipc` (Unix sockets / Windows named pipes); ConPTY terminals on Windows; per-OS data dir; `dunce` paths; CI on 3 OSes | done |
 | Restructure | Codebase grouped into area modules, large files split, transitional re-exports removed ([restructure.md](restructure.md)) | done |
-| M3 | Repository DB `trama-db::share`, manifest firmato (`SignedEnvelope`), protocollo vNext/discovery | in corso: DB `trama-db::share` e manifest firmati (`trama-domain::manifest`) fatti |
+| M3 | Repository DB `trama-db::share`, manifest firmato (`SignedEnvelope`), protocollo vNext/discovery | fatto |
 | M4 | Trasporto, E2EE MLS/openmls (dopo security review), wizard Share/Join | da fare |
 
 ## Decisioni M3 (DB share e manifest firmati)

@@ -3,7 +3,8 @@
 //!
 //! This service still speaks only collab protocol v2, so it advertises
 //! `2..=2` and no vNext capabilities. A capability is listed only once the
-//! routes behind it exist.
+//! routes behind it exist. `server_id` comes from `--server-id` /
+//! `TRAMA_COLLAB_SERVER_ID` when set, else a random persisted id.
 
 use crate::*;
 use trama_collab_protocol::vnext::discovery::{ServerDiscovery, ServerLimits, ServerPolicy};
@@ -30,6 +31,23 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), String> {
         )
         .map_err(|e| format!("store server id: {e}"))?;
     Ok(())
+}
+
+/// Maximum length of an operator-chosen server id.
+const MAX_SERVER_ID_LEN: usize = 128;
+
+/// An operator-chosen id: 1–128 ASCII letters, digits, `-`, `_`, `.`, `:`.
+pub(crate) fn validate_server_id(id: &str) -> Result<(), String> {
+    let ok = !id.is_empty()
+        && id.len() <= MAX_SERVER_ID_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'));
+    if ok {
+        Ok(())
+    } else {
+        Err("server id must be 1-128 characters of A-Z, a-z, 0-9, '-', '_', '.', ':'".into())
+    }
 }
 
 fn server_id(connection: &Connection) -> Result<String, String> {
@@ -59,7 +77,11 @@ pub(crate) fn document(server_id: String) -> ServerDiscovery {
 
 pub(crate) async fn well_known(State(state): State<AppState>) -> Response {
     let database = state.auth.database.clone();
+    let configured = state.auth.config.server_id.clone();
     let id = tokio_blocking(move || {
+        if let Some(id) = configured {
+            return Ok(id);
+        }
         open_connection(&database)
             .and_then(|connection| server_id(&connection))
             .map_err(|_| AuthError::Database)

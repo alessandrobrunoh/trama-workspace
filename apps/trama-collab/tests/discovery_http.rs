@@ -45,3 +45,20 @@ async fn discovery_is_public_stable_and_advertises_only_v2() {
     let (_, again) = fetch(app).await;
     assert_eq!(again.server_id, first.server_id);
 }
+
+#[tokio::test]
+async fn operator_server_id_overrides_the_persisted_one_and_is_validated() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("collab.sqlite");
+    let config = AuthConfig {
+        server_id: Some("acme-collab-eu1".into()),
+        ..AuthConfig::default()
+    };
+    let (_, doc) = fetch(router(AuthService::open(&path, config).unwrap())).await;
+    assert_eq!(doc.server_id, "acme-collab-eu1");
+    let bad = AuthConfig {
+        server_id: Some("has space".into()),
+        ..AuthConfig::default()
+    };
+    assert!(AuthService::open(&path, bad).is_err());
+}

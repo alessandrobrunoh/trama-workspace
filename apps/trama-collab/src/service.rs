@@ -32,6 +32,9 @@ impl AuthService {
         {
             return Err("login throttle settings must be nonzero".into());
         }
+        if let Some(id) = &config.server_id {
+            http::discovery::validate_server_id(id)?;
+        }
         let path = path.to_path_buf();
         if let Some(parent) = path
             .parent()
