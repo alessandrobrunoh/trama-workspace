@@ -4,17 +4,14 @@
 //! CLI and speaks NDJSON (`--input-format stream-json` /
 //! `--output-format stream-json`). ACP is not used for Claude Code.
 
-pub mod archive;
-pub mod changes;
-pub mod checkout;
 pub mod claude;
-pub mod cow;
-#[cfg(unix)]
-pub mod pty;
-#[cfg(windows)]
-#[path = "pty_windows.rs"]
-pub mod pty;
-pub mod setup;
-pub mod share_git;
+pub mod fs;
+pub mod git;
+pub mod process;
+
+// Stable top-level paths for dependents.
+pub use fs::cow;
+pub use git::{archive, changes, checkout, share_git};
+pub use process::{pty, setup};
 
 pub use claude::adapter::ClaudeAdapter;
