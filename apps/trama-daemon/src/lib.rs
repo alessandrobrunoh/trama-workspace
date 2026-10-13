@@ -30,7 +30,7 @@ use tokio::net::UnixListener;
 use tokio::sync::watch;
 use trama_db::TramaDb;
 
-/// `$TRAMA_DATA_DIR`, else `$HOME/Library/Application Support/TramaWorkspace`
+/// `$TRAMA_DATA_DIR`, else the per-OS data directory (see `platform_app_dir`).
 pub fn default_app_dir() -> Result<PathBuf> {
     trama_protocol::default_app_dir().ok_or_else(|| {
         DaemonError::Invalid(

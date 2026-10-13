@@ -121,13 +121,34 @@ pub const PROTOCOL_VERSION: u32 = 12;
 /// `HOME` to find the user's Claude Code login.
 pub const DATA_DIR_ENV: &str = "TRAMA_DATA_DIR";
 
-/// `$TRAMA_DATA_DIR`, else `$HOME/Library/Application Support/TramaWorkspace`.
+/// `$TRAMA_DATA_DIR`, else the per-OS data directory (see `platform_app_dir`).
 pub fn default_app_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os(DATA_DIR_ENV).filter(|dir| !dir.is_empty()) {
         return Some(PathBuf::from(dir));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/TramaWorkspace"))
+    platform_app_dir(|key| std::env::var_os(key).filter(|value| !value.is_empty()))
+}
+
+/// Per-OS default data directory from an environment lookup:
+/// macOS `~/Library/Application Support/TramaWorkspace` (unchanged),
+/// Windows `%APPDATA%/TramaWorkspace`, other Unix
+/// `$XDG_DATA_HOME/TramaWorkspace` or `~/.local/share/TramaWorkspace`.
+fn platform_app_dir(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        let home = env("HOME")?;
+        Some(PathBuf::from(home).join("Library/Application Support/TramaWorkspace"))
+    } else if cfg!(windows) {
+        let base = env("APPDATA").map(PathBuf::from).or_else(|| {
+            env("USERPROFILE").map(|home| PathBuf::from(home).join("AppData/Roaming"))
+        })?;
+        Some(base.join("TramaWorkspace"))
+    } else {
+        let base = env("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+            .or_else(|| env("HOME").map(|home| PathBuf::from(home).join(".local/share")))?;
+        Some(base.join("TramaWorkspace"))
+    }
 }
 
 /// Encode `value` as one JSON line (compact JSON plus a trailing `\n`).
@@ -1487,6 +1508,38 @@ mod tests {
     }
 
     #[test]
+    fn platform_app_dir_follows_os_conventions() {
+        let env = |key: &str| -> Option<std::ffi::OsString> {
+            match key {
+                "HOME" => Some("/home/someone".into()),
+                "APPDATA" => Some("C:/Users/someone/AppData/Roaming".into()),
+                _ => None,
+            }
+        };
+        let expected = if cfg!(target_os = "macos") {
+            "/home/someone/Library/Application Support/TramaWorkspace"
+        } else if cfg!(windows) {
+            "C:/Users/someone/AppData/Roaming/TramaWorkspace"
+        } else {
+            "/home/someone/.local/share/TramaWorkspace"
+        };
+        assert_eq!(platform_app_dir(env), Some(PathBuf::from(expected)));
+        if !cfg!(target_os = "macos") && !cfg!(windows) {
+            let xdg = |key: &str| -> Option<std::ffi::OsString> {
+                match key {
+                    "XDG_DATA_HOME" => Some("/data".into()),
+                    "HOME" => Some("/home/someone".into()),
+                    _ => None,
+                }
+            };
+            assert_eq!(
+                platform_app_dir(xdg),
+                Some(PathBuf::from("/data/TramaWorkspace"))
+            );
+        }
+    }
+
+    #[test]
     fn app_dir_prefers_trama_data_dir_over_home() {
         // Single test touching these variables, so no cross-test races.
         let saved = (std::env::var_os(DATA_DIR_ENV), std::env::var_os("HOME"));
@@ -1496,9 +1549,7 @@ mod tests {
         }
         assert_eq!(
             default_app_dir(),
-            Some(PathBuf::from(
-                "/Users/someone/Library/Application Support/TramaWorkspace"
-            ))
+            platform_app_dir(|key| std::env::var_os(key).filter(|value| !value.is_empty()))
         );
         unsafe { std::env::set_var(DATA_DIR_ENV, "/tmp/trama-test") };
         assert_eq!(default_app_dir(), Some(PathBuf::from("/tmp/trama-test")));
