@@ -29,7 +29,7 @@ use super::flow::role_key;
 use super::outbound::Payload;
 use crate::error::Result;
 
-fn watermark_key(share_id: &str, gid: &str) -> String {
+pub(crate) fn watermark_key(share_id: &str, gid: &str) -> String {
     format!("share_hist:{share_id}:{gid}")
 }
 

@@ -32,7 +32,7 @@ use crate::error::Result;
 
 const MAX_TEXT_BYTES: usize = 256 * 1024;
 
-fn message(
+pub(super) fn message(
     thread: &ThreadId,
     author: &str,
     role: Role,

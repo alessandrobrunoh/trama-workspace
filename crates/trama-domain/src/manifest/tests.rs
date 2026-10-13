@@ -90,6 +90,7 @@ fn content() -> ContentManifestV1 {
             byte_len: 1024,
             key_epoch: 3,
             parts: vec!["chunk_1".into()],
+            object_key: None,
         }],
         content_policy: ContentPolicySummary {
             ignored_files_exported: false,

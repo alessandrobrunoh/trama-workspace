@@ -7,10 +7,13 @@ mod flow;
 mod inbound;
 mod leases;
 mod members;
+mod objects;
 mod outbound;
 mod outgoing;
 mod preflight;
+mod retry;
 mod scan;
+mod slices;
 mod snapshot;
 #[cfg(test)]
 mod tests;

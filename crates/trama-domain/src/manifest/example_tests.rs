@@ -116,6 +116,7 @@ fn object(id: &str, n: u8, len: u64) -> ManifestObject {
         byte_len: len,
         key_epoch: 3,
         parts: vec![format!("chunk_{n:03}")],
+        object_key: None,
     }
 }
 

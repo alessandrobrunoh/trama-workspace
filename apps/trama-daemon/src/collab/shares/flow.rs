@@ -202,11 +202,12 @@ impl CollabService {
             Payload::Plain(b"{}".to_vec()),
         )
         .await?;
+        // Marks first: the snapshot's message slices end at them.
+        self.init_history_marks(&share_id).await?;
         self.publish_history_snapshot(&client, &share_id).await?;
         self.db()
             .set_share_status(&share, ShareStatus::Ready)
             .await?;
-        self.init_history_marks(&share_id).await?;
         self.ensure_share_stream(&share_id, connection.generation);
         Ok(Ok(self.share_snapshot(&share_id).await?))
     }
@@ -314,16 +315,17 @@ impl CollabService {
         let welcome = change
             .welcome
             .ok_or_else(|| DaemonError::Collab("MLS add produced no Welcome".into()))?;
-        client
-            .post_welcome(
-                share_id,
-                &WelcomeBlob {
-                    device_id: device_id.to_owned(),
-                    welcome: STANDARD.encode(welcome),
-                    epoch: change.epoch,
-                },
-            )
-            .await?;
+        // The group already moved: Welcome, commit and republish are queued
+        // and retried until delivered (no rollback).
+        self.enqueue_welcome(
+            share_id,
+            &WelcomeBlob {
+                device_id: device_id.to_owned(),
+                welcome: STANDARD.encode(welcome),
+                epoch: change.epoch,
+            },
+        )
+        .await?;
         self.emit_share_event(
             &client,
             share_id,
@@ -336,7 +338,8 @@ impl CollabService {
         )
         .await?;
         // Snapshots sealed at older epochs are unreadable for the new device.
-        self.publish_history_snapshot(&client, share_id).await?;
+        self.enqueue_snapshot(share_id).await?;
+        self.flush_share_ops(Some(share_id)).await;
         Ok(change.epoch)
     }
 
@@ -385,6 +388,17 @@ impl CollabService {
                 repo_attachments: Vec::new(),
             };
             self.db().create_thread(&thread).await?;
+            if let Some(slice) = &t.message_slice {
+                let publisher = &manifest.publisher_device_id.0;
+                if let Err(e) = self
+                    .import_slice(&client, share_id, slice, &thread.id, publisher)
+                    .await
+                {
+                    crate::log::warn(format!(
+                        "share {share_id}: pre-share history not imported: {e}"
+                    ));
+                }
+            }
             local.push((t.thread_gid.clone(), thread.id.clone()));
             rows.push(ShareThreadRow {
                 share_id: share.clone(),
@@ -425,6 +439,11 @@ impl CollabService {
         if client.info(share_id).await?.role != ShareRole::Owner {
             return Err(DaemonError::Invalid(
                 "only the share owner publishes snapshots".into(),
+            ));
+        }
+        if !self.flush_share_ops(Some(share_id)).await {
+            return Err(DaemonError::Collab(
+                "earlier membership changes of this share are still being delivered".into(),
             ));
         }
         self.publish_history_snapshot(&client, share_id).await

@@ -63,6 +63,10 @@ pub struct ManifestObject {
     pub byte_len: u64,
     pub key_epoch: u64,
     pub parts: Vec<String>,
+    /// Base64 per-object key (ChaCha20-Poly1305). Only ever travels inside
+    /// the MLS-sealed content manifest; absent in older manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

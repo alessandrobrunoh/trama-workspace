@@ -18,7 +18,7 @@ use super::super::CollabService;
 use super::super::e2ee::mls_err;
 use super::super::transport::{ShareClient, open_manifest, publish_manifests};
 use crate::error::{DaemonError, Result};
-use trama_collab_protocol::vnext::api::ManifestPart;
+use trama_collab_protocol::vnext::api::{ManifestPart, SigningKeyRequest};
 use trama_collab_protocol::vnext::cipher::PayloadKind;
 use trama_domain::manifest::SignedEnvelope;
 
@@ -69,12 +69,19 @@ impl CollabService {
                     .unwrap_or_default(),
                 None => String::new(),
             };
+            let message_slice = match &r.local_thread_id {
+                Some(id) => {
+                    self.thread_slice(client, share_id, &r.thread_gid.0, &id.clone().into())
+                        .await?
+                }
+                None => None,
+            };
             threads.push(ManifestThread {
                 thread_gid: r.thread_gid.clone(),
                 parent_gid: r.parent_gid.clone(),
                 kind: parse_kind(&r.kind),
                 title,
-                message_slice: None,
+                message_slice,
                 fork_origin: None,
             });
         }
@@ -97,6 +104,14 @@ impl CollabService {
             threads,
         };
         let signer = e2ee.clone();
+        let (key_id, _) = signer.signing_key()?;
+        // Idempotent: the server binds this device key to our account once.
+        client
+            .bind_signing_key(&SigningKeyRequest {
+                device_id: e2ee.device_id().to_owned(),
+                public_key: key_id.trim_start_matches("ed25519:").to_owned(),
+            })
+            .await?;
         let envelope = tokio::task::spawn_blocking(move || {
             let (key_id, key) = signer.signing_key()?;
             seal_history(&manifest, &key_id, &key).map_err(|e| DaemonError::Invalid(e.to_string()))
@@ -165,6 +180,20 @@ impl CollabService {
         // The publisher is checked against the signer by `open_history`.
         let publisher: HistoryManifestV1 = serde_json::from_slice(&envelope.payload_bytes)
             .map_err(|_| DaemonError::Collab("manifest payload is malformed".into()))?;
+        // The key must be bound by the server to the owner's account, not
+        // only pinned on first use.
+        let info = client.info(share_id).await?;
+        let b64 = key_id.trim_start_matches("ed25519:");
+        let bound = client.signing_keys(share_id).await?.into_iter().any(|b| {
+            b.username == info.owner
+                && b.device_id == publisher.publisher_device_id.0
+                && b.public_key == b64
+        });
+        if !bound {
+            return Err(DaemonError::Collab(
+                "manifest key is not bound to the share owner's account".into(),
+            ));
+        }
         let mut keyring = Keyring::default();
         keyring.insert(key_id.clone(), publisher.publisher_device_id.clone(), raw);
         let manifest = open_history(&envelope, &keyring, None)
