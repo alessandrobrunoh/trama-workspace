@@ -18,6 +18,9 @@ async-channel = { workspace = true }
 tokio = { workspace = true }
 ulid = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+portable-pty = "0.9"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

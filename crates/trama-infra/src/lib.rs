@@ -11,6 +11,9 @@ pub mod claude;
 pub mod cow;
 #[cfg(unix)]
 pub mod pty;
+#[cfg(windows)]
+#[path = "pty_windows.rs"]
+pub mod pty;
 pub mod setup;
 pub mod share_git;
 

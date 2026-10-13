@@ -57,7 +57,7 @@ pub(super) struct Terminal {
     command: Option<String>,
     size: Mutex<(u16, u16)>,
     pty: Mutex<PtyChild>,
-    writer: Mutex<std::fs::File>,
+    writer: Mutex<Box<dyn std::io::Write + Send>>,
     scrollback: Mutex<Scrollback>,
     exit: Mutex<Option<TerminalExitStatus>>,
 }
@@ -98,7 +98,8 @@ impl Terminal {
     }
 
     fn hang_up(&self, force: bool) {
-        let pty = lock(&self.pty);
+        #[allow(unused_mut)]
+        let mut pty = lock(&self.pty);
         if force {
             pty.kill_group();
         } else {
@@ -150,6 +151,27 @@ pub(super) fn filter_env(
 }
 
 /// The user's login shell, else `/bin/sh`.
+/// Program and arguments for a terminal: the user's shell on Unix
+/// (`-c <command>` or a login shell), `%ComSpec%` (`/C <command>`) on Windows.
+fn shell_invocation(command: Option<&str>) -> (PathBuf, Vec<OsString>) {
+    if cfg!(windows) {
+        let shell = std::env::var_os("ComSpec")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("cmd.exe"));
+        let args = match command {
+            Some(command) => vec!["/C".into(), command.into()],
+            None => Vec::new(),
+        };
+        (shell, args)
+    } else {
+        let args = match command {
+            Some(command) => vec!["-c".into(), command.into()],
+            None => vec!["-l".into()],
+        };
+        (user_shell(), args)
+    }
+}
+
 fn user_shell() -> PathBuf {
     std::env::var_os("SHELL")
         .map(PathBuf::from)
@@ -207,11 +229,7 @@ impl SessionManager {
             }
         }
         let (cols, rows) = clamp_size(cols, rows);
-        let shell = user_shell();
-        let args: Vec<OsString> = match &command {
-            Some(command) => vec!["-c".into(), command.into()],
-            None => vec!["-l".into()],
-        };
+        let (shell, args) = shell_invocation(command.as_deref());
         let spec = PtySpec {
             program: shell,
             args,
@@ -222,8 +240,10 @@ impl SessionManager {
         };
         let pty = PtyChild::spawn(&spec)
             .map_err(|error| DaemonError::Invalid(format!("could not start terminal: {error}")))?;
-        let reader = pty.reader().map_err(DaemonError::from)?;
-        let writer = pty.writer().map_err(DaemonError::from)?;
+        let reader: Box<dyn std::io::Read + Send> =
+            Box::new(pty.reader().map_err(DaemonError::from)?);
+        let writer: Box<dyn std::io::Write + Send> =
+            Box::new(pty.writer().map_err(DaemonError::from)?);
         let terminal = Arc::new(Terminal {
             id: format!("term-{}", MessageId::generate()).to_lowercase(),
             thread_id: thread_id.clone(),
@@ -256,7 +276,11 @@ impl SessionManager {
     /// One blocking reader and one exit watcher per terminal. They hold the
     /// terminal until it exits, so output keeps flowing after a close until
     /// the process is gone.
-    fn spawn_terminal_threads(&self, terminal: &Arc<Terminal>, mut reader: std::fs::File) {
+    fn spawn_terminal_threads(
+        &self,
+        terminal: &Arc<Terminal>,
+        mut reader: Box<dyn std::io::Read + Send>,
+    ) {
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let manager = self.clone();
         let reading = Arc::clone(terminal);
