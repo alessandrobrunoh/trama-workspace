@@ -42,6 +42,13 @@ impl CollabService {
         thread_gid: Option<String>,
         payload: Payload,
     ) -> Result<ShareEventEnvelope> {
+        let durable = matches!(payload, Payload::Raw { .. });
+        if !durable && !self.flush_share_ops(Some(share_id)).await {
+            return Err(DaemonError::Collab(
+                "earlier membership changes of this share are still being delivered; try again shortly"
+                    .into(),
+            ));
+        }
         let e2ee = self.e2ee()?;
         let device = e2ee.device_id().to_owned();
         let share = ShareId::from(share_id);
@@ -82,7 +89,17 @@ impl CollabService {
             created_at: Utc::now().timestamp(),
             received_at: None,
         };
-        client.publish(share_id, vec![event.clone()]).await?;
+        if durable {
+            // Membership commits are already merged locally: they must reach
+            // the server eventually, so they go through the retry queue.
+            let body =
+                serde_json::to_string(&event).map_err(|e| DaemonError::Invalid(e.to_string()))?;
+            self.db()
+                .enqueue_share_op(share_id, super::retry::OP_EVENT, &body)
+                .await?;
+        } else {
+            client.publish(share_id, vec![event.clone()]).await?;
+        }
         // Own head only: the stream cursor must not jump past events of
         // others that were not delivered yet.
         self.db()
@@ -98,6 +115,9 @@ impl CollabService {
             .await?;
         self.seed_share(share_id).await?;
         let _ = self.share_events().admit(&event);
+        if durable {
+            self.flush_share_ops(Some(share_id)).await;
+        }
         Ok(event)
     }
 }

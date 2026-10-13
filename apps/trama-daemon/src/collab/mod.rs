@@ -345,6 +345,7 @@ impl CollabService {
                 Err(err) => crate::log::warn(format!("e2ee unavailable: {err}")),
             }
         }
+        self.start_share_retry();
         self.settle_interrupted_turns().await;
         let (signals, rx) = mpsc::unbounded_channel();
         self.inner.sessions.set_collab_observer(Some(signals));

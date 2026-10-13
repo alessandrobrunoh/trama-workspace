@@ -61,7 +61,8 @@ impl CollabService {
             removed.push(device);
         }
         if !removed.is_empty() {
-            self.publish_history_snapshot(&client, share_id).await?;
+            self.enqueue_snapshot(share_id).await?;
+            self.flush_share_ops(Some(share_id)).await;
         }
         Ok((removed, self.share_epoch(share_id).await?))
     }
