@@ -915,7 +915,10 @@ mod tests {
         let elsewhere = temp.path().join("elsewhere");
         fs::create_dir_all(&elsewhere).unwrap();
         // The copy-on-write checkout cloned the ignored `link/` directory.
-        fs::remove_dir_all(checkout.join("link")).unwrap();
+        // (Only on macOS; elsewhere the plain-clone fallback has no `link/`.)
+        if checkout.join("link").exists() {
+            fs::remove_dir_all(checkout.join("link")).unwrap();
+        }
         std::os::unix::fs::symlink(&elsewhere, checkout.join("link")).unwrap();
         let record = run_checkout_setup(&request(&source, &checkout, "t"));
         assert!(record.linked[0].linked, "{record:?}");

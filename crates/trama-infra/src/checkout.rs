@@ -1763,11 +1763,14 @@ mod tests {
             fs::read_to_string(source.join("same.txt")).unwrap(),
             "original\n"
         );
-        // Ignored files are cloned copy-on-write into the checkout.
-        assert_eq!(
-            fs::read_to_string(a.path.join("ignored.local")).unwrap(),
-            "secret"
-        );
+        // Ignored files are cloned copy-on-write into the checkout (APFS
+        // only; other platforms fall back to a plain clone without them).
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                fs::read_to_string(a.path.join("ignored.local")).unwrap(),
+                "secret"
+            );
+        }
         assert_eq!(
             fs::read_to_string(source.join(".gitignore")).unwrap(),
             "ignored.local\n"
