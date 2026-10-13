@@ -25,6 +25,10 @@ pub fn router_with_proxy(auth: AuthService, proxy: Option<ProxyTrust>) -> Router
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
     auth_routes
         .route("/healthz", get(healthz))
+        .route(
+            trama_collab_protocol::vnext::discovery::DISCOVERY_PATH,
+            get(super::discovery::well_known),
+        )
         .merge(collab::routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),

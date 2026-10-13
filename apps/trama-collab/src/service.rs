@@ -73,6 +73,7 @@ impl AuthService {
             )
             .map_err(|e| format!("initialize database: {e}"))?;
         collab::migrate(&connection)?;
+        http::discovery::migrate(&connection)?;
         // A claim that was open when the previous process stopped has an
         // unknown outcome: mark it ambiguous instead of offering it again.
         if recover_claims {
