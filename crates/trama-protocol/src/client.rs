@@ -323,6 +323,11 @@ pub enum ClientMessage {
     GetShareHistoryStatus {
         thread_id: ThreadId,
     },
+    /// Which share (if any) a local thread belongs to, with this device's
+    /// role and the current writer lease. Answered with `ThreadShare`.
+    GetThreadShare {
+        thread_id: ThreadId,
+    },
     /// Share a top-level thread: create its collab thread on first use
     /// (access `invited`), then apply `access` when set and invite the
     /// `invite` usernames (owner only). Setting `link` (again) returns a fresh

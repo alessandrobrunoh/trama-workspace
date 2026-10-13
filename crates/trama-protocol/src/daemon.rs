@@ -25,6 +25,9 @@ pub enum DaemonMessage {
         totals: UsageReport,
     },
     Error {
+        /// `access_revoked` when this device lost access (the share is now
+        /// closed locally), else the generic daemon error code
+        /// (`not_found`, `invalid`, `collab`, …).
         code: String,
         message: String,
     },
@@ -211,6 +214,11 @@ pub enum DaemonMessage {
     ShareHistoryStatus {
         thread_id: ThreadId,
         entries: Vec<ShareHistoryEntry>,
+    },
+    /// Reply to `GetThreadShare`; `share` is `None` for unshared threads.
+    ThreadShare {
+        thread_id: ThreadId,
+        share: Option<ThreadShareInfo>,
     },
     /// A share command failed. Sent right before the matching `Error`
     /// (whose message ends with `[ref <correlation_id>]`); the daemon log

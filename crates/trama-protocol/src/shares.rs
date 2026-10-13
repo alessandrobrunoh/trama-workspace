@@ -143,3 +143,15 @@ pub struct ShareHistoryEntry {
     pub message_id: MessageId,
     pub state: ShareHistoryState,
 }
+
+/// A local thread's share membership (`GetThreadShare`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadShareInfo {
+    pub share_id: String,
+    pub status: ShareStatus,
+    pub role: ShareRole,
+    pub thread_gid: String,
+    /// Username holding the writer lease on this thread, if any.
+    #[serde(default)]
+    pub lease_holder: Option<String>,
+}
