@@ -26,6 +26,7 @@ Specifiche fornite da Alessandro Bruno. Ordine di lettura:
 - **Scout fuori dallo share:** un thread `scout` esterno al perimetro condiviso viene rifiutato (non entra nello snapshot).
 - **Autorizzazione Git:** unico provider in v1 è GitHub OAuth; l'attestazione enterprise è rinviata.
 - **Index Git in conflitto:** la condivisione è bloccata quando l'index ha conflitti, con un messaggio d'errore chiaro.
+- **M4a, scelte conservative (in corso):** crate `trama-e2ee` su `openmls` 0.8 + `openmls_rust_crypto` (puro Rust, nessun C/asm), unica ciphersuite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` non negoziabile; un gruppo MLS per share (group id = `share_id`), una leaf per device (credential basic = device id); wire format solo ciphertext anche per i commit; ratchet tree nel Welcome; il commit viene applicato localmente subito (se il server lo rifiuta si ripristina lo snapshot precedente); niente proposal standalone; `cipher_payload` = application message con AAD = metadati di routing canonici dell'evento. Lo stato di epoca è uno snapshot segreto opaco dietro `EpochStateStore` (va cifrato a riposo, mai caricato). Secret scanner `trama-domain::secrets`: ogni finding blocca lo share (nessun override in v1), file > 8 MiB non scansionati = bloccati, i finding non contengono mai il segreto. Conflitti: `trama-infra::git::conflicts::unmerged_paths`. Aperti: binding device↔account GitHub, ordinamento dei commit lato server, rotazione key package, cifratura a riposo dello snapshot, security review.
 
 ## Stato dell'implementazione
 
