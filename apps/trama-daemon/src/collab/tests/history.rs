@@ -700,6 +700,18 @@ async fn the_outbox_delivers_after_downtime_and_restart_without_duplicates() {
     alice_ipc.send_turn(&root, "online turn").await;
     alice.settle(std::slice::from_ref(&root)).await;
     eventually("published", || alice.outbox_drained()).await;
+    // The runner's `Finish` must be acknowledged before the outage, or the
+    // service marks the claimed turn ambiguous (seen on slow Windows CI).
+    eventually("online turn finished", || async {
+        alice
+            .sessions
+            .db()
+            .collab_turns_in_states(&[turn_state::SUBMITTED, turn_state::CLAIMED])
+            .await
+            .unwrap()
+            .is_empty()
+    })
+    .await;
 
     // The service goes away; Alice keeps working locally.
     outage.set_down(true);
