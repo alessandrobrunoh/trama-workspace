@@ -20,9 +20,13 @@ const ZED_BUNDLES: [&str; 3] = ["Zed.app", "Zed Preview.app", "Zed Nightly.app"]
 
 /// Build a launch plan only for an existing checkout directory.
 pub fn zed_plan(path: &Path, path_env: Option<&std::ffi::OsStr>) -> Result<LaunchPlan, PlanError> {
-    let mut app_dirs = vec![PathBuf::from("/Applications")];
-    if let Some(home) = std::env::var_os("HOME") {
-        app_dirs.push(PathBuf::from(home).join("Applications"));
+    // App bundles exist only on macOS; elsewhere `zed` must be on PATH.
+    let mut app_dirs = Vec::new();
+    if cfg!(target_os = "macos") {
+        app_dirs.push(PathBuf::from("/Applications"));
+        if let Some(home) = std::env::var_os("HOME") {
+            app_dirs.push(PathBuf::from(home).join("Applications"));
+        }
     }
     zed_plan_in(path, path_env, &app_dirs)
 }
@@ -200,6 +204,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     fn fake_bundle(apps: &Path, name: &str, with_cli: bool) -> PathBuf {
         let macos = apps.join(name).join("Contents/MacOS");
         std::fs::create_dir_all(&macos).unwrap();
@@ -212,6 +217,7 @@ mod tests {
         apps.join(name)
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn zed_preview_bundle_cli_is_used_without_zed_on_path() {
         let directory = test_directory("preview");
@@ -225,6 +231,7 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn stable_zed_is_preferred_and_bundle_without_cli_opens_by_path() {
         let directory = test_directory("stable");

@@ -10,13 +10,14 @@ mod archive;
 #[cfg(test)]
 mod archive_tests;
 mod comments;
-#[cfg(test)]
+// Unix-only: POSIX shell terminals, symlinks and executable scripts.
+#[cfg(all(test, unix))]
 mod composer_tests;
 mod context;
 mod forks;
 #[cfg(test)]
 mod forks_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod setup_tests;
 mod skills;
 mod subthreads;
