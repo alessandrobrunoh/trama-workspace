@@ -356,7 +356,7 @@ async fn owner_shares_device_joins_and_history_flows_encrypted() {
     let snapshot = alice.collab.share_snapshot(&share_id).await.unwrap();
     assert_eq!(snapshot.snapshot_version, 3);
     // The revoked device marks its share closed locally.
-    bob.collab.check_share_access(&share_id).await;
+    assert!(bob.collab.check_share_access(&share_id).await);
     let bob_share = bob
         .collab
         .db()

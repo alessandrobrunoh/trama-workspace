@@ -4,7 +4,7 @@ use trama_db::ShareStatus;
 use trama_domain::ids::{MessageId, ThreadId};
 use trama_domain::share::ShareId;
 use trama_protocol::{
-    ShareHistoryEntry, ShareHistoryState, ShareMemberDevice, ShareMemberSnapshot,
+    ShareHistoryEntry, ShareHistoryState, ShareMemberDevice, ShareMemberSnapshot, ThreadShareInfo,
 };
 
 use super::super::CollabService;
@@ -14,14 +14,17 @@ impl CollabService {
     /// After a failed share call: when the server answers "not found" for
     /// the share itself (revoked, or the share is gone), the local share is
     /// marked closed. Transport errors change nothing.
-    pub(crate) async fn check_share_access(&self, share_id: &str) {
+    /// Returns `true` when this device has lost access: the share was
+    /// already closed locally or is closed now (`access_revoked`).
+    pub(crate) async fn check_share_access(&self, share_id: &str) -> bool {
         let share = ShareId::from(share_id);
         match self.db().share(&share).await {
-            Ok(Some(row)) if row.status != ShareStatus::Closed => {}
-            _ => return,
+            Ok(Some(row)) if row.status == ShareStatus::Closed => return true,
+            Ok(Some(_)) => {}
+            _ => return false,
         }
         let Ok((_, client)) = self.share_client() else {
-            return;
+            return false;
         };
         if let Err(DaemonError::NotFound(_)) = client.info(share_id).await {
             crate::log::warn(format!("share {share_id}: access lost, closing it locally"));
@@ -33,7 +36,47 @@ impl CollabService {
                 crate::log::warn(format!("share {share_id}: not closed: {err}"));
             }
             self.share_events().forget(share_id);
+            return true;
         }
+        false
+    }
+
+    /// The share a local thread belongs to, if any. The lease holder is
+    /// best effort (omitted when the server is unreachable).
+    pub(crate) async fn thread_share(&self, thread: &ThreadId) -> Result<Option<ThreadShareInfo>> {
+        let local = thread.to_string();
+        for row in self.db().shares().await? {
+            let Some(mapped) = self
+                .db()
+                .share_threads(&row.share_id)
+                .await?
+                .into_iter()
+                .find(|r| r.local_thread_id.as_deref() == Some(local.as_str()))
+            else {
+                continue;
+            };
+            let share_id = row.share_id.0.clone();
+            let snapshot = self.share_snapshot(&share_id).await?;
+            let mut lease_holder = None;
+            if row.status == ShareStatus::Ready {
+                if let Ok((_, client)) = self.share_client() {
+                    if let Ok(leases) = client.leases(&share_id).await {
+                        lease_holder = leases
+                            .into_iter()
+                            .find(|l| l.thread_gid == mapped.thread_gid.0)
+                            .map(|l| l.holder);
+                    }
+                }
+            }
+            return Ok(Some(ThreadShareInfo {
+                share_id,
+                status: snapshot.status,
+                role: snapshot.role,
+                thread_gid: mapped.thread_gid.0,
+                lease_holder,
+            }));
+        }
+        Ok(None)
     }
 
     pub(crate) async fn list_share_members(

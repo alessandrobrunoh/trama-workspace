@@ -28,10 +28,16 @@ pub(super) async fn handle(msg: ClientMessage, ctx: &mut Ctx<'_>) -> Result<Conn
             crate::log::warn(format!(
                 "share command {operation} failed [ref {correlation_id}]: {err}"
             ));
-            if let Some(id) = &share_id {
-                ctx.collab.check_share_access(id).await;
+            let revoked = match &share_id {
+                Some(id) => ctx.collab.check_share_access(id).await,
+                None => false,
+            };
+            let code = if revoked {
+                "access_revoked"
+            } else {
+                err.code()
             }
-            let code = err.code().to_owned();
+            .to_owned();
             let message = err.to_string();
             let _ = ctx.out_tx.send(DaemonMessage::ShareFailed {
                 operation,
@@ -135,6 +141,10 @@ async fn run(msg: ClientMessage, collab: &CollabService) -> Result<Option<Daemon
         ClientMessage::GetShareHistoryStatus { thread_id } => {
             let entries = collab.share_history_status(&thread_id).await?;
             DaemonMessage::ShareHistoryStatus { thread_id, entries }
+        }
+        ClientMessage::GetThreadShare { thread_id } => {
+            let share = collab.thread_share(&thread_id).await?;
+            DaemonMessage::ThreadShare { thread_id, share }
         }
         _ => return Ok(None),
     };
