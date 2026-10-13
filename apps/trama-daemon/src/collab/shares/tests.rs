@@ -29,6 +29,12 @@ async fn owner_shares_device_joins_and_history_flows_encrypted() {
     a.connect(&server, "alice", None).await;
     b.connect(&server, "bob", None).await;
     let root = a.create_thread(&alice.workspace_id, "Shared root").await;
+    alice
+        .sessions
+        .db()
+        .append_message(&local_message(&root, "before sharing"))
+        .await
+        .unwrap();
 
     let report = a
         .request(
@@ -155,6 +161,11 @@ async fn owner_shares_device_joins_and_history_flows_encrypted() {
         .unwrap()
         .title;
     assert_eq!(title.as_deref(), Some("Shared root"));
+    // Pre-share history arrived with the snapshot, as remote messages.
+    assert!(bob.messages(&bob_root).await.iter().any(|m| {
+        format!("{:?}", m.content).contains("before sharing")
+            && matches!(&m.actor, trama_domain::message::Actor::Human { id } if id.starts_with("collab:"))
+    }));
 
     // Alice appends history; Bob's daemon decrypts it into his thread.
     let gid = alice
@@ -256,6 +267,52 @@ async fn owner_shares_device_joins_and_history_flows_encrypted() {
         .await
         .unwrap();
     assert_eq!(alice.collab.publish_local_history(&root).await.unwrap(), 0);
+    let status = a
+        .request(
+            ClientMessage::GetShareHistoryStatus {
+                thread_id: root.clone(),
+            },
+            "history status",
+            |m| {
+                fail(m);
+                match m {
+                    DaemonMessage::ShareHistoryStatus { entries, .. } => Some(entries.clone()),
+                    _ => None,
+                }
+            },
+        )
+        .await;
+    assert!(
+        status
+            .iter()
+            .any(|e| e.state == trama_protocol::ShareHistoryState::NotSharedNoLease)
+    );
+    let members = a
+        .request(
+            ClientMessage::ListShareMembers {
+                share_id: share_id.clone(),
+            },
+            "members",
+            |m| {
+                fail(m);
+                match m {
+                    DaemonMessage::ShareMembers { members, .. } => Some(members.clone()),
+                    _ => None,
+                }
+            },
+        )
+        .await;
+    let names: Vec<&str> = members.iter().map(|m| m.username.as_str()).collect();
+    assert!(
+        names.contains(&"alice") && names.contains(&"bob"),
+        "{names:?}"
+    );
+    assert!(
+        members
+            .iter()
+            .find(|m| m.username == "alice")
+            .is_some_and(|m| m.devices.iter().any(|d| d.signing_key_bound))
+    );
 
     // Snapshots re-read from the sealed cache (an MLS message opens once).
     let (_, bob_client) = bob.collab.share_client().unwrap();
@@ -298,6 +355,16 @@ async fn owner_shares_device_joins_and_history_flows_encrypted() {
     assert!(bob_client.info(&share_id).await.is_err());
     let snapshot = alice.collab.share_snapshot(&share_id).await.unwrap();
     assert_eq!(snapshot.snapshot_version, 3);
+    // The revoked device marks its share closed locally.
+    bob.collab.check_share_access(&share_id).await;
+    let bob_share = bob
+        .collab
+        .db()
+        .share(&ShareId::from(share_id.as_str()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bob_share.status, trama_db::ShareStatus::Closed);
 }
 
 fn local_message(
