@@ -99,11 +99,12 @@ mod tests {
     fn evaluate_negotiates_and_reports_bad_documents() {
         let ok = evaluate(
             "u".into(),
-            br#"{"server_id":"s","min_client_protocol":2,"max_client_protocol":3,"capabilities":["e2ee"]}"#,
+            br#"{"server_id":"s","min_client_protocol":2,"max_client_protocol":3,"capabilities":["e2ee","content_transfer"]}"#,
         );
         let profile = ok.profile.unwrap();
         assert_eq!(profile.protocol, 3);
-        assert!(profile.capabilities.is_empty());
+        // Only capabilities this client implements survive negotiation.
+        assert_eq!(profile.capabilities, vec![Capability::E2ee]);
         let newer = evaluate(
             "u".into(),
             br#"{"server_id":"s","min_client_protocol":4,"max_client_protocol":4}"#,
