@@ -5,29 +5,46 @@ on:
   pull_request:
 
 jobs:
-  test:
-    name: macOS
-    runs-on: macos-14
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # Channel comes from rust-toolchain.toml (stable).
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - run: cargo fmt --all -- --check
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+  # Portable core crates must build and pass on every desktop OS.
+  core:
+    name: core (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Git identity for test fixtures
+        run: |
+          git config --global user.name "Trama CI"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+      - name: Check core crates
+        run: cargo check -p trama-domain -p trama-infra -p trama-db -p trama-protocol -p trama-collab-protocol --all-targets
+      - name: Test core crates
+        run: cargo test -p trama-domain -p trama-infra -p trama-db -p trama-protocol -p trama-collab-protocol
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      # Note: trama-desktop first build is heavy (GPUI Kit pulls a large
-      # native graph; expect a long compile on a cold cache).
-      - name: Check workspace
-        run: cargo check --workspace
-
-      - name: Test workspace
-        run: cargo test --workspace
+  # Full workspace (daemon, collab service, GPUI desktop). Linux/Windows
+  # ports of the daemon IPC and desktop are tracked as follow-up milestones.
+  workspace:
+    name: workspace (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace
+      - run: cargo test --workspace
