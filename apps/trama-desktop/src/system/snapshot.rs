@@ -17,8 +17,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use trama_domain::ids::MessageId;
 
-use crate::chat::ChatPanel;
-use crate::theme::{self, Palette};
+use crate::app::theme::{self, Palette};
+use crate::conversation::chat::ChatPanel;
 
 /// Lines a collapsed snapshot shows (its tail).
 const COLLAPSED_LINES: usize = 4;
@@ -422,7 +422,7 @@ fn render_terminal(
         output = output.child(div().text_color(p.text_faint).child(if hidden > 0 {
             format!(
                 "\u{2026} {}",
-                crate::comments::plural(hidden, "earlier line", "earlier lines")
+                crate::review::comments::plural(hidden, "earlier line", "earlier lines")
             )
         } else {
             "\u{2026}".to_string()

@@ -11,9 +11,9 @@ use gpui_kit::*;
 use trama_domain::ids::ThreadId;
 use trama_protocol::{ClientMessage, DaemonMessage, ModelInfo};
 
-use crate::net::{DaemonClient, SendStatus};
-use crate::theme;
-use crate::turns::model_label;
+use crate::app::theme;
+use crate::conversation::turns::model_label;
+use crate::system::net::{DaemonClient, SendStatus};
 
 /// What new sessions use when a thread has no override.
 pub const DEFAULT_MODEL_LABEL: &str = "Sonnet 5.5";

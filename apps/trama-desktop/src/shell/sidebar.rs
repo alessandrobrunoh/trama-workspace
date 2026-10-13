@@ -1,6 +1,6 @@
 //! Left sidebar: a compact thread list grouped by project.
 //!
-//! Setup forms live in the Manage projects dialog ([`crate::projects`]). This
+//! Setup forms live in the Manage projects dialog ([`crate::shell::projects`]). This
 //! panel owns the shared [`Onboarding`] state because the thread list is its
 //! main reader; the workspace and dialogs reach it through the entity.
 
@@ -21,8 +21,8 @@ use gpui_kit::*;
 use trama_domain::ids::{ThreadId, WorkspaceId};
 use trama_protocol::SharedThreadListing;
 
-use crate::onboarding::{Link, Onboarding, OnboardingRequest};
-use crate::theme::{self, Palette};
+use crate::app::theme::{self, Palette};
+use crate::shell::onboarding::{Link, Onboarding, OnboardingRequest};
 
 /// Live state shown as the dot in front of a thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -82,7 +82,7 @@ pub struct SidebarPanel {
     /// Shared-thread badges and the "Shared with me" list.
     pub collab: crate::collab::SidebarCollab,
     /// Collapsed threads and fully shown child lists.
-    pub tree: crate::thread_tree::TreeState,
+    pub tree: crate::shell::thread_tree::TreeState,
     /// The "Archived" section is expanded (collapsed by default).
     archived_open: bool,
 }
@@ -190,7 +190,8 @@ impl Render for SidebarPanel {
         let connected = self.onboarding.connected();
         let workspaces = self.onboarding.workspaces.clone();
         let selected_workspace = self.onboarding.selected_workspace.clone();
-        let (threads, archived) = crate::thread_tree::split_archived(&self.onboarding.threads);
+        let (threads, archived) =
+            crate::shell::thread_tree::split_archived(&self.onboarding.threads);
         let selected_thread = self.onboarding.selected_thread.clone();
         let can_thread = self.onboarding.can_create_thread();
 
@@ -365,14 +366,14 @@ impl Render for SidebarPanel {
                 }
                 continue;
             }
-            for tree_row in crate::thread_tree::tree_rows(&threads, &self.tree) {
+            for tree_row in crate::shell::thread_tree::tree_rows(&threads, &self.tree) {
                 let (row, children, collapsed) = match tree_row {
-                    crate::thread_tree::TreeRow::Thread {
+                    crate::shell::thread_tree::TreeRow::Thread {
                         row,
                         children,
                         collapsed,
                     } => (row, children, collapsed),
-                    crate::thread_tree::TreeRow::ShowMore {
+                    crate::shell::thread_tree::TreeRow::ShowMore {
                         parent,
                         depth,
                         hidden,
@@ -466,7 +467,7 @@ impl SidebarPanel {
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let indent = crate::thread_tree::indent_level(depth);
+        let indent = crate::shell::thread_tree::indent_level(depth);
         h_flex()
             .id(SharedString::from(format!("th-more-{parent}")))
             .h(px(24.))
@@ -491,7 +492,7 @@ impl SidebarPanel {
     fn thread_row(
         &self,
         thread: &trama_protocol::ThreadSnapshot,
-        row: &crate::subthreads::ThreadRow,
+        row: &crate::conversation::subthreads::ThreadRow,
         (children, collapsed): (usize, bool),
         selected: bool,
         status: ThreadStatus,
@@ -501,8 +502,8 @@ impl SidebarPanel {
         let id = thread.id.clone();
         let title = thread.title.clone();
         let depth = row.depth;
-        let indent = crate::thread_tree::indent_level(depth);
-        let marker = crate::thread_tree::depth_marker(depth);
+        let indent = crate::shell::thread_tree::indent_level(depth);
+        let marker = crate::shell::thread_tree::depth_marker(depth);
         let kind = row.kind;
         let verdict = row.verdict;
         let group = SharedString::from(format!("thread-row-{id}"));
@@ -514,7 +515,7 @@ impl SidebarPanel {
         let subagent = thread
             .subagent
             .as_ref()
-            .map(|snapshot| crate::subagents::sidebar_badge(&id, snapshot, p));
+            .map(|snapshot| crate::conversation::subagents::sidebar_badge(&id, snapshot, p));
         // Fixed-width slot so rows line up whether or not they have children.
         let chevron = div()
             .id(SharedString::from(format!("th-toggle-{id}")))
@@ -573,15 +574,18 @@ impl SidebarPanel {
                     .child(status_dot(status, p))
                     .tooltip(move |window, cx| Tooltip::new(status.label()).build(window, cx)),
             )
-            .children(crate::subthreads::kind_icon(kind).map(|icon| {
-                div()
-                    .id(SharedString::from(format!("th-kind-{id}")))
-                    .flex_shrink_0()
-                    .child(Icon::new(icon).with_size(px(12.)).text_color(p.text_faint))
-                    .tooltip(move |window, cx| {
-                        Tooltip::new(crate::subthreads::kind_label(kind)).build(window, cx)
-                    })
-            }))
+            .children(
+                crate::conversation::subthreads::kind_icon(kind).map(|icon| {
+                    div()
+                        .id(SharedString::from(format!("th-kind-{id}")))
+                        .flex_shrink_0()
+                        .child(Icon::new(icon).with_size(px(12.)).text_color(p.text_faint))
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(crate::conversation::subthreads::kind_label(kind))
+                                .build(window, cx)
+                        })
+                }),
+            )
             .children(subagent)
             .child(div().flex_1().min_w_0().truncate().child(title))
             .when_some(marker, |this, marker| {
@@ -618,8 +622,10 @@ impl SidebarPanel {
                     .flex_shrink_0()
                     .child(
                         Icon::new(match badge {
-                            crate::subthreads::VerdictBadge::Approved => IconName::CircleCheckBig,
-                            crate::subthreads::VerdictBadge::ChangesRequested => {
+                            crate::conversation::subthreads::VerdictBadge::Approved => {
+                                IconName::CircleCheckBig
+                            }
+                            crate::conversation::subthreads::VerdictBadge::ChangesRequested => {
                                 IconName::CircleAlert
                             }
                         })
@@ -844,7 +850,12 @@ impl SidebarPanel {
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(SidebarEvent::OpenShared(open.clone()));
                     }))
-                    .child(crate::presence::avatar(p, &listing.owner, 16., false))
+                    .child(crate::collab::presence::avatar(
+                        p,
+                        &listing.owner,
+                        16.,
+                        false,
+                    ))
                     .child(
                         div()
                             .flex_1()

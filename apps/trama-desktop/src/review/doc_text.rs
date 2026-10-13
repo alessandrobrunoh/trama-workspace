@@ -8,7 +8,7 @@
 //! A comment on one of these blocks cannot anchor to it (the protocol only
 //! anchors to messages, code and diff hunks), so it is stored on the
 //! turn's answer with the selected passage quoted in its body
-//! ([`crate::comments::proxy_body`]). Marks find that passage again in the
+//! ([`crate::review::comments::proxy_body`]). Marks find that passage again in the
 //! block's text to highlight it and to place the comment under the block.
 
 use std::collections::{HashMap, HashSet};
@@ -22,7 +22,7 @@ use gpui_kit::*;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Mark {
     pub group: Option<usize>,
-    /// The block kind the comment was written on ([`crate::comments::proxy_body`]).
+    /// The block kind the comment was written on ([`crate::review::comments::proxy_body`]).
     pub kind: &'static str,
     pub excerpt: String,
     pub color: Hsla,

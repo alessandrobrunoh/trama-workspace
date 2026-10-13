@@ -19,11 +19,11 @@ use gpui_kit::*;
 use trama_domain::ids::ThreadId;
 use trama_protocol::{ClientMessage, DaemonMessage, Mentionable, SkillInfo};
 
-use crate::mentions;
-use crate::net::{DaemonClient, SendStatus};
-use crate::slash;
-use crate::theme::{self, Palette};
-use crate::trigger::{self, Trigger};
+use crate::app::theme::{self, Palette};
+use crate::conversation::mentions;
+use crate::conversation::slash;
+use crate::conversation::trigger::{self, Trigger};
+use crate::system::net::{DaemonClient, SendStatus};
 
 const MENTION_DEBOUNCE: Duration = Duration::from_millis(90);
 const MENTION_LIMIT: u32 = 30;

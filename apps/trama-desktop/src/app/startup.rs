@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::net::default_socket_path;
+use crate::system::net::default_socket_path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonLocate {

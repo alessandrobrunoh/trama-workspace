@@ -13,8 +13,8 @@ use trama_domain::ids::{MessageId, ThreadId};
 use trama_domain::message::{Message, MessageAnnotation, Role};
 use trama_protocol::{SubagentProfile, SubagentSnapshot, SubagentStatus, ThreadSnapshot};
 
-use crate::chat::ChatPanel;
-use crate::theme::{self, Palette};
+use crate::app::theme::{self, Palette};
+use crate::conversation::chat::ChatPanel;
 
 // -- profiles and statuses ---------------------------------------------------
 
@@ -228,7 +228,7 @@ impl ThreadIndex {
 /// Prefer the child recorded for this tool call over the guess from its
 /// input and output (titles can repeat; the tool use id cannot).
 pub fn link_spawned_child(
-    link: &mut crate::tools::SubthreadLink,
+    link: &mut crate::conversation::tools::SubthreadLink,
     tool_use_id: &str,
     index: &ThreadIndex,
 ) {
@@ -550,14 +550,14 @@ mod tests {
             ),
         ];
         let index = ThreadIndex::from_threads(&threads);
-        let mut link = crate::tools::SubthreadLink {
+        let mut link = crate::conversation::tools::SubthreadLink {
             title: "Same title".into(),
             thread: Some(ThreadId::from("c1")),
             message: false,
         };
         link_spawned_child(&mut link, "toolu_b", &index);
         assert_eq!(link.thread, Some(ThreadId::from("c2")));
-        let mut message = crate::tools::SubthreadLink {
+        let mut message = crate::conversation::tools::SubthreadLink {
             title: "x".into(),
             thread: None,
             message: true,

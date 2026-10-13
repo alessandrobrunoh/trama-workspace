@@ -9,7 +9,7 @@
 //! lines over the diff built from the tool input, whose lines can be picked
 //! and commented on. Trama subagent calls are "Agent spawned: <title>"
 //! lines that open the subagent next to the transcript. All their text is
-//! selectable and commentable ([`crate::doc_text`]). The pure helpers come
+//! selectable and commentable ([`crate::review::doc_text`]). The pure helpers come
 //! first and are tested; the renderers below them only lay out what they
 //! compute.
 
@@ -43,8 +43,8 @@ use gpui_kit::*;
 use serde_json::Value;
 use trama_domain::ids::ThreadId;
 
-use crate::chat::{ChatEntry, ChatPanel};
-use crate::comments;
-use crate::diff::{DiffLine, Hunk, LineKind};
-use crate::doc_text::{BlockTexts, Mark, code_block, escape_markdown};
-use crate::theme::{self, Palette};
+use crate::app::theme::{self, Palette};
+use crate::conversation::chat::{ChatEntry, ChatPanel};
+use crate::review::comments;
+use crate::review::diff::{DiffLine, Hunk, LineKind};
+use crate::review::doc_text::{BlockTexts, Mark, code_block, escape_markdown};

@@ -13,7 +13,7 @@ use gpui_kit::component::{
 use gpui_kit::*;
 use trama_protocol::{MentionKind, Mentionable, PromptMention};
 
-use crate::theme;
+use crate::app::theme;
 
 pub fn kind_name(kind: MentionKind) -> &'static str {
     match kind {

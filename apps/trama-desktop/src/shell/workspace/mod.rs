@@ -35,24 +35,24 @@ use trama_domain::agent::ApprovalDecision;
 use trama_domain::ids::{ThreadId, WorkspaceId};
 use trama_protocol::{ClientMessage, DaemonMessage, LandOutcome, SubthreadKind, ThreadKind};
 
-use crate::changes::{ChangesEvent, ChangesPanel, DrawerTab, render_drawer};
-use crate::chat::{ChatEvent, ChatPanel};
+use crate::app::keymap::{self, CONTEXT, fuzzy_rank};
+use crate::app::startup::{DaemonLocate, DaemonStart};
+use crate::app::theme::{self, Palette};
 use crate::collab::CollabStore;
-use crate::collab_account::{AccountView, JoinEvent, JoinView};
-use crate::comments::CommentStore;
-use crate::copies::CopyPanel;
-use crate::disk_usage::{DiskUsageEvent, DiskUsageView, RemovalKind};
-use crate::keymap::{self, CONTEXT, fuzzy_rank};
-use crate::net::{DaemonClient, NetEvent};
-use crate::onboarding::{Link, OnboardingRequest};
-use crate::projects::{NewThreadEvent, NewThreadView, ProjectsEvent, ProjectsPanel};
-use crate::share_dialog::{ShareDialog, ShareDialogEvent};
-use crate::sidebar::{SidebarEvent, SidebarPanel, status_dot};
-use crate::startup::{DaemonLocate, DaemonStart};
-use crate::subthreads::{
+use crate::collab::account::{AccountView, JoinEvent, JoinView};
+use crate::collab::share_dialog::{ShareDialog, ShareDialogEvent};
+use crate::conversation::chat::{ChatEvent, ChatPanel};
+use crate::conversation::subthreads::{
     PullSummary, SubthreadBar, land_label, subthread_parent, title_from_prompt,
 };
-use crate::theme::{self, Palette};
+use crate::review::changes::{ChangesEvent, ChangesPanel, DrawerTab, render_drawer};
+use crate::review::comments::CommentStore;
+use crate::shell::onboarding::{Link, OnboardingRequest};
+use crate::shell::projects::{NewThreadEvent, NewThreadView, ProjectsEvent, ProjectsPanel};
+use crate::shell::sidebar::{SidebarEvent, SidebarPanel, status_dot};
+use crate::system::copies::CopyPanel;
+use crate::system::disk_usage::{DiskUsageEvent, DiskUsageView, RemovalKind};
+use crate::system::net::{DaemonClient, NetEvent};
 
 /// What a palette row does when confirmed.
 #[derive(Debug, Clone, PartialEq)]
@@ -82,7 +82,7 @@ pub struct Workspace {
     focus_handle: FocusHandle,
     chat: Entity<ChatPanel>,
     /// A subagent's transcript beside the selected thread's.
-    pane: crate::side_pane::SidePane,
+    pane: crate::shell::side_pane::SidePane,
     pane_chat: Entity<ChatPanel>,
     pane_comments: Entity<CommentStore>,
     copies: Entity<CopyPanel>,
@@ -105,7 +105,7 @@ pub struct Workspace {
     /// Subthread this window asked for, to follow it once created.
     pending_subthread: Option<(ThreadId, SubthreadKind)>,
     /// The fork-at-a-message dialog.
-    fork_view: Entity<crate::forks::ForkView>,
+    fork_view: Entity<crate::conversation::forks::ForkView>,
     /// Parent of a fork this window asked for; the fork opens when created.
     pending_fork: Option<ThreadId>,
     /// "Disk usage" dialog body.
@@ -118,7 +118,7 @@ pub struct Workspace {
     _subscriptions: Vec<Subscription>,
     _net_events: Task<()>,
     _daemon_start: Option<Task<()>>,
-    dev: Option<crate::devhooks::DevScript>,
+    dev: Option<crate::app::devhooks::DevScript>,
     /// Showing the scripted demo transcript (debug builds).
     dev_demo: bool,
 }
@@ -127,7 +127,7 @@ impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         window.set_window_title("TramaWorkspace");
 
-        let (client, events) = crate::net::start();
+        let (client, events) = crate::system::net::start();
         let comments = cx.new(|_| CommentStore::new(client.clone()));
         let chat_client = client.clone();
         let chat_comments = comments.clone();
@@ -160,7 +160,7 @@ impl Workspace {
         let join_store = collab.clone();
         let join = cx.new(|cx| JoinView::new(join_store, window, cx));
         let composer_input = chat.read(cx).composer_input();
-        let fork_view = cx.new(|cx| crate::forks::ForkView::new(window, cx));
+        let fork_view = cx.new(|cx| crate::conversation::forks::ForkView::new(window, cx));
         let disk_usage = cx.new(|_| DiskUsageView::new());
 
         let subscriptions = vec![
@@ -251,9 +251,9 @@ impl Workspace {
             cx.subscribe_in(
                 &fork_view,
                 window,
-                |this, _, event: &crate::forks::ForkEvent, window, cx| {
+                |this, _, event: &crate::conversation::forks::ForkEvent, window, cx| {
                     window.close_dialog(cx);
-                    if let crate::forks::ForkEvent::Submit(message) = event {
+                    if let crate::conversation::forks::ForkEvent::Submit(message) = event {
                         this.send_fork(message.clone(), window, cx);
                     }
                 },
@@ -284,7 +284,7 @@ impl Workspace {
                     .iter()
                     .map(|thread| (thread.id.clone(), thread.model.clone()))
                     .collect();
-                let index = crate::subagents::ThreadIndex::from_threads(
+                let index = crate::conversation::subagents::ThreadIndex::from_threads(
                     &sidebar.read(cx).onboarding.threads,
                 );
                 this.chat.update(cx, |chat, cx| {
@@ -318,7 +318,7 @@ impl Workspace {
                 }
             }),
             cx.observe_window_appearance(window, |_, window, cx| {
-                if crate::devhooks::appearance().is_none() {
+                if crate::app::devhooks::appearance().is_none() {
                     theme::apply(theme::mode_for(window.appearance()), cx);
                 }
             }),
@@ -336,33 +336,37 @@ impl Workspace {
             }
         });
 
-        let mut demo_pane = crate::side_pane::SidePane::default();
-        if let Some(dev) = crate::devhooks::from_env() {
+        let mut demo_pane = crate::shell::side_pane::SidePane::default();
+        if let Some(dev) = crate::app::devhooks::from_env() {
             if let Some((label, diff)) = &dev.diff {
                 changes.update(cx, |changes, cx| changes.set_diff(label.clone(), diff, cx));
             }
             if dev.demo {
-                let parent = ThreadId::from(crate::demo::PARENT);
-                let index = crate::subagents::ThreadIndex::from_threads(&crate::demo::threads());
+                let parent = ThreadId::from(crate::app::demo::PARENT);
+                let index = crate::conversation::subagents::ThreadIndex::from_threads(
+                    &crate::app::demo::threads(),
+                );
                 sidebar.update(cx, |sidebar, _| {
-                    sidebar.onboarding.apply_threads(crate::demo::threads());
+                    sidebar
+                        .onboarding
+                        .apply_threads(crate::app::demo::threads());
                 });
                 comments.update(cx, |comments, _| {
-                    comments.load_demo(parent.clone(), crate::demo::parent_comments());
+                    comments.load_demo(parent.clone(), crate::app::demo::parent_comments());
                 });
                 chat.update(cx, |chat, cx| {
                     chat.set_thread_index(index.clone(), cx);
-                    chat.load_demo(parent, crate::demo::parent_entries(), Vec::new(), cx);
+                    chat.load_demo(parent, crate::app::demo::parent_entries(), Vec::new(), cx);
                 });
                 if dev.pane {
-                    let child = ThreadId::from(crate::demo::CHILD);
+                    let child = ThreadId::from(crate::app::demo::CHILD);
                     demo_pane.open(child.clone(), None);
                     pane_chat.update(cx, |chat, cx| {
                         chat.set_thread_index(index, cx);
                         chat.load_demo(
                             child,
-                            crate::demo::child_entries(),
-                            crate::demo::child_received(),
+                            crate::app::demo::child_entries(),
+                            crate::app::demo::child_received(),
                             cx,
                         );
                     });
@@ -392,7 +396,7 @@ impl Workspace {
             join,
             palette,
             palette_query: String::new(),
-            drawer_open: crate::devhooks::from_env().is_some_and(|dev| dev.drawer),
+            drawer_open: crate::app::devhooks::from_env().is_some_and(|dev| dev.drawer),
             drawer_tab: DrawerTab::default(),
             seen_completed_turns: 0,
             pending_subthread: None,
@@ -405,8 +409,8 @@ impl Workspace {
             _subscriptions: subscriptions,
             _net_events: net_events,
             _daemon_start: None,
-            dev: crate::devhooks::from_env(),
-            dev_demo: crate::devhooks::from_env().is_some_and(|dev| dev.demo),
+            dev: crate::app::devhooks::from_env(),
+            dev_demo: crate::app::devhooks::from_env().is_some_and(|dev| dev.demo),
         }
     }
 
@@ -426,7 +430,7 @@ impl Workspace {
             thread_id: thread_id.clone(),
             base,
         };
-        if self.client.send(message) == crate::net::SendStatus::Enqueued {
+        if self.client.send(message) == crate::system::net::SendStatus::Enqueued {
             self.changes
                 .update(cx, |changes, cx| changes.begin_loading(thread_id, cx));
         }
@@ -466,7 +470,7 @@ impl Workspace {
             title,
             initial_prompt,
         };
-        if self.client.send(message) == crate::net::SendStatus::Rejected {
+        if self.client.send(message) == crate::system::net::SendStatus::Rejected {
             window.push_notification(
                 Notification::error("The daemon is not connected; no subthread was created."),
                 cx,
@@ -533,7 +537,7 @@ impl Workspace {
     /// Ask for a title, a first prompt and a kind, then fork at the message.
     fn open_fork(
         &mut self,
-        target: crate::forks::ForkTarget,
+        target: crate::conversation::forks::ForkTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -557,7 +561,7 @@ impl Workspace {
             return;
         };
         let parent = thread_id.clone();
-        if self.client.send(message) == crate::net::SendStatus::Rejected {
+        if self.client.send(message) == crate::system::net::SendStatus::Rejected {
             window.push_notification(
                 Notification::error("The daemon is not connected; nothing was forked."),
                 cx,

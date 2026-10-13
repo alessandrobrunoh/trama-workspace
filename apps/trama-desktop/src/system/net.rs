@@ -66,7 +66,7 @@ pub struct DaemonClient {
     connected: Arc<AtomicBool>,
 }
 
-/// Unique receiver for daemon events. Held by [`crate::workspace::Workspace`].
+/// Unique receiver for daemon events. Held by [`crate::shell::workspace::Workspace`].
 pub struct DaemonEvents {
     events: Receiver<NetEvent>,
 }

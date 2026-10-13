@@ -18,11 +18,11 @@ use gpui_kit::*;
 use trama_domain::ids::{CommentId, MessageId};
 use trama_protocol::{ChangeBase, FileChange, FileChangeStatus, RepoChanges, ThreadId};
 
-use crate::comments::{
+use crate::app::theme::{self, Palette};
+use crate::review::comments::{
     self, AnchorBadge, CardHandlers, CommentDraft, CommentGroup, CommentStore, Detached, DiffSlot,
 };
-use crate::diff::{DiffFile, DiffLine, FileStatus, LineKind, parse_unified_diff, totals};
-use crate::theme::{self, Palette};
+use crate::review::diff::{DiffFile, DiffLine, FileStatus, LineKind, parse_unified_diff, totals};
 
 /// One repository's files, ready to render.
 #[derive(Debug, Clone, PartialEq)]
@@ -1529,7 +1529,7 @@ pub fn render_drawer(
 #[cfg(test)]
 mod tests {
     use super::{HashMap, RepoView, file_key, parse_unified_diff, retain_seen, split_path};
-    use crate::diff::FileStatus;
+    use crate::review::diff::FileStatus;
     use trama_protocol::{FileChange, FileChangeStatus, RepoChanges, RepositoryId};
 
     const DIFF: &str = "\

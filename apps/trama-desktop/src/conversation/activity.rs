@@ -1,14 +1,14 @@
 //! Replayed turn activity: the daemon stores each turn's tool calls and
 //! thinking (`DaemonMessage::TurnActivity`) and replays them on subscribe,
-//! so the tool views of [`crate::tools`] come back after a restart. This
+//! so the tool views of [`crate::conversation::tools`] come back after a restart. This
 //! module turns the stored items into transcript entries.
 
 use std::collections::HashSet;
 
 use trama_protocol::ActivityItem;
 
-use crate::chat::ChatEntry;
-use crate::tools::ToolTiming;
+use crate::conversation::chat::ChatEntry;
+use crate::conversation::tools::ToolTiming;
 
 /// Entries (and tool timings by `tool_use_id`) for one replayed turn.
 #[derive(Default)]
@@ -96,7 +96,7 @@ pub fn shown_tool_ids(entries: &[ChatEntry]) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{self, Item, ToolKind};
+    use crate::conversation::tools::{self, Item, ToolKind};
     use chrono::{DateTime, Utc};
     use serde_json::json;
 

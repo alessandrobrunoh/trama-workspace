@@ -441,7 +441,7 @@ impl Workspace {
             PaletteTarget::ToggleDrawer => self.toggle_drawer(cx),
             PaletteTarget::ManageProjects => self.open_projects(window, cx),
             PaletteTarget::PrepareCheckout => {
-                crate::projects::open_prepare_confirm(self.sidebar.clone(), window, cx);
+                crate::shell::projects::open_prepare_confirm(self.sidebar.clone(), window, cx);
             }
             PaletteTarget::ToggleAppearance => self.toggle_appearance(cx),
             PaletteTarget::Shortcuts => self.open_shortcuts(window, cx),

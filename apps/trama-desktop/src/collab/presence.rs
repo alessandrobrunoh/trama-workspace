@@ -11,8 +11,8 @@ use gpui_kit::*;
 use trama_domain::message::Role;
 use trama_protocol::{CollabMember, CollabMemberVia, CollabPresenceState};
 
+use crate::app::theme::{self, Palette};
 use crate::collab::{RemotePhase, RemoteTurn, Speaker, avatar_hue, initials};
-use crate::theme::{self, Palette};
 
 /// Avatars shown in the title bar before the rest collapse into `+N`.
 const MAX_TITLE_AVATARS: usize = 5;

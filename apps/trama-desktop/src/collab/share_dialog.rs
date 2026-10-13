@@ -20,9 +20,9 @@ use trama_protocol::{
     ClientMessage, CollabAccess, CollabMember, CollabMemberVia, SharedThreadSnapshot,
 };
 
+use crate::app::theme::{self, Palette};
+use crate::collab::presence;
 use crate::collab::{CollabStore, encode_join, valid_name};
-use crate::presence;
-use crate::theme::{self, Palette};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SharePhase {

@@ -20,7 +20,7 @@ impl Render for Workspace {
         let pane = match (online, self.pane_info(cx)) {
             (true, Some(info)) => {
                 let weak = cx.weak_entity();
-                let actions = crate::side_pane::PaneActions {
+                let actions = crate::shell::side_pane::PaneActions {
                     back: Box::new({
                         let weak = weak.clone();
                         move |_, _, cx| {
@@ -63,7 +63,7 @@ impl Render for Workspace {
                 };
                 let running = self.pane_chat.read(cx).is_running();
                 let width = (!self.pane.expanded).then(|| self.pane.shown_width(available));
-                Some(crate::side_pane::render(
+                Some(crate::shell::side_pane::render(
                     &self.pane,
                     &info,
                     running,
@@ -144,7 +144,7 @@ impl Render for Workspace {
                 }),
             )
             .on_action(cx.listener(
-                |this, _: &crate::terminal_view::ToggleTerminal, window, cx| {
+                |this, _: &crate::terminal::view::ToggleTerminal, window, cx| {
                     this.chat
                         .update(cx, |chat, cx| chat.toggle_terminal(window, cx));
                 },

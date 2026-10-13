@@ -19,9 +19,9 @@ use gpui_kit::*;
 use trama_domain::ids::ThreadId;
 use trama_protocol::{ClientMessage, DaemonMessage, TerminalExitStatus, TerminalSnapshot};
 
-use crate::net::{DaemonClient, SendStatus};
-use crate::theme::{self, Palette};
-use crate::vt::{self, CellStyle, TermColor, VtScreen};
+use crate::app::theme::{self, Palette};
+use crate::system::net::{DaemonClient, SendStatus};
+use crate::terminal::vt::{self, CellStyle, TermColor, VtScreen};
 
 /// Key context of a focused terminal grid.
 pub const CONTEXT: &str = "TramaTerminal";
@@ -45,7 +45,7 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("shift-tab", SendBackTab, Some(CONTEXT)),
         KeyBinding::new("escape", SendEscape, Some(CONTEXT)),
         KeyBinding::new("cmd-v", PasteToTerminal, Some(CONTEXT)),
-        KeyBinding::new("ctrl-`", ToggleTerminal, Some(crate::keymap::CONTEXT)),
+        KeyBinding::new("ctrl-`", ToggleTerminal, Some(crate::app::keymap::CONTEXT)),
     ]);
 }
 

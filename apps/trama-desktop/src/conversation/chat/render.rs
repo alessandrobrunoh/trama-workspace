@@ -51,7 +51,7 @@ impl Render for ChatPanel {
             ));
         }
         if shared.revoked {
-            rows.push(row(crate::presence::revoked_banner(&p)));
+            rows.push(row(crate::collab::presence::revoked_banner(&p)));
         }
         if !self.connected && !self.pane_mode && !self.demo {
             rows.push(row(notice(
@@ -185,7 +185,7 @@ impl Render for ChatPanel {
         }
 
         for turn in &shared.remote_turns {
-            rows.push(row(crate::presence::remote_turn(&p, turn)));
+            rows.push(row(crate::collab::presence::remote_turn(&p, turn)));
             last_author = None;
         }
 
@@ -362,9 +362,9 @@ impl Render for ChatPanel {
         } else {
             None
         };
-        let live_drafts = crate::presence::drafts_block(&p, &shared.drafts);
+        let live_drafts = crate::collab::presence::drafts_block(&p, &shared.drafts);
         let shared_footer = (shared.linked && !shared.revoked)
-            .then(|| crate::presence::shared_footer(&p, shared.runner_online));
+            .then(|| crate::collab::presence::shared_footer(&p, shared.runner_online));
 
         v_flex()
             .size_full()

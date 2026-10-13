@@ -11,7 +11,7 @@ impl ChatPanel {
         &mut self,
         thread: ThreadId,
         entries: Vec<ChatEntry>,
-        received: Vec<(MessageId, crate::subagents::AnnotationRow)>,
+        received: Vec<(MessageId, crate::conversation::subagents::AnnotationRow)>,
         cx: &mut Context<Self>,
     ) {
         self.demo = true;
@@ -28,7 +28,7 @@ impl ChatPanel {
         }
         self.entries = entries;
         self.received = received.into_iter().collect();
-        if crate::devhooks::from_env().is_some_and(|dev| dev.bottom) {
+        if crate::app::devhooks::from_env().is_some_and(|dev| dev.bottom) {
             self.scroll.scroll_to_bottom();
         }
         cx.notify();
@@ -117,7 +117,7 @@ impl ChatPanel {
                 matches!(
                     entry,
                     ChatEntry::Annotation(row)
-                        if matches!(row.kind, crate::subagents::AnnotationKind::SubagentStarted(_))
+                        if matches!(row.kind, crate::conversation::subagents::AnnotationKind::SubagentStarted(_))
                             && spawned.contains(&row.thread_id)
                 )
             })
@@ -246,60 +246,59 @@ impl ChatPanel {
         row: usize,
         p: &Palette,
     ) -> AnyElement {
-        let (element, tip): (AnyElement, String) = match author {
-            AuthorKey::Me => (
-                match me {
-                    Some(name) => {
-                        crate::presence::avatar(p, name, AVATAR, false).into_any_element()
-                    }
-                    None => {
-                        glyph_avatar(IconName::User, p.selected, p.text_muted).into_any_element()
-                    }
-                },
-                "You".into(),
-            ),
-            AuthorKey::Person(name) => (
-                crate::presence::avatar(p, name, AVATAR, false).into_any_element(),
-                name.clone(),
-            ),
-            AuthorKey::Agent => (
-                glyph_avatar(IconName::Bot, p.accent_soft, p.accent_text).into_any_element(),
-                "Claude".into(),
-            ),
-            AuthorKey::PersonAgent(name) => (
-                div()
-                    .relative()
-                    .child(crate::presence::avatar(p, name, AVATAR, false))
-                    .child(
-                        div()
-                            .absolute()
-                            .bottom(px(-3.))
-                            .right(px(-3.))
-                            .size(px(12.))
-                            .rounded_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(p.accent_soft)
-                            .border_1()
-                            .border_color(p.bg)
-                            .child(
-                                Icon::new(IconName::Bot)
-                                    .with_size(px(8.))
-                                    .text_color(p.accent_text),
-                            ),
-                    )
-                    .into_any_element(),
-                format!("{name}'s Claude"),
-            ),
-            AuthorKey::ThreadAgent(thread) => (
-                glyph_avatar(IconName::Bot, p.selected, p.text_muted).into_any_element(),
-                format!(
-                    "Agent of {}",
-                    self.thread_index.title(thread).unwrap_or("another thread")
+        let (element, tip): (AnyElement, String) =
+            match author {
+                AuthorKey::Me => (
+                    match me {
+                        Some(name) => crate::collab::presence::avatar(p, name, AVATAR, false)
+                            .into_any_element(),
+                        None => glyph_avatar(IconName::User, p.selected, p.text_muted)
+                            .into_any_element(),
+                    },
+                    "You".into(),
                 ),
-            ),
-        };
+                AuthorKey::Person(name) => (
+                    crate::collab::presence::avatar(p, name, AVATAR, false).into_any_element(),
+                    name.clone(),
+                ),
+                AuthorKey::Agent => (
+                    glyph_avatar(IconName::Bot, p.accent_soft, p.accent_text).into_any_element(),
+                    "Claude".into(),
+                ),
+                AuthorKey::PersonAgent(name) => (
+                    div()
+                        .relative()
+                        .child(crate::collab::presence::avatar(p, name, AVATAR, false))
+                        .child(
+                            div()
+                                .absolute()
+                                .bottom(px(-3.))
+                                .right(px(-3.))
+                                .size(px(12.))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(p.accent_soft)
+                                .border_1()
+                                .border_color(p.bg)
+                                .child(
+                                    Icon::new(IconName::Bot)
+                                        .with_size(px(8.))
+                                        .text_color(p.accent_text),
+                                ),
+                        )
+                        .into_any_element(),
+                    format!("{name}'s Claude"),
+                ),
+                AuthorKey::ThreadAgent(thread) => (
+                    glyph_avatar(IconName::Bot, p.selected, p.text_muted).into_any_element(),
+                    format!(
+                        "Agent of {}",
+                        self.thread_index.title(thread).unwrap_or("another thread")
+                    ),
+                ),
+            };
         let tip: SharedString = tip.into();
         div()
             .id(("doc-avatar", row))
@@ -450,7 +449,7 @@ impl ChatPanel {
                     row_of.insert(id.clone(), row);
                     self.message_row(id, body, p, cx)
                 } else {
-                    crate::presence::remote_notice(p, &name, markdown)
+                    crate::collab::presence::remote_notice(p, &name, markdown)
                 }
             }
             ChatEntry::Assistant {
@@ -488,7 +487,11 @@ impl ChatPanel {
             } if tools::tool_kind(name) == ToolKind::Subthread => {
                 let mut link =
                     tools::subthread_link(name, input_json, output.as_ref(), &self.known_threads);
-                crate::subagents::link_spawned_child(&mut link, tool_use_id, &self.thread_index);
+                crate::conversation::subagents::link_spawned_child(
+                    &mut link,
+                    tool_use_id,
+                    &self.thread_index,
+                );
                 let (label, detail) = if link.message {
                     ("Message to agent:", link.title.clone())
                 } else {
@@ -509,7 +512,9 @@ impl ChatPanel {
                     .as_ref()
                     .and_then(|id| self.thread_index.status(id))
                 {
-                    Some(status) => vec![crate::subagents::status_glyph(status, 12., p)],
+                    Some(status) => {
+                        vec![crate::conversation::subagents::status_glyph(status, 12., p)]
+                    }
                     None if !*finished || *is_error => {
                         vec![tools::status_icon(*finished, *is_error, p)]
                     }
@@ -577,7 +582,7 @@ impl ChatPanel {
     ) -> AnyElement {
         let mut block = v_flex().w_full().gap(theme::sp(1.5));
         if let Some(note) = message_id.and_then(|id| self.received.get(id)).cloned() {
-            block = block.child(crate::subagents::agent_message_header(
+            block = block.child(crate::conversation::subagents::agent_message_header(
                 ix,
                 &note,
                 &self.thread_index,
@@ -630,13 +635,13 @@ impl ChatPanel {
     pub(super) fn render_note(
         &mut self,
         ix: usize,
-        note: &crate::subagents::AnnotationRow,
+        note: &crate::conversation::subagents::AnnotationRow,
         turn: usize,
         marks: &[Mark],
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        use crate::subagents::AnnotationKind;
+        use crate::conversation::subagents::AnnotationKind;
         let known = self.thread_index.title(&note.thread_id).is_some();
         let thread = known.then(|| note.thread_id.clone());
         let title = self
@@ -667,7 +672,10 @@ impl ChatPanel {
                     key,
                     thread,
                     Vec::new(),
-                    Some(crate::subagents::row_text(note, &self.thread_index)),
+                    Some(crate::conversation::subagents::row_text(
+                        note,
+                        &self.thread_index,
+                    )),
                     &mut doc,
                     cx,
                 )
@@ -690,19 +698,29 @@ impl ChatPanel {
                     &detail,
                     key,
                     thread,
-                    vec![crate::subagents::status_glyph(*status, 12., p)],
-                    Some(crate::subagents::row_text(note, &self.thread_index)),
+                    vec![crate::conversation::subagents::status_glyph(
+                        *status, 12., p,
+                    )],
+                    Some(crate::conversation::subagents::row_text(
+                        note,
+                        &self.thread_index,
+                    )),
                     &mut doc,
                     cx,
                 )
             }
             AnnotationKind::Sent | AnnotationKind::Received => {
-                let header =
-                    crate::subagents::agent_message_header(ix, note, &self.thread_index, p, cx);
+                let header = crate::conversation::subagents::agent_message_header(
+                    ix,
+                    note,
+                    &self.thread_index,
+                    p,
+                    cx,
+                );
                 let body = note.body.clone().map(|body| {
                     let view = self.block_texts.view(
                         &key,
-                        &crate::doc_text::escape_markdown(&body),
+                        &crate::review::doc_text::escape_markdown(&body),
                         &body,
                         comments::KIND_SUBAGENT,
                         turn,
@@ -769,8 +787,12 @@ impl ChatPanel {
             .group(hover.clone())
             .child(content)
             .when(self.uses_daemon(), |this| {
-                let fork =
-                    crate::forks::fork_button(message_id, self.fork_index.state(message_id), p, cx);
+                let fork = crate::conversation::forks::fork_button(
+                    message_id,
+                    self.fork_index.state(message_id),
+                    p,
+                    cx,
+                );
                 this.child(
                     v_flex()
                         .absolute()

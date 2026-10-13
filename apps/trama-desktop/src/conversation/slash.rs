@@ -2,7 +2,7 @@
 
 use trama_protocol::{SkillInfo, SkillKind, SkillSource};
 
-use crate::keymap::fuzzy_score;
+use crate::app::keymap::fuzzy_score;
 
 /// Most rows the popup shows.
 pub const MAX_ROWS: usize = 50;

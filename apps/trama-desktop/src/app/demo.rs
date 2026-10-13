@@ -9,9 +9,9 @@ use trama_domain::ids::{MessageId, ThreadId};
 use trama_domain::subagent::{SubagentProfile, SubagentStatus};
 use trama_protocol::{CommentSnapshot, SpawnedBy, SubagentSnapshot, ThreadKind, ThreadSnapshot};
 
-use crate::chat::ChatEntry;
-use crate::comments;
-use crate::subagents::{AnnotationKind, AnnotationRow};
+use crate::conversation::chat::ChatEntry;
+use crate::conversation::subagents::{AnnotationKind, AnnotationRow};
+use crate::review::comments;
 
 pub const PARENT: &str = "demo-parent";
 pub const CHILD: &str = "demo-child";

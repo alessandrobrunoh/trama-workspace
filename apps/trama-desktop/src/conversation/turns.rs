@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use chrono::{DateTime, Local, Utc};
 use trama_domain::ids::{MessageId, ThreadId};
 
-use crate::chat::ChatEntry;
-use crate::comments;
+use crate::conversation::chat::ChatEntry;
+use crate::review::comments;
 
 /// One prompt and the agent's answer, as a range of transcript entries.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -24,7 +24,7 @@ use gpui_kit::*;
 use trama_domain::ids::ThreadId;
 use trama_domain::subagent::SubagentStatus;
 
-use crate::theme::{self, Palette};
+use crate::app::theme::{self, Palette};
 
 pub const DEFAULT_WIDTH: f32 = 520.;
 pub const MIN_WIDTH: f32 = 340.;
@@ -294,7 +294,7 @@ pub fn render(
         .bg(p.panel)
         .text_size(theme::text_xs())
         .child(match info.status {
-            Some(status) => crate::subagents::status_glyph(status, 12., p),
+            Some(status) => crate::conversation::subagents::status_glyph(status, 12., p),
             None => Icon::new(IconName::Bot)
                 .with_size(px(12.))
                 .text_color(p.text_faint)

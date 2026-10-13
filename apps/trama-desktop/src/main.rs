@@ -7,27 +7,13 @@ mod shell;
 mod system;
 mod terminal;
 
-// Transitional flat paths (`crate::chat`, ...) while call sites migrate
-// to the area modules (docs/plan/restructure.md).
-#[allow(unused_imports)]
-use {
-    app::demo, app::devhooks, app::dialog, app::keymap, app::startup, app::theme,
-    collab::account as collab_account, collab::presence, collab::share_dialog,
-    composer::model_picker, composer::popup as composer_popup, conversation::activity,
-    conversation::agent, conversation::chat, conversation::forks, conversation::mentions,
-    conversation::slash, conversation::subagents, conversation::subthreads, conversation::tools,
-    conversation::trigger, conversation::turns, review::changes, review::comments, review::diff,
-    review::doc_text, review::document, shell::onboarding, shell::projects, shell::side_pane,
-    shell::sidebar, shell::thread_tree, shell::workspace, system::copies, system::disk_usage,
-    system::editor, system::net, system::snapshot, terminal::view as terminal_view, terminal::vt,
-};
-
 use std::borrow::Cow;
 
 use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
-use workspace::Workspace;
+use app::{devhooks, keymap, theme};
+use shell::workspace::Workspace;
 
 // Icons beyond GPUI Kit's default bundle.
 gpui_kit::assets::icon_assets!(
@@ -106,7 +92,7 @@ fn main() {
     application().with_assets(AppAssets).run(|cx| {
         gpui_kit::init(cx);
         keymap::bind(cx);
-        terminal_view::bind(cx);
+        terminal::view::bind(cx);
         let mut mode = theme::mode_for(cx.window_appearance());
         if let Some(forced) = devhooks::appearance() {
             mode = forced;

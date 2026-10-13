@@ -11,9 +11,9 @@
 use trama_domain::ids::{MessageId, ThreadId};
 use trama_domain::message::Role;
 
-use crate::chat::ChatEntry;
-use crate::tools::Item;
-use crate::turns::Turn;
+use crate::conversation::chat::ChatEntry;
+use crate::conversation::tools::Item;
+use crate::conversation::turns::Turn;
 
 /// Who wrote a block, as far as the gutter avatar is concerned.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -33,7 +33,7 @@ pub enum AuthorKey {
 /// What a document block holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockItem {
-    /// Entries, laid out as [`crate::tools::layout_items`] folds them.
+    /// Entries, laid out as [`crate::conversation::tools::layout_items`] folds them.
     Entries(Item),
     /// The comment threads on a turn, at its end (turn index).
     Comments(usize),
@@ -151,8 +151,8 @@ pub fn document(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::layout_items;
-    use crate::turns::segment_turns;
+    use crate::conversation::tools::layout_items;
+    use crate::conversation::turns::segment_turns;
     use serde_json::json;
 
     fn user(text: &str, id: &str) -> ChatEntry {

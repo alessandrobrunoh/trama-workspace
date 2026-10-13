@@ -28,8 +28,8 @@ use trama_protocol::{
     DaemonMessage, SharedThreadListing, SharedThreadSnapshot,
 };
 
-use crate::net::{DaemonClient, SendStatus};
-use crate::share_dialog::ShareState;
+use crate::collab::share_dialog::ShareState;
+use crate::system::net::{DaemonClient, SendStatus};
 
 /// Where `trama-collab serve` listens by default.
 pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8787";
@@ -360,7 +360,7 @@ impl RemoteTurn {
                 self.tools.push(RemoteTool {
                     tool_use_id: tool_use_id.clone(),
                     name: name.clone(),
-                    summary: crate::chat::tool_summary(name, input_json),
+                    summary: crate::conversation::chat::tool_summary(name, input_json),
                     finished: false,
                     is_error: false,
                 });

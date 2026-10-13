@@ -22,7 +22,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use trama_protocol::{CheckoutRemoval, ClientMessage, DiskUsageItem, ThreadId};
 
-use crate::theme::{self, Palette};
+use crate::app::theme::{self, Palette};
 
 /// What a removal request asked for, kept to resend it with `force`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

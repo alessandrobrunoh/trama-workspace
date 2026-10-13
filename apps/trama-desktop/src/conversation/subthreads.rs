@@ -21,9 +21,9 @@ use trama_protocol::{
     ThreadSnapshot,
 };
 
-use crate::net::{DaemonClient, SendStatus};
-use crate::sidebar::SidebarPanel;
-use crate::theme::{self, Palette};
+use crate::app::theme::{self, Palette};
+use crate::shell::sidebar::SidebarPanel;
+use crate::system::net::{DaemonClient, SendStatus};
 
 pub fn kind_icon(kind: ThreadKind) -> Option<IconName> {
     match kind {
@@ -397,7 +397,9 @@ impl Render for SubthreadBar {
                 model
                     .subagent
                     .as_ref()
-                    .map(|subagent| crate::subagents::profile_icon(subagent.spawned_by.profile))
+                    .map(|subagent| {
+                        crate::conversation::subagents::profile_icon(subagent.spawned_by.profile)
+                    })
                     .or_else(|| kind_icon(model.kind))
                     .map(|icon| Icon::new(icon).with_size(px(13.)).text_color(p.accent_text)),
             )
@@ -409,7 +411,9 @@ impl Render for SubthreadBar {
                     .child(match &model.subagent {
                         Some(subagent) => format!(
                             "{} subagent",
-                            crate::subagents::profile_title(subagent.spawned_by.profile)
+                            crate::conversation::subagents::profile_title(
+                                subagent.spawned_by.profile
+                            )
                         ),
                         None => kind_label(model.kind).to_string(),
                     }),
@@ -423,7 +427,7 @@ impl Render for SubthreadBar {
             .gap(theme::sp(1.))
             .items_center()
             .when_some(model.subagent.as_ref(), |this, subagent| {
-                this.child(crate::subagents::header_badge(subagent, &p))
+                this.child(crate::conversation::subagents::header_badge(subagent, &p))
             })
             .when_some(badge, |this, badge| {
                 this.child(
@@ -664,7 +668,7 @@ mod tests {
         IconName, PullSummary, ThreadId, VerdictBadge, bar_model, kind_icon, outcome_label,
         subthread_parent, title_from_prompt,
     };
-    use crate::thread_tree::{TreeRow, TreeState, tree_rows};
+    use crate::shell::thread_tree::{TreeRow, TreeState, tree_rows};
     use trama_protocol::{
         FileChangeStatus, PullFileOutcome, PullFileResult, RepoPullResult, RepositoryId,
         ReviewVerdict, ThreadKind, ThreadSnapshot,

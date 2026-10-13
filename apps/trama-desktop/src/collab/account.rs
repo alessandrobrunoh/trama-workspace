@@ -18,8 +18,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use trama_protocol::CollabRunnerState;
 
+use crate::app::theme::{self, Palette};
 use crate::collab::{CollabOp, CollabStore, DEFAULT_SERVER_URL, JoinTarget, parse_join};
-use crate::theme::{self, Palette};
 
 pub fn runner_label(state: CollabRunnerState) -> &'static str {
     match state {
@@ -174,7 +174,7 @@ impl Render for AccountView {
                     .gap(theme::sp(2.5))
                     .items_center()
                     .child(match status.as_ref().and_then(|s| s.username.clone()) {
-                        Some(name) if signed_in => crate::presence::avatar(&p, &name, 28., false),
+                        Some(name) if signed_in => crate::collab::presence::avatar(&p, &name, 28., false),
                         _ => div()
                             .size(px(28.))
                             .rounded_full()

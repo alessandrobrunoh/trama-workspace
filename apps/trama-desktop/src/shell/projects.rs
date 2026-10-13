@@ -1,7 +1,7 @@
 //! Manage projects dialog and the New thread dialog.
 //!
 //! These are the setup forms that used to sit in the sidebar. All validation
-//! and protocol mapping stays in [`crate::onboarding`]; these views only own
+//! and protocol mapping stays in [`crate::shell::onboarding`]; these views only own
 //! the text inputs and forward to the shared [`SidebarPanel`] state.
 
 use gpui_kit::assets::IconName;
@@ -15,9 +15,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::onboarding::{Feedback, Link};
-use crate::sidebar::{SidebarEvent, SidebarPanel};
-use crate::theme::{self, Palette};
+use crate::app::theme::{self, Palette};
+use crate::shell::onboarding::{Feedback, Link};
+use crate::shell::sidebar::{SidebarEvent, SidebarPanel};
 
 pub enum ProjectsEvent {
     StartDaemon,
@@ -119,26 +119,26 @@ impl ProjectsPanel {
             return;
         }
         self.picker_open = true;
-        let outcome = crate::dialog::prompt_for_repository_directory(cx);
+        let outcome = crate::app::dialog::prompt_for_repository_directory(cx);
         self._picker = Some(cx.spawn(async move |this, cx| {
             let outcome = outcome.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.picker_open = false;
                 match outcome {
-                    crate::dialog::PickerOutcome::Picked(Some(path)) => {
+                    crate::app::dialog::PickerOutcome::Picked(Some(path)) => {
                         let text = path.display().to_string();
                         this.repo_path.update(cx, |input, cx| {
                             input.set_value(text, window, cx);
                         });
                     }
-                    crate::dialog::PickerOutcome::Failed(message) => {
+                    crate::app::dialog::PickerOutcome::Failed(message) => {
                         this.sidebar.update(cx, |sidebar, cx| {
                             sidebar.onboarding.note_picker_failure(message);
                             cx.notify();
                         });
                     }
-                    crate::dialog::PickerOutcome::Picked(None)
-                    | crate::dialog::PickerOutcome::Cancelled => {}
+                    crate::app::dialog::PickerOutcome::Picked(None)
+                    | crate::app::dialog::PickerOutcome::Cancelled => {}
                 }
                 cx.notify();
             });
@@ -176,7 +176,7 @@ impl ProjectsPanel {
 /// Confirm, then send `MigrateLegacyThread` for the selected thread.
 pub fn open_prepare_confirm(sidebar: Entity<SidebarPanel>, window: &mut Window, cx: &mut App) {
     let weak = sidebar.downgrade();
-    crate::dialog::open_migration_confirm(window, cx, move |_window, cx| {
+    crate::app::dialog::open_migration_confirm(window, cx, move |_window, cx| {
         let _ = weak.update(cx, |sidebar, cx| {
             if let Some(request) = sidebar.onboarding.confirm_migration() {
                 cx.emit(SidebarEvent::Requests(vec![request]));

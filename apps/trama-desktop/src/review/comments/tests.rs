@@ -1,6 +1,6 @@
 use super::*;
 // `super::*` brings GPUI's `test` attribute; use the standard one.
-use crate::diff::parse_unified_diff;
+use crate::review::diff::parse_unified_diff;
 use core::prelude::v1::test;
 use serde_json::{Value, json};
 

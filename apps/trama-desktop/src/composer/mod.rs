@@ -14,7 +14,7 @@ use gpui_kit::*;
 use trama_domain::agent::{BillingSource, UsageReport};
 use trama_protocol::PromptMention;
 
-use crate::{mentions, theme};
+use crate::{app::theme, conversation::mentions};
 
 /// Context window used for the meter. Claude models in use today have a
 /// 200k-token window; the daemon does not report it yet.

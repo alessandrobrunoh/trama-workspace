@@ -29,7 +29,7 @@ impl Workspace {
     /// it shows now.
     pub(super) fn apply_pane_change(
         &mut self,
-        change: Option<crate::side_pane::PaneChange>,
+        change: Option<crate::shell::side_pane::PaneChange>,
         cx: &mut Context<Self>,
     ) {
         let Some(change) = change else {
@@ -49,19 +49,21 @@ impl Workspace {
     }
 
     /// What the pane's chrome says about the thread it shows.
-    pub(super) fn pane_info(&self, cx: &App) -> Option<crate::side_pane::PaneInfo> {
+    pub(super) fn pane_info(&self, cx: &App) -> Option<crate::shell::side_pane::PaneInfo> {
         let id = self.pane.thread()?;
         let snapshot = self.sidebar.read(cx).onboarding.thread(id);
         let title = snapshot
             .map(|thread| thread.title.clone())
             .unwrap_or_else(|| "Subagent".into());
         let subagent = snapshot.and_then(|thread| thread.subagent.as_ref());
-        Some(crate::side_pane::PaneInfo {
+        Some(crate::shell::side_pane::PaneInfo {
             title,
             status: subagent.map(|subagent| subagent.status),
             controlled: snapshot.is_some_and(|thread| thread.parent_thread_id.is_some()),
             icon: subagent
-                .map(|subagent| crate::subagents::profile_icon(subagent.spawned_by.profile))
+                .map(|subagent| {
+                    crate::conversation::subagents::profile_icon(subagent.spawned_by.profile)
+                })
                 .unwrap_or(IconName::Bot),
         })
     }
@@ -158,7 +160,7 @@ impl Workspace {
         if self
             .client
             .send(ClientMessage::GetDiskUsage { workspace_id: None })
-            == crate::net::SendStatus::Enqueued
+            == crate::system::net::SendStatus::Enqueued
         {
             self.disk_usage.update(cx, |view, cx| view.reset(cx));
         }
@@ -176,7 +178,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if self.client.send(kind.message(thread_id.clone(), force))
-            == crate::net::SendStatus::Rejected
+            == crate::system::net::SendStatus::Rejected
         {
             window.push_notification(
                 Notification::error("The daemon is not connected; nothing was removed."),
@@ -220,7 +222,7 @@ impl Workspace {
         if self
             .client
             .send(ClientMessage::UnarchiveThread { thread_id })
-            == crate::net::SendStatus::Rejected
+            == crate::system::net::SendStatus::Rejected
         {
             window.push_notification(
                 Notification::error("The daemon is not connected; the thread stays archived."),
@@ -253,7 +255,7 @@ impl Workspace {
             .unwrap_or(RemovalKind::Archive);
         self.disk_usage
             .update(cx, |view, cx| view.set_pending(&thread_id, false, cx));
-        let details = crate::disk_usage::refusal_details(&checkouts);
+        let details = crate::system::disk_usage::refusal_details(&checkouts);
         let description = format!(
             "These copies hold work that is not in the source repository. Trama keeps a snapshot and restores it when the copy is recreated, but ignored files (build output, local config) are deleted.\n\n{details}"
         );

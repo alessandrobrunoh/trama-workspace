@@ -12,7 +12,7 @@ use gpui_kit::*;
 use std::path::PathBuf;
 use trama_protocol::{CheckoutSnapshot, CheckoutStatus, ThreadId};
 
-use crate::theme::{self, Palette};
+use crate::app::theme::{self, Palette};
 
 #[derive(Default)]
 pub struct CopyState {
@@ -99,12 +99,12 @@ impl CopyPanel {
         self.launching = true;
         let job = cx.background_spawn(async move {
             let plan = if finder {
-                crate::editor::finder_plan(&path)
+                crate::system::editor::finder_plan(&path)
             } else {
-                crate::editor::zed_plan(&path, std::env::var_os("PATH").as_deref())
+                crate::system::editor::zed_plan(&path, std::env::var_os("PATH").as_deref())
             };
             match plan {
-                Ok(plan) => crate::editor::launch(plan),
+                Ok(plan) => crate::system::editor::launch(plan),
                 Err(error) => Err(format!("Cannot open this copy: {error:?}")),
             }
         });

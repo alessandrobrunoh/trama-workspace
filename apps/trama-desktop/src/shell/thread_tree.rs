@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use trama_domain::ids::ThreadId;
 use trama_protocol::ThreadSnapshot;
 
-use crate::subthreads::{ThreadRow, VerdictBadge};
+use crate::conversation::subthreads::{ThreadRow, VerdictBadge};
 
 /// Indentation stops growing past this depth.
 pub const MAX_INDENT: usize = 6;

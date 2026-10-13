@@ -46,6 +46,6 @@ use trama_protocol::{
     CommentTarget, DaemonMessage,
 };
 
-use crate::diff::Hunk;
-use crate::net::{DaemonClient, SendStatus};
-use crate::theme::{self, Palette};
+use crate::app::theme::{self, Palette};
+use crate::review::diff::Hunk;
+use crate::system::net::{DaemonClient, SendStatus};

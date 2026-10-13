@@ -353,10 +353,11 @@ pub fn passage_color(phase: &Phase, p: &Palette) -> Option<Hsla> {
 pub fn author_avatar(actor: &Actor, me: Option<&str>, size: f32, p: &Palette) -> AnyElement {
     match crate::collab::Speaker::of(actor) {
         crate::collab::Speaker::Remote(name) => {
-            crate::presence::avatar(p, &name, size, false).into_any_element()
+            crate::collab::presence::avatar(p, &name, size, false).into_any_element()
         }
         crate::collab::Speaker::Me if me.is_some() => {
-            crate::presence::avatar(p, me.unwrap_or_default(), size, false).into_any_element()
+            crate::collab::presence::avatar(p, me.unwrap_or_default(), size, false)
+                .into_any_element()
         }
         speaker => {
             let (icon, bg, fg) = match speaker {

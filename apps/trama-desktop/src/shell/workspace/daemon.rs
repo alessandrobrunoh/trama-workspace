@@ -102,7 +102,7 @@ impl Workspace {
         if mismatch {
             return;
         }
-        match crate::startup::locate_daemon() {
+        match crate::app::startup::locate_daemon() {
             DaemonLocate::Missing { instructions } => {
                 self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.onboarding.finish_daemon_start(
@@ -130,7 +130,7 @@ impl Workspace {
         let background = cx.background_executor().clone();
         self._daemon_start = Some(cx.spawn(async move |this, cx| {
             let outcome = background
-                .spawn(async move { crate::startup::start_daemon(&path) })
+                .spawn(async move { crate::app::startup::start_daemon(&path) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.sidebar.update(cx, |sidebar, cx| {
@@ -219,8 +219,10 @@ impl Workspace {
                 let title = thread.title.clone();
                 self.upsert_thread_snapshot(thread, cx);
                 self.after_removal(&id, cx);
-                let freed = crate::disk_usage::freed_total(&removed)
-                    .map(|bytes| format!(" Freed {}.", crate::disk_usage::format_bytes(bytes)))
+                let freed = crate::system::disk_usage::freed_total(&removed)
+                    .map(|bytes| {
+                        format!(" Freed {}.", crate::system::disk_usage::format_bytes(bytes))
+                    })
                     .unwrap_or_default();
                 window.push_notification(
                     Notification::success(format!(
@@ -242,8 +244,10 @@ impl Workspace {
             }
             DaemonMessage::ThreadCheckoutsDeleted { thread_id, removed } => {
                 self.after_removal(&thread_id, cx);
-                let freed = crate::disk_usage::freed_total(&removed)
-                    .map(|bytes| format!(" Freed {}.", crate::disk_usage::format_bytes(bytes)))
+                let freed = crate::system::disk_usage::freed_total(&removed)
+                    .map(|bytes| {
+                        format!(" Freed {}.", crate::system::disk_usage::format_bytes(bytes))
+                    })
                     .unwrap_or_default();
                 window.push_notification(
                     Notification::success(format!(
@@ -351,7 +355,7 @@ impl Workspace {
                 ..
             } => {
                 self.sidebar.update(cx, |sidebar, cx| {
-                    if crate::subagents::apply_status(
+                    if crate::conversation::subagents::apply_status(
                         &mut sidebar.onboarding.threads,
                         &thread_id,
                         status,

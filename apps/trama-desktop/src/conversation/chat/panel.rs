@@ -380,8 +380,8 @@ impl ChatPanel {
                     return;
                 }
                 self.fork_index.note(&message, &thread_id);
-                if let Some(row) = crate::subagents::annotation_row(&message) {
-                    if crate::subagents::is_standalone(&message) {
+                if let Some(row) = crate::conversation::subagents::annotation_row(&message) {
+                    if crate::conversation::subagents::is_standalone(&message) {
                         // Shown even mid-turn: a subagent starts while its
                         // parent's turn is still running.
                         self.entries.push(ChatEntry::Annotation(row));
@@ -1036,7 +1036,7 @@ impl ChatPanel {
             .enumerate()
             .map(|(ix, (id, label))| {
                 let terminals = self.terminals.clone();
-                terminal_view::attachment_chip(
+                crate::terminal::view::attachment_chip(
                     ("attached-terminal", ix),
                     &label,
                     p,
@@ -1060,7 +1060,7 @@ impl ChatPanel {
     /// rows and links from `spawn_subagent` calls to their child.
     pub fn set_thread_index(
         &mut self,
-        index: crate::subagents::ThreadIndex,
+        index: crate::conversation::subagents::ThreadIndex,
         cx: &mut Context<Self>,
     ) {
         if self.thread_index != index {
@@ -1092,8 +1092,8 @@ impl ChatPanel {
             // Subscribed mid-turn: follow it like a turn started elsewhere.
             self.adopt_remote_turn();
         }
-        let shown = crate::activity::shown_tool_ids(&self.entries);
-        let mut replayed = crate::activity::replay_entries(items, in_flight, &shown);
+        let shown = crate::conversation::activity::shown_tool_ids(&self.entries);
+        let mut replayed = crate::conversation::activity::replay_entries(items, in_flight, &shown);
         if following {
             replayed
                 .entries
@@ -1113,7 +1113,7 @@ impl ChatPanel {
         let Some(thread_id) = self.selected_thread.clone() else {
             return;
         };
-        if self.fork_index.state(&message_id) != crate::forks::ForkState::Ready {
+        if self.fork_index.state(&message_id) != crate::conversation::forks::ForkState::Ready {
             return;
         }
         let label = self
@@ -1131,9 +1131,9 @@ impl ChatPanel {
                 } if id == &message_id => Some(markdown.clone()),
                 _ => None,
             })
-            .map(|text| crate::forks::preview(&text))
+            .map(|text| crate::conversation::forks::preview(&text))
             .unwrap_or_default();
-        cx.emit(ChatEvent::Fork(crate::forks::ForkTarget {
+        cx.emit(ChatEvent::Fork(crate::conversation::forks::ForkTarget {
             thread_id,
             message_id,
             label,
@@ -1156,8 +1156,9 @@ impl ChatPanel {
                 .or(Some(0))
         })?;
         let range = turn_list.get(turn)?.entries.clone();
-        let message = crate::forks::turn_fork_message(&self.entries[range])?;
-        (self.fork_index.state(&message) == crate::forks::ForkState::Ready).then_some(message)
+        let message = crate::conversation::forks::turn_fork_message(&self.entries[range])?;
+        (self.fork_index.state(&message) == crate::conversation::forks::ForkState::Ready)
+            .then_some(message)
     }
 }
 

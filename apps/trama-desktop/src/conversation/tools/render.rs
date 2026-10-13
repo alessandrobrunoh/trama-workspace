@@ -62,7 +62,7 @@ pub fn subthread_link(
             .map(|(id, _)| id.clone())
     });
     SubthreadLink {
-        title: crate::comments::one_line(&title, 80),
+        title: crate::review::comments::one_line(&title, 80),
         thread,
         message: base_name(name) == "send_to_thread",
     }
@@ -296,7 +296,7 @@ pub fn call_line(name: &str, input: &Value) -> (String, String) {
             .find_map(|key| input.get(*key).and_then(Value::as_str))
             .map(|text| text.lines().next().unwrap_or_default().trim().to_string())
     };
-    let summary = || crate::chat::tool_summary(name, input);
+    let summary = || crate::conversation::chat::tool_summary(name, input);
     let (label, detail) = match base_name(name) {
         "Bash" => ("Ran", field(&["command"]).unwrap_or_else(summary)),
         "Read" | "NotebookRead" => (
@@ -340,7 +340,7 @@ pub fn agent_detail(title: &str, profile: Option<&str>, model: Option<&str>) -> 
     } else {
         title.trim()
     };
-    let model = model.map(crate::turns::model_label);
+    let model = model.map(crate::conversation::turns::model_label);
     match (profile, model) {
         (Some(profile), Some(model)) => format!("{title} ({profile} \u{b7} {model})"),
         (Some(profile), None) => format!("{title} ({profile})"),

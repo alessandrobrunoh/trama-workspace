@@ -335,7 +335,7 @@ impl ChatPanel {
                             .gap(theme::sp(2.))
                             .items_center()
                             .child(match &remote {
-                                Some(name) => crate::presence::avatar(p, name, 22., false),
+                                Some(name) => crate::collab::presence::avatar(p, name, 22., false),
                                 None => div()
                                     .size(px(22.))
                                     .flex_shrink_0()

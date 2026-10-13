@@ -42,22 +42,24 @@ use trama_domain::ids::{CommentId, MessageId, ThreadId};
 use trama_domain::message::{ContentBlock, Message, Role};
 use trama_protocol::{ClientMessage, CommentTarget, DaemonMessage};
 
-use crate::agent::{ChatAgent, FakeAgent};
-use crate::comments::{
+use crate::app::theme::{self, Palette};
+use crate::composer::model_picker::ModelPicker;
+use crate::composer::popup::ComposerPopup;
+use crate::composer::{BillingBadge, Composer, ComposerFooter};
+use crate::conversation::agent::{ChatAgent, FakeAgent};
+use crate::conversation::tools::{
+    self, DocCtx, Item, PatchLine, PatchPick, ToolKind, ToolTiming, ToolViewState,
+};
+use crate::conversation::turns::{self, Bookmarks, Span};
+use crate::review::comments::{
     self, CardHandlers, CommentDraft, CommentGroup, CommentStore, Phase, PromptBlock,
 };
-use crate::composer::{BillingBadge, Composer, ComposerFooter};
-use crate::composer_popup::ComposerPopup;
-use crate::doc_text::{BlockSelection, BlockTexts, Mark};
-use crate::document::{self, AuthorKey, BlockItem};
-use crate::model_picker::ModelPicker;
-use crate::net::{DaemonClient, SendStatus};
-use crate::sidebar::ThreadStatus;
-use crate::snapshot;
-use crate::terminal_view::{self, TerminalEvent, TerminalPanel};
-use crate::theme::{self, Palette};
-use crate::tools::{self, DocCtx, Item, PatchLine, PatchPick, ToolKind, ToolTiming, ToolViewState};
-use crate::turns::{self, Bookmarks, Span};
+use crate::review::doc_text::{BlockSelection, BlockTexts, Mark};
+use crate::review::document::{self, AuthorKey, BlockItem};
+use crate::shell::sidebar::ThreadStatus;
+use crate::system::net::{DaemonClient, SendStatus};
+use crate::system::snapshot;
+use crate::terminal::view::{TerminalEvent, TerminalPanel};
 use gpui_kit::component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +147,7 @@ pub enum ChatEntry {
     },
     /// A stored message that links another thread (subagent started or
     /// finished, agent message sent).
-    Annotation(crate::subagents::AnnotationRow),
+    Annotation(crate::conversation::subagents::AnnotationRow),
 }
 
 /// Requests the chat panel makes of the workspace.
@@ -157,7 +159,7 @@ pub enum ChatEvent {
     /// "Agent spawned" line).
     OpenInPane(ThreadId),
     /// Fork the selected thread at a message (hover action, ⌘K).
-    Fork(crate::forks::ForkTarget),
+    Fork(crate::conversation::forks::ForkTarget),
 }
 
 /// The turn rail's interaction state.
@@ -323,11 +325,11 @@ pub struct ChatPanel {
     /// Threads the sidebar lists, for subagent links.
     known_threads: Vec<(ThreadId, String)>,
     /// Titles, subagent profiles and spawning tool calls of known threads.
-    thread_index: crate::subagents::ThreadIndex,
+    thread_index: crate::conversation::subagents::ThreadIndex,
     /// Where the stored messages can be forked at.
-    fork_index: crate::forks::ForkIndex,
+    fork_index: crate::conversation::forks::ForkIndex,
     /// Prompts another thread's agent sent, by message.
-    received: HashMap<MessageId, crate::subagents::AnnotationRow>,
+    received: HashMap<MessageId, crate::conversation::subagents::AnnotationRow>,
     /// Shared-thread state (drafts, presence, remote turns).
     collab: Option<Entity<crate::collab::CollabStore>>,
     /// Mirrored messages of other participants: author and role.

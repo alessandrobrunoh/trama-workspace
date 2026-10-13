@@ -18,8 +18,8 @@ use trama_domain::ids::{MessageId, ThreadId};
 use trama_domain::message::{Message, Role};
 use trama_protocol::{ClientMessage, SubthreadKind};
 
-use crate::chat::{ChatEntry, ChatPanel};
-use crate::theme::{self, Palette};
+use crate::app::theme::{self, Palette};
+use crate::conversation::chat::{ChatEntry, ChatPanel};
 
 // -- which messages can be forked at -----------------------------------------
 

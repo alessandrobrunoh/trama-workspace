@@ -34,14 +34,14 @@ impl Workspace {
         let collaborators = selected.as_ref().filter(|_| shared_thread).and_then(|id| {
             let snapshot = store.snapshot(id)?;
             let live = store.presence(id).cloned().unwrap_or_default();
-            let people = crate::presence::roster(
+            let people = crate::collab::presence::roster(
                 &snapshot.members,
                 &snapshot.owner,
                 &live,
                 store.username(),
                 &store.typing(id),
             );
-            (!people.is_empty()).then(|| crate::presence::title_avatars(&p, &people))
+            (!people.is_empty()).then(|| crate::collab::presence::title_avatars(&p, &people))
         });
 
         TitleBar::new()
