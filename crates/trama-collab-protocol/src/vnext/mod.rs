@@ -6,6 +6,8 @@
 //! their canonical encoding live elsewhere; events here only reference
 //! payloads as opaque ciphertext.
 
+pub mod api;
+pub mod cipher;
 pub mod discovery;
 pub mod events;
 

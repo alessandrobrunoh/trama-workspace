@@ -22,6 +22,12 @@ pub enum Capability {
     WorkspaceShare,
     ChunkResume,
     DirectTransport,
+    /// `/v3/shares/{id}/events` and `/stream`: sequenced durable events.
+    EventStream,
+    /// `/v3/shares/{id}/snapshots/commit` and `/manifest/{version}`.
+    ManifestStore,
+    /// `/v3/shares/{id}/leases`: exclusive writer leases.
+    WriterLeases,
     #[serde(other)]
     Unknown,
 }
