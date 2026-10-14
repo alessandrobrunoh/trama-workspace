@@ -4,6 +4,7 @@ use super::*;
 
 mod collab;
 mod comments;
+mod providers;
 mod shares;
 mod subthreads;
 mod terminals;
@@ -28,6 +29,7 @@ enum Family {
     Terminals,
     Collab,
     Shares,
+    Providers,
     Control,
 }
 
@@ -103,6 +105,11 @@ fn family(msg: &ClientMessage) -> Family {
         | ClientMessage::GetShareStatus { .. }
         | ClientMessage::RetryShareRestore { .. }
         | ClientMessage::ApplyShareUpdate { .. } => Family::Shares,
+        ClientMessage::ListProviders
+        | ClientMessage::SaveProvider { .. }
+        | ClientMessage::RemoveProvider { .. }
+        | ClientMessage::SetDefaultProvider { .. }
+        | ClientMessage::TestProvider { .. } => Family::Providers,
         ClientMessage::Hello { .. }
         | ClientMessage::ApprovalHook { .. }
         | ClientMessage::McpToolCall { .. }
@@ -144,6 +151,7 @@ pub(super) async fn handle_line(
         Family::Terminals => terminals::handle(msg, &mut ctx).await,
         Family::Collab => collab::handle(msg, &mut ctx).await,
         Family::Shares => shares::handle(msg, &mut ctx).await,
+        Family::Providers => providers::handle(msg, &mut ctx).await,
         Family::Control => control(msg, &mut ctx).await,
     }
 }

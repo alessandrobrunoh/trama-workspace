@@ -6,6 +6,7 @@ mod config;
 mod error;
 mod ipc;
 mod log;
+mod providers;
 mod session;
 
 #[cfg(test)]

@@ -9,7 +9,11 @@ use trama_domain::ids::ThreadId;
 use trama_domain::workspace::{Repository, Workspace, WorkspaceMembership};
 use trama_protocol::DaemonMessage;
 
-async fn seed_workspace(db: &TramaDb, with_repo: bool, root: &std::path::Path) -> WorkspaceId {
+pub(super) async fn seed_workspace(
+    db: &TramaDb,
+    with_repo: bool,
+    root: &std::path::Path,
+) -> WorkspaceId {
     let workspace = Workspace::new("Default");
     let id = workspace.id.clone();
     db.create_workspace(&workspace).await.unwrap();

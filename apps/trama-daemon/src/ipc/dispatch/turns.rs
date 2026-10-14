@@ -101,7 +101,7 @@ pub(super) async fn handle(msg: ClientMessage, ctx: &mut Ctx<'_>) -> Result<Conn
         }
         ClientMessage::ListModels => {
             let _ = out_tx.send(DaemonMessage::Models {
-                items: crate::session::model_choices(),
+                items: sessions.all_model_choices(),
             });
         }
         // Terminal events go to the thread's subscribers; a requester that

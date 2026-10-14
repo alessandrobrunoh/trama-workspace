@@ -91,6 +91,13 @@ impl SessionManager {
         // is not replayed or started later without another user action. The
         // turn reservation is held meanwhile, so a migration cannot retarget
         // the thread's checkouts under this prompt.
+        let route = match self.chat_route(&thread_id).await {
+            Ok(route) => route,
+            Err(err) => {
+                self.release_turn(&thread_id);
+                return Err(err);
+            }
+        };
         if let Err(err) = self.session_config(&thread_id).await {
             self.release_turn(&thread_id);
             return Err(err);
@@ -185,6 +192,10 @@ impl SessionManager {
             }
             _ => prompt,
         };
+        if let Some(route) = route {
+            tokio::spawn(async move { manager.run_provider_turn(thread_id, prompt, route).await });
+            return Ok(message);
+        }
         tokio::spawn(async move {
             if let Err(failure) = manager.run_turn(thread_id.clone(), prompt).await {
                 manager.handle_turn_failure(&thread_id, failure).await;
@@ -239,6 +250,9 @@ impl SessionManager {
             let mut inner = self.lock();
             let thread = inner.threads.entry(thread_id.clone()).or_default();
             thread.interrupt_requested = true;
+            if let Some(cancel) = &thread.provider_cancel {
+                cancel.notify_one();
+            }
             thread.live_session.clone()
         };
         // Release a hook blocked on a person first; `interrupt` tells Claude

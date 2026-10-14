@@ -144,6 +144,10 @@ pub struct SkillInfo {
 pub struct ModelInfo {
     pub id: String,
     pub label: String,
+    /// Display name of the API provider for a qualified id
+    /// (`provider::model`); `None` for Claude Code models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 /// How a terminal's process ended. `signal` is set when it was killed.

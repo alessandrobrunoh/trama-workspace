@@ -57,6 +57,7 @@
 mod client;
 mod daemon;
 mod payloads;
+mod providers;
 mod shares;
 mod snapshots;
 #[cfg(test)]
@@ -69,6 +70,8 @@ pub use self::client::*;
 pub use self::daemon::*;
 #[allow(unused_imports)]
 pub use self::payloads::*;
+#[allow(unused_imports)]
+pub use self::providers::*;
 #[allow(unused_imports)]
 pub use self::shares::*;
 #[allow(unused_imports)]
@@ -104,6 +107,10 @@ pub use trama_collab_protocol::{
 
 /// Wire protocol version carried in `Hello` / `Welcome`.
 ///
+/// Version 20 adds model providers (ADR 0015): `ListProviders`,
+/// `SaveProvider`, `RemoveProvider`, `SetDefaultProvider`, `TestProvider`,
+/// `Providers`, `ProviderTestResult`, and qualified model ids
+/// (`provider::model`) in `SetThreadModel` / `ModelInfo`.
 /// Version 19 adds `ApplyShareUpdate` and
 /// `ShareStatusReport.update_available`.
 /// Version 18 adds `GetShareStatus`, `RetryShareRestore` and
@@ -158,7 +165,7 @@ pub use trama_collab_protocol::{
 /// Version 4 added the Claude approval channel and 3 thread checkout
 /// discovery. It does not migrate stored data; peers with a different version
 /// are rejected at handshake time.
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// Default writer lease length for `AcquireShareLease`.
 pub const DEFAULT_LEASE_TTL_SECS: u64 = 120;

@@ -123,6 +123,16 @@ pub enum DaemonMessage {
     Models {
         items: Vec<ModelInfo>,
     },
+    /// Reply to the provider messages; also sent to every client after a
+    /// change.
+    Providers {
+        items: Vec<ProviderSnapshot>,
+    },
+    /// Reply to `TestProvider`.
+    ProviderTestResult {
+        id: String,
+        report: ProviderTestReport,
+    },
     /// Reply to `OpenTerminal`.
     TerminalOpened {
         thread_id: ThreadId,

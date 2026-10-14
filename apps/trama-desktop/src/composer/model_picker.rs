@@ -293,10 +293,12 @@ mod tests {
             ModelInfo {
                 id: "default".into(),
                 label: "Default".into(),
+                provider: None,
             },
             ModelInfo {
                 id: "claude-opus-5-5".into(),
                 label: "Claude Opus 5.5".into(),
+                provider: None,
             },
         ]
     }

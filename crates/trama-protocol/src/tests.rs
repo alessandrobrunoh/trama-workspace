@@ -401,7 +401,7 @@ fn app_dir_prefers_trama_data_dir_over_home() {
 
 #[test]
 fn protocol_version_is_current() {
-    assert_eq!(PROTOCOL_VERSION, 19);
+    assert_eq!(PROTOCOL_VERSION, 20);
 }
 
 #[test]
@@ -696,6 +696,7 @@ fn composer_contract_shapes() {
             items: vec![ModelInfo {
                 id: "default".into(),
                 label: "Default".into(),
+                provider: None,
             }],
         },
         DaemonMessage::TerminalOpened {
@@ -1332,4 +1333,71 @@ fn thread_checkout_discovery_contract_uses_snake_case_status() {
     assert_eq!(json["payload"]["checkouts"][0]["status"], "ready");
     let decoded = serde_json::from_value::<DaemonMessage>(json.clone()).unwrap();
     assert_eq!(serde_json::to_value(decoded).unwrap(), json);
+}
+
+#[test]
+fn provider_messages_round_trip() {
+    let client = [
+        ClientMessage::ListProviders,
+        ClientMessage::SaveProvider {
+            provider: ProviderConfig {
+                id: String::new(),
+                kind: ProviderKind::OpenAiCompatible,
+                name: "Ollama".into(),
+                base_url: Some("http://localhost:11434/v1".into()),
+                default_model: Some("llama3.1".into()),
+                models: vec!["llama3.1".into()],
+            },
+            api_key: ApiKeyUpdate::Clear,
+        },
+        ClientMessage::RemoveProvider {
+            id: "ollama".into(),
+        },
+        ClientMessage::SetDefaultProvider {
+            id: "ollama".into(),
+        },
+        ClientMessage::TestProvider {
+            id: "ollama".into(),
+            provider: None,
+            api_key: ApiKeyUpdate::Keep,
+        },
+    ];
+    for message in client {
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).unwrap(),
+            message
+        );
+    }
+    let daemon = [
+        DaemonMessage::Providers {
+            items: vec![ProviderSnapshot {
+                config: ProviderConfig {
+                    id: "openai".into(),
+                    kind: ProviderKind::OpenAi,
+                    name: "OpenAI".into(),
+                    base_url: None,
+                    default_model: Some("gpt-4o".into()),
+                    models: Vec::new(),
+                },
+                has_api_key: true,
+                is_default: false,
+                builtin: false,
+            }],
+        },
+        DaemonMessage::ProviderTestResult {
+            id: "openai".into(),
+            report: ProviderTestReport {
+                ok: true,
+                message: "2 models".into(),
+                models: vec!["a".into(), "b".into()],
+            },
+        },
+    ];
+    for message in daemon {
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(!json.contains("api_key\":\""), "no key on the wire: {json}");
+        let back = serde_json::from_str::<DaemonMessage>(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
 }

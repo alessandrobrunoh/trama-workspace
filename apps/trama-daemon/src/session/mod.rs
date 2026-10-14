@@ -40,6 +40,10 @@ mod forks;
 #[cfg(test)]
 #[path = "tests/forks.rs"]
 mod forks_tests;
+mod provider_turns;
+#[cfg(test)]
+#[path = "tests/providers.rs"]
+mod provider_turns_tests;
 #[cfg(all(test, unix))]
 #[path = "tests/setup.rs"]
 mod setup_tests;
@@ -134,6 +138,8 @@ struct ThreadRuntime {
     /// Tool calls and thinking of the in-flight turn, stored with the
     /// message that ends it.
     activity: trama_domain::activity::ActivityLog,
+    /// Cancels the in-flight API provider turn (ADR 0015).
+    provider_cancel: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// A permission request blocking a Claude Code hook process. The hook's
@@ -222,6 +228,8 @@ pub struct SessionManager {
     agents: Arc<agents::AgentsRuntime>,
     /// Where [`CollabSignal`]s go (the collab service), if anywhere.
     collab_observer: Arc<Mutex<Option<mpsc::UnboundedSender<CollabSignal>>>>,
+    /// Model providers (`providers.json` + keychain) in the app dir.
+    providers: Arc<crate::providers::ProviderStore>,
 }
 
 impl SessionManager {
@@ -246,6 +254,7 @@ impl SessionManager {
             db,
             adapter,
             agents_config: Arc::new(agents::AgentsConfig::new(root.clone())),
+            providers: Arc::new(crate::providers::ProviderStore::open(&root)),
             agents: Arc::default(),
             checkout_manager: trama_infra::git::checkout::CheckoutManager::new(root),
             inner: Arc::new(Mutex::new(Inner {
@@ -259,6 +268,18 @@ impl SessionManager {
             composer: Arc::new(context::ComposerState::new()),
             collab_observer: Arc::default(),
         }
+    }
+
+    /// Model providers (ADR 0015).
+    pub(crate) fn providers(&self) -> &crate::providers::ProviderStore {
+        &self.providers
+    }
+
+    /// Claude Code models followed by every API provider's models.
+    pub(crate) fn all_model_choices(&self) -> Vec<trama_protocol::ModelInfo> {
+        let mut items = model_choices();
+        items.extend(self.providers.model_choices());
+        items
     }
 
     /// Route [`CollabSignal`]s to `tx` (replacing any previous observer).

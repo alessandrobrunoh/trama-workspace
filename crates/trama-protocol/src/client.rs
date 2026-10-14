@@ -177,6 +177,35 @@ pub enum ClientMessage {
     },
     /// Answered with `Models`.
     ListModels,
+    /// Answered with `Providers`.
+    ListProviders,
+    /// Create or update an API provider (Claude Code is built in and cannot
+    /// be edited). The key goes to the OS keychain, never to a config file.
+    /// Answered with `Providers`.
+    SaveProvider {
+        provider: ProviderConfig,
+        #[serde(default)]
+        api_key: ApiKeyUpdate,
+    },
+    /// Remove an API provider and its stored key. Answered with `Providers`.
+    RemoveProvider {
+        id: String,
+    },
+    /// Provider for new threads (and threads without a model override).
+    /// Answered with `Providers`.
+    SetDefaultProvider {
+        id: String,
+    },
+    /// Check a provider: lists its models. `provider` tests unsaved settings
+    /// (with `api_key`, or the stored key when `Keep`); otherwise the stored
+    /// provider `id` is tested. Answered with `ProviderTestResult`.
+    TestProvider {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<ProviderConfig>,
+        #[serde(default)]
+        api_key: ApiKeyUpdate,
+    },
     /// Start an interactive terminal (a real PTY) in the thread's checkout
     /// (`repository_id`, else the first one). `command` runs through the
     /// user's shell; without it an interactive shell starts. Output goes to
