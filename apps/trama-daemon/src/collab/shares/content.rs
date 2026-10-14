@@ -216,22 +216,41 @@ impl CollabService {
             Err(DaemonError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let (cipher, id, epoch) = (
-            self.e2ee()?.cipher.clone(),
-            share_id.to_owned(),
-            snapshot.epoch,
-        );
-        let envelope = tokio::task::spawn_blocking(move || {
-            open_manifest(
-                cipher.as_ref(),
-                &id,
-                epoch,
-                PayloadKind::ContentManifest,
-                &blob.ciphertext,
-            )
-        })
-        .await
-        .map_err(collab)??;
+        // An MLS message decrypts once: keep the plaintext sealed at rest
+        // (signature and binding are re-checked below on every read).
+        let name = format!("content:{share_id}");
+        let e2ee = self.e2ee()?;
+        let (store, key) = (e2ee.clone(), name.clone());
+        let cached = tokio::task::spawn_blocking(move || store.get_sealed(&key))
+            .await
+            .map_err(collab)??
+            .and_then(|b| serde_json::from_slice::<(u64, SignedEnvelope)>(&b).ok())
+            .filter(|(v, _)| *v == blob.version)
+            .map(|(_, envelope)| envelope);
+        let envelope = match cached {
+            Some(envelope) => envelope,
+            None => {
+                let (cipher, id, epoch) =
+                    (e2ee.cipher.clone(), share_id.to_owned(), snapshot.epoch);
+                let text = blob.ciphertext.clone();
+                let envelope = tokio::task::spawn_blocking(move || {
+                    open_manifest(
+                        cipher.as_ref(),
+                        &id,
+                        epoch,
+                        PayloadKind::ContentManifest,
+                        &text,
+                    )
+                })
+                .await
+                .map_err(collab)??;
+                let body = serde_json::to_vec(&(blob.version, &envelope)).map_err(collab)?;
+                tokio::task::spawn_blocking(move || e2ee.put_sealed(&name, &body))
+                    .await
+                    .map_err(collab)??;
+                envelope
+            }
+        };
         let manifest = open_content(
             &envelope,
             &snapshot.keyring,
