@@ -24,12 +24,13 @@ impl Workspace {
         window.close_all_dialogs(cx);
         self.collab
             .update(cx, |collab, cx| collab.open_share_wizard(thread, title, cx));
-        self.share_wizard
-            .update(cx, |wizard, cx| wizard.reset(window, cx));
         let view = self.share_wizard.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             dialog.title("Share").w(px(560.)).child(view.clone())
         });
+        // After opening: the dialog takes focus when it opens.
+        self.share_wizard
+            .update(cx, |wizard, cx| wizard.reset(window, cx));
     }
 
     pub(super) fn open_join_wizard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -41,12 +42,13 @@ impl Workspace {
         window.close_all_dialogs(cx);
         self.collab
             .update(cx, |collab, cx| collab.open_join_wizard(workspace, cx));
-        self.join_wizard
-            .update(cx, |wizard, cx| wizard.reset(window, cx));
         let view = self.join_wizard.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             dialog.title("Join a share").w(px(520.)).child(view.clone())
         });
+        // After opening: the dialog takes focus when it opens.
+        self.join_wizard
+            .update(cx, |wizard, cx| wizard.reset(window, cx));
     }
 
     /// Share/Join while the server check is in flight: a short "Checking

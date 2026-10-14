@@ -108,12 +108,14 @@ impl Workspace {
             return;
         }
         window.close_all_dialogs(cx);
-        self.new_thread
-            .update(cx, |view, cx| view.reset(window, cx));
         let view = self.new_thread.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             dialog.title("New thread").w(px(520.)).child(view.clone())
         });
+        // Reset after opening: `open_dialog` focuses the dialog itself, so
+        // focusing the title before it ate the first typed character.
+        self.new_thread
+            .update(cx, |view, cx| view.reset(window, cx));
     }
 
     pub(super) fn open_projects(&mut self, window: &mut Window, cx: &mut Context<Self>) {

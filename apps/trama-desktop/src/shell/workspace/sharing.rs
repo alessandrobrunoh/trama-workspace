@@ -91,17 +91,18 @@ impl Workspace {
                 sidebar.selected_workspace_title(),
             )
         };
-        self.join.update(cx, |join, cx| {
-            join.workspace = workspace;
-            join.workspace_title = title;
-            join.reset(window, cx);
-        });
         let view = self.join.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
                 .title("Join shared thread")
                 .w(px(520.))
                 .child(view.clone())
+        });
+        // After opening: the dialog takes focus when it opens.
+        self.join.update(cx, |join, cx| {
+            join.workspace = workspace;
+            join.workspace_title = title;
+            join.reset(window, cx);
         });
     }
 
