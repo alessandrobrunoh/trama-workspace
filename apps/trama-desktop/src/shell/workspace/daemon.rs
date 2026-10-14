@@ -22,9 +22,13 @@ impl Workspace {
                     chat.set_connected(true, cx);
                 });
                 self.collab.update(cx, |collab, cx| collab.on_connected(cx));
+                self.settings
+                    .update(cx, |settings, cx| settings.set_connected(true, cx));
             }
             NetEvent::Disconnected => {
                 self.connected = false;
+                self.settings
+                    .update(cx, |settings, cx| settings.set_connected(false, cx));
                 self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.set_link(Link::Offline, cx);
                 });
@@ -472,6 +476,10 @@ impl Workspace {
                     bar.apply_land(land_thread_id, outcome, summary, cx);
                 });
             }
+            DaemonMessage::Providers { .. } | DaemonMessage::ProviderTestResult { .. } => {
+                self.settings
+                    .update(cx, |settings, cx| settings.handle_daemon(&message, cx));
+            }
             DaemonMessage::ThreadModelChanged { thread_id, model } => {
                 // Keep the snapshot current so the picker is not reset.
                 self.sidebar.update(cx, |sidebar, cx| {
@@ -588,7 +596,14 @@ impl Workspace {
             if onboarding.selected_workspace.is_some() {
                 return;
             }
-            onboarding.workspaces.first().map(|ws| ws.id.clone())
+            // Settings > General > Default project, else the first one.
+            let preferred = crate::settings::current(cx).general.default_project;
+            onboarding
+                .workspaces
+                .iter()
+                .find(|ws| preferred.as_deref() == Some(ws.id.to_string().as_str()))
+                .or(onboarding.workspaces.first())
+                .map(|ws| ws.id.clone())
         };
         if let Some(id) = first {
             let requests = self.sidebar.update(cx, |sidebar, cx| {

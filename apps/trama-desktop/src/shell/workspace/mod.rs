@@ -2,6 +2,7 @@ mod chrome;
 mod daemon;
 mod panes;
 mod render;
+mod settings;
 mod sharing;
 mod wizards;
 #[allow(unused_imports)]
@@ -99,6 +100,8 @@ pub struct Workspace {
     share_wizard: Entity<ShareWizard>,
     join_wizard: Entity<JoinWizard>,
     account: Entity<AccountView>,
+    /// The Settings view (opened as a large dialog).
+    settings: Entity<crate::settings::SettingsView>,
     join: Entity<JoinView>,
     palette: Entity<CommandState>,
     palette_query: String,
@@ -165,6 +168,11 @@ impl Workspace {
         let join_wizard = cx.new(|cx| JoinWizard::new(wizard_store, window, cx));
         let account_store = collab.clone();
         let account = cx.new(|cx| AccountView::new(account_store, window, cx));
+        let settings_client = client.clone();
+        let settings_account = account.clone();
+        let settings = cx.new(|cx| {
+            crate::settings::SettingsView::new(settings_client, settings_account, window, cx)
+        });
         let join_store = collab.clone();
         let join = cx.new(|cx| JoinView::new(join_store, window, cx));
         let composer_input = chat.read(cx).composer_input();
@@ -409,6 +417,7 @@ impl Workspace {
             share_wizard,
             join_wizard,
             account,
+            settings,
             join,
             palette,
             palette_query: String::new(),

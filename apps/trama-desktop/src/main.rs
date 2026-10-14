@@ -3,6 +3,7 @@ mod collab;
 mod composer;
 mod conversation;
 mod review;
+mod settings;
 mod shell;
 mod system;
 mod terminal;
@@ -98,6 +99,10 @@ fn main() {
             mode = forced;
         }
         theme::apply(mode, cx);
+        // settings.json: appearance and keybinding overrides.
+        if devhooks::appearance().is_none() {
+            settings::init(cx);
+        }
 
         let bounds = Bounds::centered(None, size(px(1320.), px(840.)), cx);
         let options = WindowOptions {

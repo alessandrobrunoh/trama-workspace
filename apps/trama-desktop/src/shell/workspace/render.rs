@@ -113,6 +113,11 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &keymap::ManageProjects, window, cx| {
                 this.open_projects(window, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::settings::OpenSettings, window, cx| {
+                    this.open_settings(None, window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &keymap::ShareThread, window, cx| {
                 this.open_share(window, cx);
             }))
@@ -170,7 +175,7 @@ impl Render for Workspace {
             .bg(p.canvas)
             .text_color(p.text)
             .font_family(theme::UI_FONT)
-            .text_size(theme::text_ui())
+            .text_size(crate::settings::ui_font_size(cx))
             .child(self.render_title_bar(cx))
             .when_some(alert, |this, alert| {
                 this.child(
