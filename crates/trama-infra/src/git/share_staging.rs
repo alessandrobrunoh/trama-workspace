@@ -6,9 +6,10 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::git::checkout::CheckoutError;
-use crate::git::share_git::{Result, ShareGitError};
+use crate::git::checkout::{CheckoutError, CheckoutManager, ProvisionedCheckout};
+use crate::git::share_git::{ExpectedState, Result, ShareGitError};
 use trama_domain::checkout_state::ObjectFormat;
+use trama_domain::ids::{CheckoutId, RepositoryId, ThreadId};
 
 fn run(cwd: Option<&Path>, args: &[&std::ffi::OsStr]) -> Result<()> {
     let mut command = Command::new("git");
@@ -87,10 +88,66 @@ pub fn prepare_staging(dir: &Path, format: ObjectFormat, origin: Option<&str>) -
     Ok(())
 }
 
+/// Turns a restored staging repository into the source of a regular
+/// repo-local managed checkout carrying the exact shared state: the staging
+/// is reset to a clean `HEAD`, a managed checkout is provisioned from it,
+/// and the captured index/working state is restored into that checkout
+/// from a full local bundle of the share refs (verified as usual).
+pub fn materialize_share_checkout(
+    manager: &CheckoutManager,
+    staging: &Path,
+    thread: &ThreadId,
+    repository: &RepositoryId,
+    checkout: &CheckoutId,
+    expected: &ExpectedState,
+) -> Result<ProvisionedCheckout> {
+    let destination = manager
+        .repo_local_path(staging, thread, checkout)
+        .map_err(ShareGitError::from)?;
+    if !destination.exists() {
+        run(
+            Some(staging),
+            &[
+                "read-tree".as_ref(),
+                "--reset".as_ref(),
+                "-u".as_ref(),
+                "HEAD".as_ref(),
+            ],
+        )?;
+        run(Some(staging), &["clean".as_ref(), "-fdq".as_ref()])?;
+    }
+    let provisioned = manager
+        .provision_repo_local(staging, thread, repository, checkout)
+        .map_err(ShareGitError::from)?;
+    if provisioned.base_revision != expected.head_commit {
+        return Err(ShareGitError::Mismatch {
+            what: "provisioned base",
+            expected: expected.head_commit.clone(),
+            actual: provisioned.base_revision,
+        });
+    }
+    let bundle = staging.join(".git").join("trama-share-local.bundle");
+    run(
+        Some(staging),
+        &[
+            "bundle".as_ref(),
+            "create".as_ref(),
+            "--quiet".as_ref(),
+            bundle.as_os_str(),
+            expected.index_ref.as_ref(),
+            expected.working_ref.as_ref(),
+        ],
+    )?;
+    let restored = super::share_git::restore(&provisioned.path, &bundle, expected);
+    let _ = std::fs::remove_file(&bundle);
+    restored?;
+    Ok(provisioned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::share_git::{ExpectedState, capture, export_bundle, restore};
+    use crate::git::share_git::{capture, export_bundle, restore};
 
     fn git(cwd: &Path, args: &[&str]) {
         let ok = Command::new("git")
@@ -147,6 +204,40 @@ mod tests {
             b"one\r\nbinary\x00\n"
         );
         assert!(alone.join("u.txt").exists());
+
+        // The restored staging becomes the source of a managed checkout.
+        let manager = CheckoutManager::new(tmp.path().join("managed"));
+        let (thread, repo, co) = (
+            ThreadId::from("t1"),
+            RepositoryId::from("r1"),
+            CheckoutId::from("c1"),
+        );
+        let managed =
+            materialize_share_checkout(&manager, &alone, &thread, &repo, &co, &expected).unwrap();
+        assert_eq!(managed.base_revision, captured.head_commit);
+        manager
+            .validate_repo_local(&alone, &managed.path, &managed.base_revision)
+            .unwrap();
+        assert_eq!(rev(&managed.path, "HEAD"), captured.head_commit);
+        for f in ["a.txt", "b.txt", "u.txt"] {
+            assert_eq!(
+                std::fs::read(managed.path.join(f)).unwrap(),
+                std::fs::read(src.join(f)).unwrap(),
+                "{f}"
+            );
+        }
+        let staged = |p: &Path| {
+            let o = Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .arg("write-tree")
+                .output()
+                .unwrap();
+            String::from_utf8(o.stdout).unwrap()
+        };
+        assert_eq!(staged(&managed.path), staged(&src));
+        // A second run refuses: the managed checkout now carries the state.
+        materialize_share_checkout(&manager, &alone, &thread, &repo, &co, &expected).unwrap_err();
 
         let thin = tmp.path().join("thin.bundle");
         let head = captured.head_commit.clone();
