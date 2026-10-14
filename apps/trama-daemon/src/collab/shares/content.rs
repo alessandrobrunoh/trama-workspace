@@ -208,6 +208,20 @@ impl CollabService {
         share_id: &str,
         snapshot: &VerifiedSnapshot,
     ) -> Result<Option<(ContentManifestV1, Vec<PathBuf>)>> {
+        let Some(manifest) = self.content_manifest(client, share_id, snapshot).await? else {
+            return Ok(None);
+        };
+        let stored = self.download_bundles(client, share_id, &manifest).await?;
+        Ok(Some((manifest, stored)))
+    }
+
+    /// The verified content manifest of `snapshot`, without its objects.
+    pub(crate) async fn content_manifest(
+        &self,
+        client: &ShareClient,
+        share_id: &str,
+        snapshot: &VerifiedSnapshot,
+    ) -> Result<Option<ContentManifestV1>> {
         let blob = match client
             .manifest(share_id, snapshot.version, ManifestPart::Content)
             .await
@@ -258,6 +272,15 @@ impl CollabService {
             &snapshot.manifest,
         )
         .map_err(|e| DaemonError::Collab(format!("content manifest rejected: {e}")))?;
+        Ok(Some(manifest))
+    }
+
+    async fn download_bundles(
+        &self,
+        client: &ShareClient,
+        share_id: &str,
+        manifest: &ContentManifestV1,
+    ) -> Result<Vec<PathBuf>> {
         let dir = self
             .credentials_path()?
             .parent()
@@ -283,6 +306,6 @@ impl CollabService {
             std::fs::write(&path, plain).map_err(collab)?;
             stored.push(path);
         }
-        Ok(Some((manifest, stored)))
+        Ok(stored)
     }
 }
