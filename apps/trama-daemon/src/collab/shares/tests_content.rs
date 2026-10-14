@@ -206,6 +206,89 @@ async fn joiner_restores_the_owner_checkout_exactly() {
     assert_eq!(again.checkouts, report.checkouts);
     assert_eq!(checkout_of(&bob, &bob_root).await, dst);
 
+    // A newer snapshot is offered, not applied.
+    std::fs::write(src.join("update.txt"), "v2\n").unwrap();
+    git(&src, &["add", "update.txt"]);
+    git(&src, &["commit", "-m", "update"]);
+    let (_, alice_client) = alice.collab.share_client().unwrap();
+    let v2 = alice
+        .collab
+        .publish_history_snapshot(&alice_client, &share_id, false)
+        .await
+        .unwrap();
+    let offered = share_status(
+        &mut b,
+        ClientMessage::GetShareStatus {
+            share_id: share_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(offered.update_available, Some(v2));
+    assert!(!dst.join("update.txt").exists());
+    // Local changes block the update; nothing is touched.
+    std::fs::write(dst.join("mine.txt"), "mine\n").unwrap();
+    let refused = b
+        .request(
+            ClientMessage::ApplyShareUpdate {
+                share_id: share_id.clone(),
+            },
+            "update refused",
+            |m| match m {
+                DaemonMessage::Error { message, .. } => Some(message.clone()),
+                DaemonMessage::ShareStatusReport(_) => panic!("update applied over local changes"),
+                _ => None,
+            },
+        )
+        .await;
+    assert!(refused.contains("local changes"), "{refused}");
+    assert!(!dst.join("update.txt").exists());
+    std::fs::remove_file(dst.join("mine.txt")).unwrap();
+    let updated = share_status(
+        &mut b,
+        ClientMessage::ApplyShareUpdate {
+            share_id: share_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(updated.update_available, None);
+    assert_eq!(updated.checkouts, report.checkouts);
+    assert_eq!(
+        out(&dst, &["rev-parse", "HEAD"]),
+        out(&src, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        std::fs::read(dst.join("same.txt")).unwrap(),
+        std::fs::read(src.join("same.txt")).unwrap()
+    );
+    assert!(dst.join("update.txt").exists());
+
+    // A deleted checkout folder is recreated in place, with one repository.
+    std::fs::remove_dir_all(&dst).unwrap();
+    share_status(
+        &mut b,
+        ClientMessage::RetryShareRestore {
+            share_id: share_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(checkout_of(&bob, &bob_root).await, dst);
+    assert!(dst.join("update.txt").exists());
+    let sources = bob
+        .collab
+        .db()
+        .list_all_repositories()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| {
+            r.local_path
+                .as_ref()
+                .and_then(|p| dunce::canonicalize(p).ok())
+                .is_some_and(|p| p.starts_with(&base))
+        })
+        .count();
+    assert_eq!(sources, 1);
+
     // A secret in the owner's checkout: a membership-change republish keeps
     // history without code and records a warning; a normal one refuses.
     std::fs::write(
