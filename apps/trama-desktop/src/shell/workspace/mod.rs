@@ -654,6 +654,7 @@ impl Workspace {
             }
             SidebarEvent::NewThread => self.open_new_thread(window, cx),
             SidebarEvent::ManageProjects => self.open_projects(window, cx),
+            SidebarEvent::OpenSettings => self.open_settings(None, window, cx),
             SidebarEvent::CreateProject => self.open_projects_with(true, window, cx),
             SidebarEvent::QuickSwitch => self.open_palette(window, cx),
             SidebarEvent::OpenShared(listing) => self.open_shared(listing.clone(), window, cx),

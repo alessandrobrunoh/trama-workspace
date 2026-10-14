@@ -24,6 +24,15 @@ impl Workspace {
                 self.collab.update(cx, |collab, cx| collab.on_connected(cx));
                 self.settings
                     .update(cx, |settings, cx| settings.set_connected(true, cx));
+                // Settings overlays need no thread list (dev screenshots).
+                if self.dev.as_ref().is_some_and(|dev| {
+                    matches!(
+                        dev.overlay.as_deref(),
+                        Some("settings" | "providers" | "keybindings")
+                    )
+                }) {
+                    self.run_dev_script(window, cx);
+                }
             }
             NetEvent::Disconnected => {
                 self.connected = false;

@@ -59,6 +59,8 @@ pub enum SidebarEvent {
     Requests(Vec<OnboardingRequest>),
     NewThread,
     ManageProjects,
+    /// The footer gear: the Settings view.
+    OpenSettings,
     /// The '+' next to Projects: Manage projects, focused on a new project.
     CreateProject,
     QuickSwitch,
@@ -516,8 +518,8 @@ impl Render for SidebarPanel {
                     .ghost()
                     .small()
                     .icon(IconName::Settings)
-                    .tooltip("Manage projects")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ManageProjects))),
+                    .tooltip("Settings")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenSettings))),
             );
 
         v_flex()
