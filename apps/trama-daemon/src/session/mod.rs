@@ -225,6 +225,11 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    /// Managed checkout provisioning (also used for restored share checkouts).
+    pub(crate) fn checkout_manager(&self) -> &trama_infra::git::checkout::CheckoutManager {
+        &self.checkout_manager
+    }
+
     pub fn new(db: TramaDb, adapter: Arc<dyn AgentAdapter>) -> Self {
         let root = trama_protocol::default_app_dir()
             .unwrap_or_else(|| std::env::temp_dir().join("TramaWorkspace"));

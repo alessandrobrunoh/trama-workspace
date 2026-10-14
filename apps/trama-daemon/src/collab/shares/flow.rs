@@ -426,15 +426,7 @@ impl CollabService {
         self.db().upsert_share_threads(rows).await?;
         if info.read_code {
             // History stays usable when code cannot be restored.
-            if let Err(e) = self
-                .restore_share_content(&client, share_id, &snapshot)
-                .await
-            {
-                crate::log::warn(format!("share {share_id}: content not restored: {e}"));
-                self.db()
-                    .set_collab_setting(&format!("share_content_error:{share_id}"), &e.to_string())
-                    .await?;
-            }
+            self.run_share_restore(&client, share_id, &snapshot).await?;
         }
         let role = serde_json::to_value(info.role)
             .ok()

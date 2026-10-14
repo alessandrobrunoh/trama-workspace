@@ -142,6 +142,12 @@ async fn run(msg: ClientMessage, collab: &CollabService) -> Result<Option<Daemon
             let entries = collab.share_history_status(&thread_id).await?;
             DaemonMessage::ShareHistoryStatus { thread_id, entries }
         }
+        ClientMessage::GetShareStatus { share_id } => {
+            DaemonMessage::ShareStatusReport(collab.share_status(&share_id).await?)
+        }
+        ClientMessage::RetryShareRestore { share_id } => {
+            DaemonMessage::ShareStatusReport(collab.retry_share_restore(&share_id).await?)
+        }
         ClientMessage::GetThreadShare { thread_id } => {
             let share = collab.thread_share(&thread_id).await?;
             DaemonMessage::ThreadShare { thread_id, share }

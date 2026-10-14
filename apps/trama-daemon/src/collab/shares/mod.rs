@@ -17,6 +17,7 @@ mod retry;
 mod scan;
 mod slices;
 mod snapshot;
+mod status;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
