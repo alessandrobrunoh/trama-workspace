@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 use trama_domain::ids::ThreadId;
 use trama_domain::share::ShareId;
-use trama_protocol::{ClientMessage, DaemonMessage, ShareInvite, ShareRole, ShareScope};
+use trama_protocol::{
+    ClientMessage, DaemonMessage, ShareInvite, ShareRestoreState, ShareRole, ShareScope,
+    ShareStatusReport,
+};
 
 use super::super::tests::{Ipc, Node, Server, git};
 use super::outbound::Payload;
@@ -158,27 +161,9 @@ async fn joiner_restores_the_owner_checkout_exactly() {
         rows[0].local_thread_id.as_deref(),
         Some(bob_root.to_string().as_str())
     );
-    let gid = &rows[0].thread_gid.0;
-    let prefix = format!("share_checkout:{share_id}:{gid}:");
-    let mut restored = None;
-    // One repository: find its key by listing the share-checkouts dir.
-    let base = bob.app_dir().join("share-checkouts");
-    for entry in walk(&base) {
-        if entry.join(".git").exists() {
-            restored = Some(entry);
-        }
-    }
-    let dst = restored.expect("checkout restored");
-    let key_repo = dst.file_name().unwrap().to_string_lossy().into_owned();
-    let repo_gid = key_repo.rsplit_once("-v").unwrap().0.to_owned();
-    let recorded = bob
-        .collab
-        .db()
-        .collab_setting_or_insert(&format!("{prefix}{repo_gid}"), "")
-        .await
-        .unwrap();
-    assert_eq!(PathBuf::from(recorded), dst);
-
+    // The restored checkout is the thread's real (managed) checkout.
+    let dst = checkout_of(&bob, &bob_root).await;
+    assert!(dst.starts_with(bob.app_dir().join("share-checkouts")));
     assert_eq!(
         out(&dst, &["rev-parse", "HEAD"]),
         out(&src, &["rev-parse", "HEAD"])
@@ -195,23 +180,64 @@ async fn joiner_restores_the_owner_checkout_exactly() {
             "{file}"
         );
     }
+
+    let report = share_status(
+        &mut b,
+        ClientMessage::GetShareStatus {
+            share_id: share_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(report.restore, ShareRestoreState::Restored);
+    assert_eq!(report.checkouts.len(), 1);
+    assert_eq!(PathBuf::from(&report.checkouts[0].path), dst);
+    assert_eq!(report.checkouts[0].thread_id.as_ref(), Some(&bob_root));
+    // A retry keeps the attached checkout.
+    let again = share_status(
+        &mut b,
+        ClientMessage::RetryShareRestore {
+            share_id: share_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(again.restore, ShareRestoreState::Restored);
+    assert_eq!(again.checkouts, report.checkouts);
+    assert_eq!(checkout_of(&bob, &bob_root).await, dst);
+
+    // A secret in the owner's checkout: a membership-change republish keeps
+    // history without code and records a warning; a normal one refuses.
+    std::fs::write(
+        src.join("conf.txt"),
+        "aws_access_key_id = AKIAIOSFODNN7EXAMPLQ\n",
+    )
+    .unwrap();
+    let (_, client) = alice.collab.share_client().unwrap();
+    alice
+        .collab
+        .publish_history_snapshot(&client, &share_id, true)
+        .await
+        .unwrap();
+    assert!(
+        alice
+            .collab
+            .publish_history_snapshot(&client, &share_id, false)
+            .await
+            .is_err()
+    );
+    let owner = share_status(&mut a, ClientMessage::GetShareStatus { share_id }).await;
+    assert_eq!(owner.restore, ShareRestoreState::NotRequested);
+    assert_eq!(owner.warnings[0].code, "content_skipped");
 }
 
-fn walk(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() && p.file_name().is_some_and(|n| n != ".git") {
-            out.push(p.clone());
-            if !p.join(".git").exists() {
-                out.extend(walk(&p));
-            }
+async fn share_status(ipc: &mut Ipc, msg: ClientMessage) -> ShareStatusReport {
+    ipc.request(msg, "share status", |m| {
+        fail(m);
+        match m {
+            DaemonMessage::ShareStatusReport(r) => Some(r.clone()),
+            _ => None,
         }
-    }
-    out
+    })
+    .await
 }
 
 #[tokio::test]
