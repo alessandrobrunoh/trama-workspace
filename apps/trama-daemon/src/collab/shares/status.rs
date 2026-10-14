@@ -18,6 +18,9 @@ use crate::error::{DaemonError, Result};
 #[derive(Serialize, Deserialize)]
 struct RestoreRecord {
     state: ShareRestoreState,
+    /// Snapshot version the checkouts were last restored or updated from.
+    #[serde(default)]
+    version: u64,
     error: Option<String>,
     checkouts: Vec<RestoredCheckout>,
 }
@@ -35,14 +38,27 @@ impl CollabService {
         share_id: &str,
         snapshot: &VerifiedSnapshot,
     ) -> Result<()> {
-        let record = match self.restore_share_content(client, share_id, snapshot).await {
+        let outcome = self.restore_share_content(client, share_id, snapshot).await;
+        self.record_restore(share_id, snapshot.version, outcome)
+            .await
+    }
+
+    async fn record_restore(
+        &self,
+        share_id: &str,
+        version: u64,
+        outcome: Result<Option<Vec<RestoredCheckout>>>,
+    ) -> Result<()> {
+        let record = match outcome {
             Ok(None) => RestoreRecord {
                 state: ShareRestoreState::NoContent,
+                version,
                 error: None,
                 checkouts: Vec::new(),
             },
             Ok(Some(checkouts)) => RestoreRecord {
                 state: ShareRestoreState::Restored,
+                version,
                 error: None,
                 checkouts,
             },
@@ -50,6 +66,7 @@ impl CollabService {
                 crate::log::warn(format!("share {share_id}: content not restored: {e}"));
                 RestoreRecord {
                     state: ShareRestoreState::Failed,
+                    version,
                     error: Some(e.to_string()),
                     checkouts: Vec::new(),
                 }
@@ -73,6 +90,7 @@ impl CollabService {
             .await?;
         let record = serde_json::from_str::<RestoreRecord>(&stored).unwrap_or(RestoreRecord {
             state: ShareRestoreState::NotRequested,
+            version: 0,
             error: None,
             checkouts: Vec::new(),
         });
@@ -92,7 +110,12 @@ impl CollabService {
             restore: record.state,
             restore_error: record.error,
             checkouts: record.checkouts,
-            update_available: None,
+            update_available: match record.state {
+                ShareRestoreState::Restored => {
+                    self.update_available(share_id, record.version).await
+                }
+                _ => None,
+            },
             warnings,
         })
     }
@@ -100,6 +123,55 @@ impl CollabService {
     /// Joiner with `read_code`: verifies the latest snapshot again and
     /// restores whatever is missing.
     pub(crate) async fn retry_share_restore(&self, share_id: &str) -> Result<ShareStatusReport> {
+        let client = self.code_client(share_id).await?;
+        let snapshot = self.read_verified_snapshot(&client, share_id).await?;
+        self.run_share_restore(&client, share_id, &snapshot).await?;
+        self.share_status(share_id).await
+    }
+
+    /// Best effort (never fails `GetShareStatus`): the latest snapshot
+    /// version when it is newer than the restore and moves a checkout.
+    async fn update_available(&self, share_id: &str, restored: u64) -> Option<u64> {
+        let check = async {
+            let (_, client) = self.share_client().ok()?;
+            let info = client.info(share_id).await.ok()?;
+            if info.latest_manifest_version <= restored {
+                return None;
+            }
+            let snapshot = self.read_verified_snapshot(&client, share_id).await.ok()?;
+            let manifest = self
+                .content_manifest(&client, share_id, &snapshot)
+                .await
+                .ok()??;
+            self.checkouts_behind(share_id, &manifest)
+                .await
+                .ok()?
+                .then_some(snapshot.version)
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), check)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Joiner: applies the latest snapshot to the attached checkouts.
+    /// Refused (nothing changed) when one has local changes.
+    pub(crate) async fn apply_share_update(&self, share_id: &str) -> Result<ShareStatusReport> {
+        let client = self.code_client(share_id).await?;
+        let snapshot = self.read_verified_snapshot(&client, share_id).await?;
+        let outcome = self
+            .update_share_content(&client, share_id, &snapshot)
+            .await;
+        if let Err(e @ DaemonError::Invalid(_)) = outcome {
+            // Local changes: keep the previous record, report the refusal.
+            return Err(e);
+        }
+        self.record_restore(share_id, snapshot.version, outcome)
+            .await?;
+        self.share_status(share_id).await
+    }
+
+    async fn code_client(&self, share_id: &str) -> Result<ShareClient> {
         let role = self
             .db()
             .collab_setting_or_insert(&role_key(share_id), "reader")
@@ -116,8 +188,6 @@ impl CollabService {
                 "this device has no access to the share's code".into(),
             ));
         }
-        let snapshot = self.read_verified_snapshot(&client, share_id).await?;
-        self.run_share_restore(&client, share_id, &snapshot).await?;
-        self.share_status(share_id).await
+        Ok(client)
     }
 }

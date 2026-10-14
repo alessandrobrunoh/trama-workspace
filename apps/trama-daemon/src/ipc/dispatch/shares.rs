@@ -148,6 +148,9 @@ async fn run(msg: ClientMessage, collab: &CollabService) -> Result<Option<Daemon
         ClientMessage::RetryShareRestore { share_id } => {
             DaemonMessage::ShareStatusReport(collab.retry_share_restore(&share_id).await?)
         }
+        ClientMessage::ApplyShareUpdate { share_id } => {
+            DaemonMessage::ShareStatusReport(collab.apply_share_update(&share_id).await?)
+        }
         ClientMessage::GetThreadShare { thread_id } => {
             let share = collab.thread_share(&thread_id).await?;
             DaemonMessage::ThreadShare { thread_id, share }
