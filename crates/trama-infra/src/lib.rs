@@ -7,6 +7,7 @@
 pub mod claude;
 pub mod fs;
 pub mod git;
+pub mod llm;
 pub mod process;
 
 pub use claude::adapter::ClaudeAdapter;
