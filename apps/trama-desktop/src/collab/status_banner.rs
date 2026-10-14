@@ -1,6 +1,6 @@
 //! Transcript banners for a share's persisted status: warnings such as
-//! "published without code" and checkout restore failures with a
-//! "Retry restore" button.
+//! "published without code", checkout restore failures with a
+//! "Retry restore" button and "Update available — Apply".
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -27,13 +27,40 @@ pub fn restore_text(status: &StatusView) -> Option<String> {
     Some(text)
 }
 
+/// "Update available" text, `None` when there is no pending update.
+pub fn update_text(status: &StatusView) -> Option<String> {
+    status.update_available?;
+    let mut text = "Update available: the shared code changed.".to_owned();
+    if let Some(error) = &status.update_error {
+        text.push_str(&format!(" (not applied: {error})"));
+    }
+    Some(text)
+}
+
 /// Banners for one share, newest warning first, restore failure on top.
 pub fn banners(
     p: &Palette,
     status: &StatusView,
     on_retry: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_apply: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Vec<AnyElement> {
     let mut out = Vec::new();
+    if let Some(text) = update_text(status) {
+        let action = if status.updating {
+            div()
+                .text_color(p.text_muted)
+                .child("Applying…")
+                .into_any_element()
+        } else {
+            Button::new("apply-share-update")
+                .xsmall()
+                .ghost()
+                .label("Apply")
+                .on_click(on_apply)
+                .into_any_element()
+        };
+        out.push(banner(p, IconName::Info, text, Some(action)));
+    }
     if let Some(text) = restore_text(status) {
         let action = if status.retrying {
             div()
@@ -79,7 +106,19 @@ fn banner(p: &Palette, icon: IconName, text: String, action: Option<AnyElement>)
 
 #[cfg(test)]
 mod tests {
-    use super::{StatusView, restore_text};
+    use super::{StatusView, restore_text, update_text};
+
+    #[test]
+    fn update_text_only_when_offered() {
+        let mut status = StatusView::default();
+        assert_eq!(update_text(&status), None);
+        status.update_available = Some(3);
+        status.update_error = Some("local changes".into());
+        assert_eq!(
+            update_text(&status).unwrap(),
+            "Update available: the shared code changed. (not applied: local changes)"
+        );
+    }
 
     #[test]
     fn restore_text_covers_reason_and_retry_error() {

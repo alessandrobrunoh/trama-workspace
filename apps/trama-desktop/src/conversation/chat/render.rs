@@ -57,12 +57,18 @@ impl Render for ChatPanel {
             rows.push(row(crate::collab::presence::revoked_banner(&p)));
         }
         if let Some(share_id) = shared.share_id.clone() {
+            let apply_id = share_id.clone();
             let retry = cx.listener(move |this, _: &ClickEvent, _, cx| {
                 if let Some(collab) = this.collab.clone() {
                     collab.update(cx, |collab, cx| collab.retry_restore(&share_id, cx));
                 }
             });
-            for banner in crate::collab::status_banner::banners(&p, &shared.status, retry) {
+            let apply = cx.listener(move |this, _: &ClickEvent, _, cx| {
+                if let Some(collab) = this.collab.clone() {
+                    collab.update(cx, |collab, cx| collab.apply_share_update(&apply_id, cx));
+                }
+            });
+            for banner in crate::collab::status_banner::banners(&p, &shared.status, retry, apply) {
                 rows.push(row(banner));
             }
         }

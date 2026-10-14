@@ -199,6 +199,21 @@ impl VNextState {
                 correlation_id,
                 message,
                 ..
+            } if operation == "apply_share_update" => {
+                if self
+                    .statuses
+                    .fail_update(share_id.as_deref(), message.clone())
+                {
+                    self.corr.swallow_error(correlation_id);
+                    return (true, Vec::new());
+                }
+            }
+            DaemonMessage::ShareFailed {
+                operation,
+                share_id,
+                correlation_id,
+                message,
+                ..
             } if operation == "retry_share_restore" => {
                 if self
                     .statuses
@@ -324,6 +339,14 @@ impl CollabStore {
     /// "Retry restore" for a joined share whose restore failed.
     pub fn retry_restore(&mut self, share_id: &str, cx: &mut Context<Self>) {
         if let Some(message) = self.vnext.statuses.retry(share_id) {
+            self.send(message);
+            cx.notify();
+        }
+    }
+
+    /// "Apply" on a share's "Update available" banner.
+    pub fn apply_share_update(&mut self, share_id: &str, cx: &mut Context<Self>) {
+        if let Some(message) = self.vnext.statuses.apply_update(share_id) {
             self.send(message);
             cx.notify();
         }
