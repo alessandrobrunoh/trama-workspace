@@ -104,6 +104,8 @@ pub use trama_collab_protocol::{
 
 /// Wire protocol version carried in `Hello` / `Welcome`.
 ///
+/// Version 18 adds `GetShareStatus`, `RetryShareRestore` and
+/// `ShareStatusReport` (share warnings, checkout restore state).
 /// Version 17 adds `GetThreadShare` / `ThreadShare` (share id, role and
 /// lease per thread) and the `access_revoked` share error code.
 /// Version 16 adds `ListShareMembers`, `GetShareHistoryStatus`,
@@ -154,7 +156,7 @@ pub use trama_collab_protocol::{
 /// Version 4 added the Claude approval channel and 3 thread checkout
 /// discovery. It does not migrate stored data; peers with a different version
 /// are rejected at handshake time.
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Default writer lease length for `AcquireShareLease`.
 pub const DEFAULT_LEASE_TTL_SECS: u64 = 120;

@@ -215,6 +215,8 @@ pub enum DaemonMessage {
         thread_id: ThreadId,
         entries: Vec<ShareHistoryEntry>,
     },
+    /// Reply to `GetShareStatus` and `RetryShareRestore`.
+    ShareStatusReport(ShareStatusReport),
     /// Reply to `GetThreadShare`; `share` is `None` for unshared threads.
     ThreadShare {
         thread_id: ThreadId,

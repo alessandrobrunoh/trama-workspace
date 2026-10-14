@@ -155,3 +155,43 @@ pub struct ThreadShareInfo {
     #[serde(default)]
     pub lease_holder: Option<String>,
 }
+
+/// Checkout restore progress of a joined share (owners: `not_requested`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareRestoreState {
+    /// No `read_code` grant, or this device owns the share.
+    NotRequested,
+    /// The snapshot carries no code.
+    NoContent,
+    Restored,
+    Failed,
+}
+
+/// A restored checkout, attached to its local thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoredCheckout {
+    pub thread_id: Option<ThreadId>,
+    pub repository_id: Option<RepositoryId>,
+    pub path: String,
+}
+
+/// A persisted, non-fatal share problem (e.g. `content_skipped`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareWarning {
+    pub code: String,
+    pub message: String,
+    /// RFC 3339.
+    pub at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareStatusReport {
+    pub share_id: String,
+    pub restore: ShareRestoreState,
+    /// Last restore failure, when `restore` is `failed`.
+    pub restore_error: Option<String>,
+    pub checkouts: Vec<RestoredCheckout>,
+    /// Newest first.
+    pub warnings: Vec<ShareWarning>,
+}

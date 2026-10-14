@@ -99,7 +99,9 @@ fn family(msg: &ClientMessage) -> Family {
         | ClientMessage::RemoveShareMember { .. }
         | ClientMessage::ListShareMembers { .. }
         | ClientMessage::GetShareHistoryStatus { .. }
-        | ClientMessage::GetThreadShare { .. } => Family::Shares,
+        | ClientMessage::GetThreadShare { .. }
+        | ClientMessage::GetShareStatus { .. }
+        | ClientMessage::RetryShareRestore { .. } => Family::Shares,
         ClientMessage::Hello { .. }
         | ClientMessage::ApprovalHook { .. }
         | ClientMessage::McpToolCall { .. }

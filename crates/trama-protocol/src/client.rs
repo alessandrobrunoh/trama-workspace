@@ -328,6 +328,16 @@ pub enum ClientMessage {
     GetThreadShare {
         thread_id: ThreadId,
     },
+    /// Warnings and checkout-restore state of a share. Answered with
+    /// `ShareStatusReport`.
+    GetShareStatus {
+        share_id: String,
+    },
+    /// Joiner: retry restoring the share's checkouts (after a failure or
+    /// newer content). Answered with `ShareStatusReport`.
+    RetryShareRestore {
+        share_id: String,
+    },
     /// Share a top-level thread: create its collab thread on first use
     /// (access `invited`), then apply `access` when set and invite the
     /// `invite` usernames (owner only). Setting `link` (again) returns a fresh
