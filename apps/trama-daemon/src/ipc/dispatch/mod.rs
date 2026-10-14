@@ -101,7 +101,8 @@ fn family(msg: &ClientMessage) -> Family {
         | ClientMessage::GetShareHistoryStatus { .. }
         | ClientMessage::GetThreadShare { .. }
         | ClientMessage::GetShareStatus { .. }
-        | ClientMessage::RetryShareRestore { .. } => Family::Shares,
+        | ClientMessage::RetryShareRestore { .. }
+        | ClientMessage::ApplyShareUpdate { .. } => Family::Shares,
         ClientMessage::Hello { .. }
         | ClientMessage::ApprovalHook { .. }
         | ClientMessage::McpToolCall { .. }

@@ -92,6 +92,7 @@ impl CollabService {
             restore: record.state,
             restore_error: record.error,
             checkouts: record.checkouts,
+            update_available: None,
             warnings,
         })
     }

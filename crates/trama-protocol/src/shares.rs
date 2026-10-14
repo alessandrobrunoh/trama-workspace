@@ -192,6 +192,10 @@ pub struct ShareStatusReport {
     /// Last restore failure, when `restore` is `failed`.
     pub restore_error: Option<String>,
     pub checkouts: Vec<RestoredCheckout>,
+    /// Joiner: a newer snapshot version than the restored checkouts, not
+    /// applied until `ApplyShareUpdate`.
+    #[serde(default)]
+    pub update_available: Option<u64>,
     /// Newest first.
     pub warnings: Vec<ShareWarning>,
 }

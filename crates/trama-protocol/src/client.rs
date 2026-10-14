@@ -338,6 +338,12 @@ pub enum ClientMessage {
     RetryShareRestore {
         share_id: String,
     },
+    /// Joiner: bring the attached share checkouts to the latest snapshot.
+    /// Refused when a checkout has local changes since its restore.
+    /// Answered with `ShareStatusReport`.
+    ApplyShareUpdate {
+        share_id: String,
+    },
     /// Share a top-level thread: create its collab thread on first use
     /// (access `invited`), then apply `access` when set and invite the
     /// `invite` usernames (owner only). Setting `link` (again) returns a fresh

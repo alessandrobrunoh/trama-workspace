@@ -105,6 +105,7 @@ mod tests {
             restore,
             restore_error: Some("dirty index".into()),
             checkouts: Vec::new(),
+            update_available: None,
             warnings: vec![ShareWarning {
                 code: "content_skipped".into(),
                 message: "secrets found".into(),
