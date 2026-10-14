@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    Icon, Sizable as _,
+    Disableable as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     menu::{ContextMenuExt as _, PopupMenuItem},
@@ -195,45 +195,65 @@ impl Render for SidebarPanel {
         let selected_thread = self.onboarding.selected_thread.clone();
         let can_thread = self.onboarding.can_create_thread();
 
-        let new_thread = h_flex()
-            .id("sidebar-new-thread")
+        let project_title = self
+            .selected_workspace_title()
+            .unwrap_or_else(|| "Trama".to_string());
+        let initial: SharedString = project_title
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_default()
+            .into();
+        // Workspace switcher, Linear style: logo tile + project name.
+        let switcher = h_flex()
+            .id("sidebar-switcher")
             .flex_1()
-            .h(px(30.))
-            .px(theme::sp(2.5))
+            .min_w_0()
+            .h(theme::row_height())
+            .px(theme::sp(1.5))
             .gap(theme::sp(2.))
             .items_center()
             .rounded(theme::radius())
-            .border_1()
-            .border_color(p.border)
-            .bg(p.elevated)
-            .text_size(theme::text_ui())
-            .text_color(if connected { p.text } else { p.text_faint })
-            .when(connected, |this| {
-                this.cursor_pointer()
-                    .hover(|style| style.bg(p.hover).border_color(p.border_strong))
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewThread)))
-            })
-            .child(
-                Icon::new(IconName::SquarePen)
-                    .with_size(px(14.))
-                    .text_color(p.text_muted),
-            )
-            .child(div().flex_1().child("New thread"))
+            .cursor_pointer()
+            .hover(|style| style.bg(p.hover))
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ManageProjects)))
             .child(
                 div()
+                    .size(px(18.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(theme::radius_sm())
+                    .bg(p.accent)
+                    .text_color(gpui_kit::white())
                     .text_size(theme::text_xs())
-                    .text_color(p.text_faint)
-                    .child("\u{2318}N"),
+                    .font_weight(FontWeight::BOLD)
+                    .child(initial),
+            )
+            .child(
+                div()
+                    .flex_shrink(1.)
+                    .min_w_0()
+                    .truncate()
+                    .text_size(theme::text_ui())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(project_title),
+            )
+            .child(
+                Icon::new(IconName::ChevronDown)
+                    .with_size(px(12.))
+                    .text_color(p.text_faint),
             );
 
         let header = h_flex()
             .flex_shrink_0()
             .px(theme::sp(2.))
-            .pt(theme::sp(2.))
+            .pt(theme::sp(1.))
             .pb(theme::sp(1.))
-            .gap(theme::sp(1.))
+            .gap(theme::sp(0.5))
             .items_center()
-            .child(new_thread)
+            .child(switcher)
             .child(
                 Button::new("sidebar-search")
                     .ghost()
@@ -241,7 +261,52 @@ impl Render for SidebarPanel {
                     .icon(IconName::Search)
                     .tooltip("Jump to thread (\u{2318}K)")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::QuickSwitch))),
+            )
+            .child(
+                div()
+                    .rounded(theme::radius())
+                    .border_1()
+                    .border_color(p.border_strong)
+                    .bg(p.bg)
+                    .child(
+                        Button::new("sidebar-new-thread")
+                            .ghost()
+                            .small()
+                            .icon(IconName::SquarePen)
+                            .disabled(!connected)
+                            .tooltip("New thread (\u{2318}N)")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewThread))),
+                    ),
             );
+
+        let nav = v_flex()
+            .flex_shrink_0()
+            .px(theme::sp(2.))
+            .gap(px(1.))
+            .child(nav_item(
+                "nav-new-thread",
+                IconName::SquarePen,
+                "New thread",
+                connected,
+                &p,
+                cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewThread)),
+            ))
+            .child(nav_item(
+                "nav-jump",
+                IconName::Search,
+                "Jump to thread",
+                true,
+                &p,
+                cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::QuickSwitch)),
+            ))
+            .child(nav_item(
+                "nav-projects",
+                IconName::FolderGit2,
+                "Projects",
+                true,
+                &p,
+                cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ManageProjects)),
+            ));
 
         let mut list = v_flex()
             .id("sidebar-list")
@@ -257,14 +322,7 @@ impl Render for SidebarPanel {
                     .pt(theme::sp(2.))
                     .pb(theme::sp(1.))
                     .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(theme::text_xs())
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(p.text_faint)
-                            .child("Projects"),
-                    )
+                    .child(section_heading(&p, "Your projects"))
                     .child(
                         Button::new("sidebar-manage-projects")
                             .ghost()
@@ -414,30 +472,29 @@ impl Render for SidebarPanel {
             Link::Offline => (p.warning, "Daemon offline"),
             Link::ProtocolMismatch { .. } => (p.danger, "Restart required"),
         };
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "You".to_string());
         let footer = h_flex()
             .flex_shrink_0()
             .px(theme::sp(2.))
             .py(theme::sp(2.))
             .gap(theme::sp(1.))
             .items_center()
-            .border_t_1()
-            .border_color(p.border)
             .child(
                 h_flex()
-                    .id("sidebar-manage")
+                    .id("sidebar-user")
                     .flex_1()
-                    .h(px(28.))
-                    .px(theme::sp(2.))
+                    .min_w_0()
+                    .h(theme::row_height())
+                    .px(theme::sp(1.5))
                     .gap(theme::sp(2.))
                     .items_center()
                     .rounded(theme::radius())
-                    .cursor_pointer()
                     .text_size(theme::text_ui())
-                    .text_color(p.text_muted)
-                    .hover(|style| style.bg(p.hover).text_color(p.text))
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ManageProjects)))
-                    .child(Icon::new(IconName::Settings).with_size(px(14.)))
-                    .child("Manage projects"),
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(crate::collab::presence::avatar(&p, &user, 20., false))
+                    .child(div().flex_1().min_w_0().truncate().child(user)),
             )
             .child(
                 div()
@@ -445,13 +502,22 @@ impl Render for SidebarPanel {
                     .p(theme::sp(2.))
                     .child(div().size(px(7.)).rounded_full().bg(link_color))
                     .tooltip(move |window, cx| Tooltip::new(link_label).build(window, cx)),
+            )
+            .child(
+                Button::new("sidebar-manage")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Settings)
+                    .tooltip("Manage projects")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ManageProjects))),
             );
 
         v_flex()
             .size_full()
-            .bg(p.panel)
+            .bg(p.canvas)
             .text_color(p.text)
             .child(header)
+            .child(nav)
             .child(list)
             .child(footer)
     }
@@ -784,14 +850,7 @@ impl SidebarPanel {
             .pb(theme::sp(1.))
             .gap(px(2.))
             .items_center()
-            .child(
-                div()
-                    .flex_1()
-                    .text_size(theme::text_xs())
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(p.text_faint)
-                    .child("Shared with me"),
-            )
+            .child(section_heading(p, "Shared with me"))
             .child(
                 Button::new("sidebar-refresh-shared")
                     .ghost()
@@ -880,6 +939,44 @@ impl SidebarPanel {
         }
         section
     }
+}
+
+/// Small muted section title ("Your projects", "Shared with me").
+fn section_heading(p: &Palette, text: &'static str) -> impl IntoElement {
+    div()
+        .flex_1()
+        .text_size(theme::text_sm())
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(p.text_faint)
+        .child(text)
+}
+
+/// Icon + label navigation row with a subtle hover pill.
+fn nav_item(
+    id: &'static str,
+    icon: IconName,
+    label: &'static str,
+    enabled: bool,
+    p: &Palette,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    h_flex()
+        .id(id)
+        .h(theme::row_height())
+        .px(theme::sp(2.))
+        .gap(theme::sp(2.5))
+        .items_center()
+        .rounded(theme::radius())
+        .text_size(theme::text_ui())
+        .text_color(if enabled { p.text } else { p.text_faint })
+        .child(Icon::new(icon).with_size(px(15.)).text_color(p.text_muted))
+        .child(label)
+        .when(enabled, |this| {
+            let hover = p.hover;
+            this.cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .on_click(on_click)
+        })
 }
 
 fn hint(p: &Palette, text: &'static str) -> impl IntoElement {
