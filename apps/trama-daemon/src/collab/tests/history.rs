@@ -382,6 +382,14 @@ async fn sharing_publishes_the_whole_history_and_family() {
         bob.children(&bob_root).await.len() == 3
     })
     .await;
+    // The verdict is its own event and can land after the children.
+    eventually("bob mirrored the review verdict", || async {
+        bob.children(&bob_root)
+            .await
+            .iter()
+            .any(|c| c.review_verdict == Some(ReviewVerdict::Approve))
+    })
+    .await;
     let bob_children = bob.children(&bob_root).await;
     let bob_child_ids: Vec<ThreadId> = bob_children.iter().map(|c| c.id.clone()).collect();
     caught_up(&server, "bob", &bob, &bob_child_ids).await;
