@@ -159,6 +159,12 @@ impl ModelPicker {
                     "Default".to_string(),
                     format!("Workspace default · {DEFAULT_MODEL_LABEL}"),
                 )
+            } else if let Some(provider) = &model.provider {
+                // API providers run plain chat turns (ADR 0015).
+                (
+                    model.label.clone(),
+                    format!("{provider} · chat only, no tools or files"),
+                )
             } else {
                 (label_for(Some(&model.id), &self.models), model.id.clone())
             };
@@ -224,7 +230,13 @@ impl ModelPicker {
                     .text_color(p.text_faint)
                     .child("Model for this thread's next turns"),
             )
-            .child(list)
+            .child(
+                div()
+                    .id("model-list")
+                    .max_h(px(360.))
+                    .overflow_y_scroll()
+                    .child(list),
+            )
             .into_any_element()
     }
 }

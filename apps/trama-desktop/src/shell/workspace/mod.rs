@@ -73,6 +73,8 @@ enum PaletteTarget {
     Share,
     JoinShared,
     CollabAccount,
+    Settings,
+    Providers,
     /// Fork the selected thread at this message ("Fork from here").
     ForkHere(trama_domain::ids::MessageId),
     DiskUsage,

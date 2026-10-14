@@ -308,6 +308,18 @@ impl Workspace {
                 true,
             ),
             (
+                "Settings",
+                IconName::Settings,
+                PaletteTarget::Settings,
+                true,
+            ),
+            (
+                "Model providers (OpenAI, Ollama, OpenRouter…)",
+                IconName::Sparkles,
+                PaletteTarget::Providers,
+                connected,
+            ),
+            (
                 "Review this thread in a subthread",
                 IconName::MessageSquareDiff,
                 PaletteTarget::Review,
@@ -457,7 +469,13 @@ impl Workspace {
             PaletteTarget::PullChanges => self.pull_selected(cx),
             PaletteTarget::Share => self.open_share(window, cx),
             PaletteTarget::JoinShared => self.open_join(window, cx),
-            PaletteTarget::CollabAccount => self.open_account(None, window, cx),
+            PaletteTarget::CollabAccount => {
+                self.open_settings(Some(crate::settings::Section::Collaboration), window, cx)
+            }
+            PaletteTarget::Settings => self.open_settings(None, window, cx),
+            PaletteTarget::Providers => {
+                self.open_settings(Some(crate::settings::Section::Providers), window, cx)
+            }
             PaletteTarget::ForkHere(message) => self.fork_here(message, cx),
             PaletteTarget::DiskUsage => self.open_disk_usage(window, cx),
             PaletteTarget::ArchiveSelected => self.archive_selected(window, cx),

@@ -585,6 +585,13 @@ impl Workspace {
             Some("shortcuts") => self.open_shortcuts(window, cx),
             Some("share") => self.open_share(window, cx),
             Some("collab") => self.open_account(None, window, cx),
+            Some("settings") => self.open_settings(None, window, cx),
+            Some("providers") => {
+                self.open_settings(Some(crate::settings::Section::Providers), window, cx)
+            }
+            Some("keybindings") => {
+                self.open_settings(Some(crate::settings::Section::Keybindings), window, cx)
+            }
             Some("join") => self.open_join(window, cx),
             _ => {}
         }
