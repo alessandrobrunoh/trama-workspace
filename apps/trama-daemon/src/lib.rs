@@ -1,17 +1,14 @@
 //! Local TramaWorkspace daemon: Unix-socket JSON-lines server and real sessions.
 
-pub mod approval;
-mod claude;
+pub mod claude;
 mod collab;
 mod config;
-mod connection;
 mod error;
+mod ipc;
 mod log;
-pub mod mcp;
+mod providers;
 mod session;
 
-#[cfg(test)]
-mod approval_tests;
 #[cfg(test)]
 mod testing;
 
@@ -21,16 +18,15 @@ pub use session::{
     NoCollaborators, PeopleSource, Person, PromptContext, SessionManager, SubagentSettings,
 };
 
-use crate::approval::ApprovalHookSettings;
 use crate::claude::ProductionAdapter;
+use crate::claude::approval::ApprovalHookSettings;
 use crate::config::{load_or_init_config, seed_from_config};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::net::UnixListener;
 use tokio::sync::watch;
 use trama_db::TramaDb;
 
-/// `$TRAMA_DATA_DIR`, else `$HOME/Library/Application Support/TramaWorkspace`
+/// `$TRAMA_DATA_DIR`, else the per-OS data directory (see `platform_app_dir`).
 pub fn default_app_dir() -> Result<PathBuf> {
     trama_protocol::default_app_dir().ok_or_else(|| {
         DaemonError::Invalid(
@@ -74,7 +70,7 @@ pub async fn run_on_socket(socket_path: &Path) -> Result<()> {
     let sessions = bootstrap_sessions()
         .await?
         .with_approval_hook(ApprovalHookSettings::for_current_exe(socket_path)?)
-        .with_mcp(mcp::McpSettings::for_current_exe(socket_path)?);
+        .with_mcp(claude::mcp::McpSettings::for_current_exe(socket_path)?);
     // Shared threads: credentials and the runner live beside the database.
     let collab = CollabService::new(sessions.clone(), &default_app_dir()?);
     collab.start().await?;
@@ -95,17 +91,8 @@ pub async fn serve_on_socket_with(
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if socket_path.exists() {
-        std::fs::remove_file(socket_path)?;
-    }
-
-    let listener = UnixListener::bind(socket_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(socket_path, perms)?;
-    }
+    // Unix socket (0600) or Windows named pipe; see `trama-ipc`.
+    let mut listener = trama_ipc::IpcListener::bind(socket_path)?;
     crate::log::info(format!("listening on {}", socket_path.display()));
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -120,12 +107,12 @@ pub async fn serve_on_socket_with(
             }
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _)) => {
+                    Ok(stream) => {
                         let sessions = sessions.clone();
                         let collab = collab.clone();
                         let shutdown_tx = shutdown_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = connection::handle_connection(
+                            if let Err(err) = ipc::handle_connection(
                                 stream,
                                 sessions,
                                 collab,

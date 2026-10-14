@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 use trama_domain::ids::{CheckoutId, RepositoryId, ThreadId};
-use trama_infra::checkout::{CheckoutError, CheckoutManager, CopyMode, CopyOptions};
-use trama_infra::cow::disk_usage;
+use trama_infra::fs::cow::disk_usage;
+use trama_infra::git::checkout::{CheckoutError, CheckoutManager, CopyMode, CopyOptions};
 
 fn git(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -79,7 +79,7 @@ fn source_repo(root: &Path) -> PathBuf {
         &source,
         &["remote", "add", "origin", "git@example.invalid:org/app.git"],
     );
-    source.canonicalize().unwrap()
+    dunce::canonicalize(&source).unwrap()
 }
 
 fn ids(thread: &str) -> (ThreadId, RepositoryId, CheckoutId) {
@@ -349,7 +349,7 @@ fn a_linked_worktree_source_falls_back_to_git() {
     let main = source_repo(temp.path());
     let linked = temp.path().join("linked");
     git(&main, &["worktree", "add", "-q", linked.to_str().unwrap()]);
-    let linked = linked.canonicalize().unwrap();
+    let linked = dunce::canonicalize(&linked).unwrap();
     fs::write(linked.join("cache.local"), "ignored\n").unwrap();
     let manager = CheckoutManager::new(temp.path().join("data"));
     let checkout = provision(&manager, &linked, "t");
@@ -393,14 +393,16 @@ fn linked_and_excluded_paths_are_not_cloned() {
     assert!(checkout.join("target/debug/keep").exists());
     // Removed so setup can link it back to the primary checkout.
     assert!(fs::symlink_metadata(checkout.join("shared.local")).is_err());
-    let record = trama_infra::setup::run_checkout_setup(&trama_infra::setup::SetupRequest {
-        source: &source,
-        checkout: &checkout,
-        thread_id: "t",
-        thread_title: "t",
-        repository_alias: None,
-        timeout: std::time::Duration::from_secs(20),
-    });
+    let record = trama_infra::process::setup::run_checkout_setup(
+        &trama_infra::process::setup::SetupRequest {
+            source: &source,
+            checkout: &checkout,
+            thread_id: "t",
+            thread_title: "t",
+            repository_alias: None,
+            timeout: std::time::Duration::from_secs(20),
+        },
+    );
     assert!(record.linked[0].linked, "{record:?}");
     assert!(
         fs::symlink_metadata(checkout.join("shared.local"))
@@ -515,7 +517,7 @@ fn removed_subthread_copy_restores_its_fork_point() {
     assert_eq!(
         git(
             &restored,
-            &["rev-parse", trama_infra::changes::FORK_POINT_REF]
+            &["rev-parse", trama_infra::git::changes::FORK_POINT_REF]
         ),
         copy.fork_commit
     );
@@ -543,7 +545,7 @@ fn measure_real_repository() {
     let Some(source) = std::env::var_os("TRAMA_COW_MEASURE_SOURCE") else {
         return;
     };
-    let source = PathBuf::from(source).canonicalize().unwrap();
+    let source = dunce::canonicalize(PathBuf::from(source)).unwrap();
     let count: usize = std::env::var("TRAMA_COW_MEASURE_COUNT")
         .ok()
         .and_then(|value| value.parse().ok())

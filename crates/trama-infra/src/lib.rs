@@ -4,13 +4,10 @@
 //! CLI and speaks NDJSON (`--input-format stream-json` /
 //! `--output-format stream-json`). ACP is not used for Claude Code.
 
-pub mod archive;
-pub mod changes;
-pub mod checkout;
 pub mod claude;
-pub mod cow;
-#[cfg(unix)]
-pub mod pty;
-pub mod setup;
+pub mod fs;
+pub mod git;
+pub mod llm;
+pub mod process;
 
 pub use claude::adapter::ClaudeAdapter;

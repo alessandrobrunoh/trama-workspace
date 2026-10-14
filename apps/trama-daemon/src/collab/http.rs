@@ -226,6 +226,27 @@ impl Endpoint {
         bearer: Option<&str>,
         body: Option<&serde_json::Value>,
     ) -> Result<Bytes, CollabError> {
+        let body = match body {
+            Some(value) => Some((
+                Bytes::from(
+                    serde_json::to_vec(value)
+                        .map_err(|err| CollabError::Transport(err.to_string()))?,
+                ),
+                "application/json",
+            )),
+            None => None,
+        };
+        self.request_raw(method, path, bearer, body).await
+    }
+
+    /// Request with an arbitrary body (`(bytes, content type)`).
+    pub(crate) async fn request_raw(
+        &self,
+        method: Method,
+        path: &str,
+        bearer: Option<&str>,
+        body: Option<(Bytes, &str)>,
+    ) -> Result<Bytes, CollabError> {
         let transport = |err: &dyn std::fmt::Display| CollabError::Transport(err.to_string());
         let stream = self.connect().await?;
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
@@ -242,9 +263,9 @@ impl Endpoint {
             builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
         }
         let bytes = match body {
-            Some(value) => {
-                builder = builder.header(CONTENT_TYPE, "application/json");
-                Bytes::from(serde_json::to_vec(value).map_err(|err| transport(&err))?)
+            Some((bytes, content_type)) => {
+                builder = builder.header(CONTENT_TYPE, content_type);
+                bytes
             }
             None => Bytes::new(),
         };

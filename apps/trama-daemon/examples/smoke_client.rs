@@ -1,14 +1,14 @@
-//! Headless smoke client: drives the daemon end-to-end over its UDS socket
+//! Headless smoke client: drives the daemon end-to-end over its local IPC endpoint
 //! with a real Claude turn. Usage:
 //! `cargo run -p trama-daemon --example smoke_client [-- "<prompt>"]`
 
 use std::time::Duration;
+use tokio::io::WriteHalf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
-use tokio::net::unix::OwnedWriteHalf;
+use trama_ipc::IpcStream;
 use trama_protocol::{ClientMessage, DaemonMessage, PROTOCOL_VERSION, encode_json_line};
 
-async fn send(wr: &mut OwnedWriteHalf, msg: &ClientMessage) -> std::io::Result<()> {
+async fn send(wr: &mut WriteHalf<IpcStream>, msg: &ClientMessage) -> std::io::Result<()> {
     wr.write_all(&encode_json_line(msg).expect("encode")).await
 }
 
@@ -27,8 +27,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("daemon.sock");
 
     let stream =
-        tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(&socket)).await??;
-    let (rd, mut wr) = stream.into_split();
+        tokio::time::timeout(Duration::from_secs(5), trama_ipc::connect(&socket)).await??;
+    let (rd, mut wr) = tokio::io::split(stream);
     let mut lines = BufReader::new(rd).lines();
 
     send(

@@ -74,7 +74,7 @@ pub fn find_session_transcript(projects_dir: &Path, cwd: &Path, session: &str) -
     }
     let file = format!("{session}.jsonl");
     let mut candidates = vec![projects_dir.join(project_dir_name(cwd)).join(&file)];
-    if let Ok(canonical) = fs::canonicalize(cwd) {
+    if let Ok(canonical) = dunce::canonicalize(cwd) {
         candidates.push(projects_dir.join(project_dir_name(&canonical)).join(&file));
     }
     if let Some(found) = candidates.into_iter().find(|path| path.is_file()) {

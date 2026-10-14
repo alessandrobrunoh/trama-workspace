@@ -7,6 +7,7 @@ rust-version.workspace = true
 license-file.workspace = true
 
 [dependencies]
+dunce = "1"
 trama-domain = { path = "../trama-domain" }
 serde = { workspace = true }
 serde_json = { workspace = true }

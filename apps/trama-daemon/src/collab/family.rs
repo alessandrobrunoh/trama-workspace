@@ -72,6 +72,9 @@ impl CollabService {
                         thread
                     }
                 };
+                if let Err(err) = self.publish_local_history(&thread).await {
+                    crate::log::warn(format!("share history not published: {err}"));
+                }
                 if let Some(root) = self.family_root(&thread).await {
                     roots.insert(root);
                 }

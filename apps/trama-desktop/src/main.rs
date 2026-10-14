@@ -1,52 +1,20 @@
-mod activity;
-mod agent;
-mod changes;
-mod chat;
+mod app;
 mod collab;
-mod collab_account;
-mod comments;
 mod composer;
-mod composer_popup;
-mod copies;
-mod demo;
-mod devhooks;
-mod dialog;
-mod diff;
-mod disk_usage;
-mod doc_text;
-mod document;
-mod editor;
-mod forks;
-mod keymap;
-mod mentions;
-mod model_picker;
-mod net;
-mod onboarding;
-mod presence;
-mod projects;
-mod share_dialog;
-mod side_pane;
-mod sidebar;
-mod slash;
-mod snapshot;
-mod startup;
-mod subagents;
-mod subthreads;
-mod terminal_view;
-mod theme;
-mod thread_tree;
-mod tools;
-mod trigger;
-mod turns;
-mod vt;
-mod workspace;
+mod conversation;
+mod review;
+mod settings;
+mod shell;
+mod system;
+mod terminal;
 
 use std::borrow::Cow;
 
 use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
-use workspace::Workspace;
+use app::{devhooks, keymap, theme};
+use shell::workspace::Workspace;
 
 // Icons beyond GPUI Kit's default bundle.
 gpui_kit::assets::icon_assets!(
@@ -125,12 +93,16 @@ fn main() {
     application().with_assets(AppAssets).run(|cx| {
         gpui_kit::init(cx);
         keymap::bind(cx);
-        terminal_view::bind(cx);
+        terminal::view::bind(cx);
         let mut mode = theme::mode_for(cx.window_appearance());
         if let Some(forced) = devhooks::appearance() {
             mode = forced;
         }
         theme::apply(mode, cx);
+        // settings.json: appearance and keybinding overrides.
+        if devhooks::appearance().is_none() {
+            settings::init(cx);
+        }
 
         let bounds = Bounds::centered(None, size(px(1320.), px(840.)), cx);
         let options = WindowOptions {

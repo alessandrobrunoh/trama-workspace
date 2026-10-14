@@ -1,0 +1,52 @@
+name: macOS app
+
+on:
+  push:
+    branches: [feat/new-structure]
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release -p trama-daemon -p trama-desktop
+      - name: Package TramaWorkspace.app
+        run: |
+          set -euo pipefail
+          APP=TramaWorkspace.app
+          VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys;print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="trama-desktop"))')
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release/TramaWorkspace "$APP/Contents/MacOS/"
+          cp target/release/trama-daemon "$APP/Contents/MacOS/"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key><string>TramaWorkspace</string>
+            <key>CFBundleIdentifier</key><string>dev.trama.workspace</string>
+            <key>CFBundleName</key><string>TramaWorkspace</string>
+            <key>CFBundleDisplayName</key><string>TramaWorkspace</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          sed -i '' 's/^          //' "$APP/Contents/Info.plist"
+          plutil -lint "$APP/Contents/Info.plist"
+          codesign --force --deep -s - "$APP"
+          codesign --verify --deep --verbose=2 "$APP"
+          ditto -c -k --keepParent "$APP" TramaWorkspace-macos-arm64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TramaWorkspace-macos-arm64
+          path: TramaWorkspace-macos-arm64.zip
+          if-no-files-found: error

@@ -1,0 +1,41 @@
+# ESEMPIO CONCETTUALE — non è ancora uno schema config.json supportato da Trama.
+# Per implementazione futura: un ServerProfile per share e policy enterprise.
+
+[collaboration]
+default_server_id = "trama-cloud"
+require_e2ee_for_cloud = true
+allow_direct_p2p = false
+allow_public_discovery = false
+allow_public_relay = false
+
+[[collaboration.servers]]
+id = "trama-cloud"
+label = "Trama Cloud"
+url = "https://collab.trama.example" # placeholder, non indirizzo reale
+mode = "hosted"
+require_e2ee = true
+
+[[collaboration.servers]]
+id = "company-production"
+label = "Company Collaboration"
+url = "https://collab.company.example" # placeholder
+mode = "self_hosted"
+require_e2ee = true
+# TLS trust e server identity definiti nel Keychain/config firmato, non qui in chiaro
+
+[collaboration.enterprise_policy]
+managed = false
+allowed_server_ids = ["trama-cloud", "company-production"]
+allowed_git_hosts = ["github.com", "git.company.example"]
+allow_untracked_export = "require_confirmation"
+allow_ignored_export = false
+auto_include_new_repositories = false
+max_snapshot_bytes = 1073741824
+
+[collaboration.share_defaults]
+scope = "thread_only"
+include_working_state = true
+include_future_descendants = false
+
+# La scelta per-share è persistente e non migra automaticamente al variare
+# del server di default. Direct P2P è una fase futura, non supportata ora.

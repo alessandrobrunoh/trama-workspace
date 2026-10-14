@@ -24,6 +24,8 @@
 //! presence are ephemeral frames without a `seq` and are never stored in the
 //! log.
 
+pub mod vnext;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

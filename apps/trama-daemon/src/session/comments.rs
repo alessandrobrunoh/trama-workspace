@@ -9,7 +9,7 @@ use trama_domain::comment::{
     relocate_anchor,
 };
 use trama_domain::ids::{CommentId, RepositoryId};
-use trama_infra::changes;
+use trama_infra::git::changes;
 use trama_protocol::{CommentSnapshot, CommentState};
 
 /// The local person. Matches the actor of user prompts.
@@ -46,14 +46,19 @@ fn local_user() -> Actor {
 }
 
 fn snapshot(record: CommentRecord, located: Located) -> CommentSnapshot {
-    let CommentRecord { comment, delivery } = record;
-    let state = match (comment.resolved_at, delivery) {
-        (Some(resolved_at), delivery) => CommentState::Resolved {
+    let CommentRecord {
+        comment,
+        delivery,
+        detached_at,
+    } = record;
+    let state = match (comment.resolved_at, delivery, detached_at) {
+        (Some(resolved_at), delivery, _) => CommentState::Resolved {
             resolved_at,
             delivery,
         },
-        (None, Some(delivery)) => CommentState::Delivered(delivery),
-        (None, None) => CommentState::Pending,
+        (None, Some(delivery), _) => CommentState::Delivered(delivery),
+        (None, None, Some(detached_at)) => CommentState::Detached { detached_at },
+        (None, None, None) => CommentState::Pending,
     };
     CommentSnapshot {
         id: comment.id,
@@ -157,6 +162,7 @@ impl SessionManager {
                 vec![CommentRecord {
                     comment,
                     delivery: None,
+                    detached_at: None,
                 }],
             )
             .await?
@@ -291,6 +297,74 @@ impl SessionManager {
         Ok((thread_id, ids))
     }
 
+    /// Take the local person's undelivered comments of one comment thread
+    /// (the root of `comment_id` and its replies) off the next send
+    /// (`detach`) or put them back. Nothing is deleted, and comments already
+    /// sent stay on the prompt that carried them. Returns the changed
+    /// snapshots (also broadcast as `CommentUpdated`).
+    pub async fn set_comment_detached(
+        &self,
+        comment_id: &CommentId,
+        detach: bool,
+    ) -> Result<Vec<CommentSnapshot>> {
+        let record = self
+            .db
+            .get_comment(comment_id)
+            .await?
+            .ok_or_else(|| DaemonError::NotFound(format!("comment {comment_id}")))?;
+        let thread_id = record.comment.thread_id.clone();
+        let root_id = record
+            .comment
+            .parent_id
+            .clone()
+            .unwrap_or_else(|| record.comment.id.clone());
+        let records = self.db.list_comments(&thread_id).await?;
+        let ids: Vec<CommentId> = records
+            .iter()
+            .filter(|r| r.comment.id == root_id || r.comment.parent_id.as_ref() == Some(&root_id))
+            .filter(|r| r.comment.author == local_user())
+            .filter(|r| r.delivery.is_none())
+            .filter(|r| r.detached_at.is_some() != detach)
+            .map(|r| r.comment.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let event = EventRecord::new(
+            Aggregate::Thread {
+                id: thread_id.clone(),
+            },
+            local_user(),
+            if detach {
+                DomainEvent::CommentsDetached {
+                    thread_id: thread_id.clone(),
+                    comment_ids: ids.clone(),
+                }
+            } else {
+                DomainEvent::CommentsAttached {
+                    thread_id: thread_id.clone(),
+                    comment_ids: ids.clone(),
+                }
+            },
+            vec![],
+        )?;
+        self.db
+            .set_comments_detached(&ids, detach.then(Utc::now), &event)
+            .await?;
+        let changed: Vec<CommentRecord> = self
+            .db
+            .list_comments(&thread_id)
+            .await?
+            .into_iter()
+            .filter(|r| ids.contains(&r.comment.id))
+            .collect();
+        let snapshots = self.comment_snapshots(&thread_id, changed).await?;
+        for snapshot in &snapshots {
+            self.broadcast(&thread_id, DaemonMessage::CommentUpdated(snapshot.clone()));
+        }
+        Ok(snapshots)
+    }
+
     /// Tell subscribers about comments the collab mirror wrote: created
     /// (`created`) or changed.
     pub(crate) async fn notify_comments(
@@ -352,6 +426,7 @@ impl SessionManager {
         let pending: HashSet<CommentId> = records
             .iter()
             .filter(|record| record.delivery.is_none())
+            .filter(|record| record.detached_at.is_none())
             .filter(|record| !is_remote_author(&record.comment.author))
             .filter(|record| {
                 let root = record
@@ -770,8 +845,8 @@ fn checkout_relative(rel: &Path) -> Result<()> {
 /// The file `rel` inside `root`, refusing paths (or symlinks) that leave it.
 fn checkout_file(root: &Path, rel: &Path) -> Result<PathBuf> {
     checkout_relative(rel)?;
-    let root = std::fs::canonicalize(root)?;
-    let file = std::fs::canonicalize(root.join(rel)).map_err(|error| {
+    let root = dunce::canonicalize(root)?;
+    let file = dunce::canonicalize(root.join(rel)).map_err(|error| {
         DaemonError::Invalid(format!(
             "{} is not in the thread's checkout: {error}",
             rel.display()
@@ -1374,6 +1449,88 @@ mod tests {
         mgr.send_prompt(tid.clone(), "next".into()).await.unwrap();
         wait_turn(&mut rx).await;
         assert_eq!(prompts(&fake).last().unwrap(), "next");
+    }
+
+    #[tokio::test]
+    async fn detached_comments_skip_the_send_and_sent_ones_stay() {
+        let (fixture, db) = fixture().await;
+        let fake = fast_fake();
+        let mgr = manager(&fixture, db, &fake);
+        let thread = mgr
+            .create_thread(fixture.workspace.clone(), "feature".into())
+            .await
+            .unwrap();
+        let tid = thread.id.clone();
+        let (repo, _) = checkout(&mgr, &tid).await;
+        let mut rx = subscribed(&mgr, &tid).await;
+        let kept = mgr
+            .create_comment(
+                tid.clone(),
+                code(&repo, "src/lib.rs", 4, 4),
+                "send me".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let skipped = mgr
+            .create_comment(
+                tid.clone(),
+                code(&repo, "src/lib.rs", 2, 2),
+                "not now".into(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Taking a comment off the send keeps it in the thread.
+        let changed = mgr.set_comment_detached(&skipped.id, true).await.unwrap();
+        assert_eq!(changed.len(), 1);
+        assert!(matches!(changed[0].state, CommentState::Detached { .. }));
+        mgr.send_prompt(tid.clone(), "go".into()).await.unwrap();
+        wait_turn(&mut rx).await;
+        let prompt = prompts(&fake).last().unwrap().clone();
+        assert!(prompt.contains("send me"), "{prompt}");
+        assert!(!prompt.contains("not now"), "{prompt}");
+        let listed = mgr.list_comments(&tid).await.unwrap();
+        assert!(matches!(
+            by_id(&listed, &kept.id).state,
+            CommentState::Delivered(_)
+        ));
+        assert!(matches!(
+            by_id(&listed, &skipped.id).state,
+            CommentState::Detached { .. }
+        ));
+
+        // Detaching a sent comment changes nothing: it stays on its prompt.
+        assert!(
+            mgr.set_comment_detached(&kept.id, true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let listed = mgr.list_comments(&tid).await.unwrap();
+        assert!(matches!(
+            by_id(&listed, &kept.id).state,
+            CommentState::Delivered(_)
+        ));
+
+        // Attached again, it goes out with the next send.
+        let changed = mgr.set_comment_detached(&skipped.id, false).await.unwrap();
+        assert_eq!(changed[0].state, CommentState::Pending);
+        mgr.send_prompt(tid.clone(), "again".into()).await.unwrap();
+        wait_turn(&mut rx).await;
+        let prompt = prompts(&fake).last().unwrap().clone();
+        assert!(
+            prompt.contains("not now") && !prompt.contains("send me"),
+            "{prompt}"
+        );
+        let listed = mgr.list_comments(&tid).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed
+                .iter()
+                .all(|c| matches!(c.state, CommentState::Delivered(_)))
+        );
     }
 
     #[tokio::test]

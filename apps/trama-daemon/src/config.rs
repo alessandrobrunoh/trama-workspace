@@ -9,7 +9,7 @@ use trama_domain::agent::{BillingMode, PermissionMode};
 use trama_domain::event::{Aggregate, DomainEvent, EventRecord};
 use trama_domain::message::Actor;
 use trama_domain::workspace::{Repository, Workspace, WorkspaceMembership, WorkspaceSettings};
-use trama_infra::checkout::CheckoutManager;
+use trama_infra::git::checkout::CheckoutManager;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileConfig {
@@ -27,7 +27,7 @@ pub struct FileConfig {
     /// How thread checkouts are copied: `{"mode": "copy_on_write" | "git",
     /// "exclude": ["relative/path", ...]}` (ADR 0012).
     #[serde(default)]
-    pub checkouts: trama_infra::checkout::CopyOptions,
+    pub checkouts: trama_infra::git::checkout::CopyOptions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -300,8 +300,8 @@ mod tests {
         };
         let paths: Vec<_> = repos.iter().filter_map(|r| r.local_path.clone()).collect();
         // Seeding stores the canonical path, like `add_repository`.
-        let canonical_backend = std::fs::canonicalize(&backend).unwrap();
-        let canonical_frontend = std::fs::canonicalize(&frontend).unwrap();
+        let canonical_backend = dunce::canonicalize(&backend).unwrap();
+        let canonical_frontend = dunce::canonicalize(&frontend).unwrap();
         assert!(paths.contains(&canonical_backend));
         assert!(paths.contains(&canonical_frontend));
         // Inspection-derived metadata is stored, like `add_repository`.
@@ -370,7 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn seeded_workspace_with_no_repos_is_created() {
-        let dir = tempdir().unwrap();
+        let _dir = tempdir().unwrap();
         let db = TramaDb::open_in_memory().unwrap();
         seed_from_config(
             &db,
@@ -445,14 +445,17 @@ mod tests {
         let config: FileConfig = serde_json::from_str(r#"{"workspaces":[]}"#).unwrap();
         assert_eq!(
             config.checkouts.mode,
-            trama_infra::checkout::CopyMode::CopyOnWrite
+            trama_infra::git::checkout::CopyMode::CopyOnWrite
         );
         assert!(config.checkouts.exclude.is_empty());
         let config: FileConfig = serde_json::from_str(
             r#"{"checkouts":{"mode":"git","exclude":["target/debug/incremental",".venv"]}}"#,
         )
         .unwrap();
-        assert_eq!(config.checkouts.mode, trama_infra::checkout::CopyMode::Git);
+        assert_eq!(
+            config.checkouts.mode,
+            trama_infra::git::checkout::CopyMode::Git
+        );
         assert_eq!(
             config.checkouts.exclude,
             vec!["target/debug/incremental".to_owned(), ".venv".to_owned()]

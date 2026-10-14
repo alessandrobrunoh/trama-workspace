@@ -181,9 +181,10 @@ pub(super) fn normalize_model(model: Option<String>) -> Result<Option<String>> {
     if model.is_empty() || model == "default" {
         return Ok(None);
     }
-    let valid = model.len() <= 100
+    // `/` for provider model names such as `openai/gpt-4o` (OpenRouter).
+    let valid = model.len() <= 200
         && model.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '[' | ']' | ':' | '@')
+            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '[' | ']' | ':' | '@' | '/')
         });
     if !valid {
         return Err(DaemonError::Invalid(format!("invalid model id {model:?}")));
@@ -197,6 +198,7 @@ pub(crate) fn model_choices() -> Vec<ModelInfo> {
         .map(|(id, label)| ModelInfo {
             id: (*id).into(),
             label: (*label).into(),
+            provider: None,
         })
         .collect()
 }
@@ -335,7 +337,7 @@ fn confine(checkout: &Path, rel: &str) -> Result<PathBuf> {
             "mentioned path {rel:?} is not inside the thread's checkouts"
         )));
     }
-    let real = std::fs::canonicalize(checkout.join(rel_path))
+    let real = dunce::canonicalize(checkout.join(rel_path))
         .map_err(|_| DaemonError::Invalid(format!("mentioned path {rel:?} does not exist")))?;
     if !real.starts_with(checkout) {
         return Err(DaemonError::Invalid(format!(
@@ -398,7 +400,7 @@ impl SessionManager {
             .into_iter()
             .filter(|row| row.status == CheckoutStatus::Ready)
             .filter_map(|row| {
-                let path = std::fs::canonicalize(row.checkout_path?).ok()?;
+                let path = dunce::canonicalize(row.checkout_path?).ok()?;
                 Some(ReadyCheckout {
                     repository_id: row.repository_id,
                     title: row.title,

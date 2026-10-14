@@ -1,0 +1,222 @@
+{
+  "$comment": "ILLUSTRATIVE EXAMPLE. Signed with a public test-only Ed25519 seed ([7; 32]); never trust this key. OIDs are placeholders. `payload_bytes` is the canonical JSON shown under `decoded`; encryption (MLS) is M4 and not shown. Regenerate with `cargo test -p trama-domain regenerate_share_manifest_example -- --ignored`.",
+  "content_envelope": {
+    "alg": "ed25519",
+    "key_id": "key_alice_demo_1",
+    "payload_bytes": "eyJjaGVja291dHMiOlt7ImJhc2VfY29tbWl0IjoiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsImNoZWNrb3V0X21vZGUiOnsibW9kZSI6Im93bmVkIn0sImZvcmtfcG9pbnQiOm51bGwsImdlbmVyYXRpb24iOjQsImhlYWQiOnsia2luZCI6ImJyYW5jaCIsIm5hbWUiOiJtYWluIn0sImhlYWRfY29tbWl0IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImluZGV4X3RyZWUiOiJhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwib2JqZWN0X2luZGV4X3JlZnMiOlsiY29udGVudF9iYWNrZW5kXzAwMSJdLCJyZXBvX2dpZCI6InJlcG9fYmFja2VuZCIsInRocmVhZF9naWQiOiJ0aHJlYWRfbWFpbiIsIndvcmtpbmdfdHJlZSI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEifSx7ImJhc2VfY29tbWl0IjoiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsImNoZWNrb3V0X21vZGUiOnsibW9kZSI6Im93bmVkIn0sImZvcmtfcG9pbnQiOm51bGwsImdlbmVyYXRpb24iOjQsImhlYWQiOnsia2luZCI6ImJyYW5jaCIsIm5hbWUiOiJtYWluIn0sImhlYWRfY29tbWl0IjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsImluZGV4X3RyZWUiOiJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwib2JqZWN0X2luZGV4X3JlZnMiOlsiY29udGVudF9mcm9udGVuZF8wMDEiXSwicmVwb19naWQiOiJyZXBvX2Zyb250ZW5kIiwidGhyZWFkX2dpZCI6InRocmVhZF9tYWluIiwid29ya2luZ190cmVlIjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiJ9LHsiYmFzZV9jb21taXQiOiIwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwiY2hlY2tvdXRfbW9kZSI6eyJtb2RlIjoib3duZWQifSwiZm9ya19wb2ludCI6ImZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmYiLCJnZW5lcmF0aW9uIjoyLCJoZWFkIjp7ImtpbmQiOiJicmFuY2giLCJuYW1lIjoiZmVhdHVyZS1hdXRoIn0sImhlYWRfY29tbWl0IjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImluZGV4X3RyZWUiOiJjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjIiwib2JqZWN0X2luZGV4X3JlZnMiOlsiY29udGVudF9iYWNrZW5kXzAwMSIsImNvbnRlbnRfYmFja2VuZF8wMDIiXSwicmVwb19naWQiOiJyZXBvX2JhY2tlbmQiLCJ0aHJlYWRfZ2lkIjoidGhyZWFkX2F1dGgiLCJ3b3JraW5nX3RyZWUiOiJjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjIn0seyJiYXNlX2NvbW1pdCI6IjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiLCJjaGVja291dF9tb2RlIjp7Im1vZGUiOiJhbGlhcyIsIm93bmVyIjoidGhyZWFkX2F1dGgifSwiZm9ya19wb2ludCI6ImZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmYiLCJnZW5lcmF0aW9uIjoxLCJoZWFkIjp7ImtpbmQiOiJkZXRhY2hlZCJ9LCJoZWFkX2NvbW1pdCI6ImNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2MiLCJpbmRleF90cmVlIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsIm9iamVjdF9pbmRleF9yZWZzIjpbImNvbnRlbnRfYmFja2VuZF8wMDIiXSwicmVwb19naWQiOiJyZXBvX2JhY2tlbmQiLCJ0aHJlYWRfZ2lkIjoidGhyZWFkX3JldmlldyIsIndvcmtpbmdfdHJlZSI6ImNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2MifV0sImNvbnRlbnRfcG9saWN5Ijp7ImV4Y2x1ZGVkX3BhdGhfY2xhc3NlcyI6WyJzZWNyZXRzIiwiYnVpbGRfY2FjaGUiLCJtYWNoaW5lX2xvY2FsIl0sImlnbm9yZWRfZmlsZXNfZXhwb3J0ZWQiOmZhbHNlLCJtYXhfYnl0ZXMiOjUzNjg3MDkxMiwidW50cmFja2VkIjoicmV2aWV3X3JlcXVpcmVkIn0sImNyZWF0ZWRfYXQiOiIyMDI2LTEwLTEzVDA4OjAwOjAwWiIsImhpc3RvcnlfbWFuaWZlc3RfZGlnZXN0IjoiY2M5OTNkMmUwM2M4ODY5MmRhODNkMTAyMTEwNzU4OTdhOTFiZTY5OGE3YmE3YjgyNjczNGVmNjllOWFiNzU0YSIsIm9iamVjdF9pbmRleCI6W3siYnl0ZV9sZW4iOjEwMjQsImNpcGhlcnRleHRfaGFzaCI6InNoYTI1NjowMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxIiwiY29udGVudF9pZCI6ImNvbnRlbnRfYmFja2VuZF8wMDEiLCJrZXlfZXBvY2giOjMsInBhcnRzIjpbImNodW5rXzAwMSJdfSx7ImJ5dGVfbGVuIjoyMDQ4LCJjaXBoZXJ0ZXh0X2hhc2giOiJzaGEyNTY6MDIwMjAyMDIwMjAyMDIwMjAyMDIwMjAyMDIwMjAyMDIwMjAyMDIwMjAyMDIwMjAyMDIwMjAyMDIwMjAyMDIwMiIsImNvbnRlbnRfaWQiOiJjb250ZW50X2JhY2tlbmRfMDAyIiwia2V5X2Vwb2NoIjozLCJwYXJ0cyI6WyJjaHVua18wMDIiXX0seyJieXRlX2xlbiI6NTEyLCJjaXBoZXJ0ZXh0X2hhc2giOiJzaGEyNTY6MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNCIsImNvbnRlbnRfaWQiOiJjb250ZW50X2Zyb250ZW5kXzAwMSIsImtleV9lcG9jaCI6MywicGFydHMiOlsiY2h1bmtfMDA0Il19XSwicHVibGlzaGVyX2RldmljZV9pZCI6ImRldmljZV9hbGljZV9kZW1vIiwicmVwb3NpdG9yaWVzIjpbeyJhbGlhcyI6ImJhY2tlbmQiLCJnaXRfb2JqZWN0X2Zvcm1hdCI6InNoYTEiLCJsZnNfcG9saWN5IjoiZmV0Y2hfZnJvbV9vcmlnaW5faWZfcmVxdWlyZWQiLCJvcmlnaW5faGludCI6ImdpdEBnaXRodWIuY29tOmFjbWUvcGF5bWVudHMtYmFja2VuZC5naXQiLCJvcmlnaW5faWRlbnRpdHlfaGludCI6ImFjbWUvcGF5bWVudHMtYmFja2VuZCIsInJlcG9fZ2lkIjoicmVwb19iYWNrZW5kIiwicmVxdWlyZXNfZ2l0X2Nsb25lX3Blcm1pc3Npb24iOnRydWUsInN1Ym1vZHVsZV9wb2xpY3kiOiJleHBsaWNpdF9jb25zZW50X3JlcXVpcmVkIn0seyJhbGlhcyI6ImZyb250ZW5kIiwiZ2l0X29iamVjdF9mb3JtYXQiOiJzaGExIiwibGZzX3BvbGljeSI6ImZldGNoX2Zyb21fb3JpZ2luX2lmX3JlcXVpcmVkIiwib3JpZ2luX2hpbnQiOiJnaXRAZ2l0aHViLmNvbTphY21lL3BheW1lbnRzLWZyb250ZW5kLmdpdCIsIm9yaWdpbl9pZGVudGl0eV9oaW50IjoiYWNtZS9wYXltZW50cy1mcm9udGVuZCIsInJlcG9fZ2lkIjoicmVwb19mcm9udGVuZCIsInJlcXVpcmVzX2dpdF9jbG9uZV9wZXJtaXNzaW9uIjp0cnVlLCJzdWJtb2R1bGVfcG9saWN5IjoiZXhwbGljaXRfY29uc2VudF9yZXF1aXJlZCJ9XSwic2NoZW1hX3ZlcnNpb24iOjEsInNoYXJlX2lkIjoic2hhcmVfZGVtb19wYXltZW50c18wMSIsInNuYXBzaG90X3ZlcnNpb24iOjR9",
+    "payload_type": "trama.content_manifest.v1",
+    "signature": "fnXdHpU7o6sxRaSM2QrpksT1gWqDgNCvxkLqSj9lsj+O6FwmZt5Uu9T/ehmykiBBFYh3/s7zPSvjO5ZtmcGMDw=="
+  },
+  "decoded": {
+    "content": {
+      "checkouts": [
+        {
+          "base_commit": "0000000000000000000000000000000000000000",
+          "checkout_mode": {
+            "mode": "owned"
+          },
+          "fork_point": null,
+          "generation": 4,
+          "head": {
+            "kind": "branch",
+            "name": "main"
+          },
+          "head_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "index_tree": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "object_index_refs": [
+            "content_backend_001"
+          ],
+          "repo_gid": "repo_backend",
+          "thread_gid": "thread_main",
+          "working_tree": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "base_commit": "0000000000000000000000000000000000000000",
+          "checkout_mode": {
+            "mode": "owned"
+          },
+          "fork_point": null,
+          "generation": 4,
+          "head": {
+            "kind": "branch",
+            "name": "main"
+          },
+          "head_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "index_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "object_index_refs": [
+            "content_frontend_001"
+          ],
+          "repo_gid": "repo_frontend",
+          "thread_gid": "thread_main",
+          "working_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        {
+          "base_commit": "0000000000000000000000000000000000000000",
+          "checkout_mode": {
+            "mode": "owned"
+          },
+          "fork_point": "ffffffffffffffffffffffffffffffffffffffff",
+          "generation": 2,
+          "head": {
+            "kind": "branch",
+            "name": "feature-auth"
+          },
+          "head_commit": "cccccccccccccccccccccccccccccccccccccccc",
+          "index_tree": "cccccccccccccccccccccccccccccccccccccccc",
+          "object_index_refs": [
+            "content_backend_001",
+            "content_backend_002"
+          ],
+          "repo_gid": "repo_backend",
+          "thread_gid": "thread_auth",
+          "working_tree": "cccccccccccccccccccccccccccccccccccccccc"
+        },
+        {
+          "base_commit": "0000000000000000000000000000000000000000",
+          "checkout_mode": {
+            "mode": "alias",
+            "owner": "thread_auth"
+          },
+          "fork_point": "ffffffffffffffffffffffffffffffffffffffff",
+          "generation": 1,
+          "head": {
+            "kind": "detached"
+          },
+          "head_commit": "cccccccccccccccccccccccccccccccccccccccc",
+          "index_tree": "cccccccccccccccccccccccccccccccccccccccc",
+          "object_index_refs": [
+            "content_backend_002"
+          ],
+          "repo_gid": "repo_backend",
+          "thread_gid": "thread_review",
+          "working_tree": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+      ],
+      "content_policy": {
+        "excluded_path_classes": [
+          "secrets",
+          "build_cache",
+          "machine_local"
+        ],
+        "ignored_files_exported": false,
+        "max_bytes": 536870912,
+        "untracked": "review_required"
+      },
+      "created_at": "2026-10-13T08:00:00Z",
+      "history_manifest_digest": "cc993d2e03c88692da83d10211075897a91be698a7ba7b826734ef69e9ab754a",
+      "object_index": [
+        {
+          "byte_len": 1024,
+          "ciphertext_hash": "sha256:0101010101010101010101010101010101010101010101010101010101010101",
+          "content_id": "content_backend_001",
+          "key_epoch": 3,
+          "parts": [
+            "chunk_001"
+          ]
+        },
+        {
+          "byte_len": 2048,
+          "ciphertext_hash": "sha256:0202020202020202020202020202020202020202020202020202020202020202",
+          "content_id": "content_backend_002",
+          "key_epoch": 3,
+          "parts": [
+            "chunk_002"
+          ]
+        },
+        {
+          "byte_len": 512,
+          "ciphertext_hash": "sha256:0404040404040404040404040404040404040404040404040404040404040404",
+          "content_id": "content_frontend_001",
+          "key_epoch": 3,
+          "parts": [
+            "chunk_004"
+          ]
+        }
+      ],
+      "publisher_device_id": "device_alice_demo",
+      "repositories": [
+        {
+          "alias": "backend",
+          "git_object_format": "sha1",
+          "lfs_policy": "fetch_from_origin_if_required",
+          "origin_hint": "git@github.com:acme/payments-backend.git",
+          "origin_identity_hint": "acme/payments-backend",
+          "repo_gid": "repo_backend",
+          "requires_git_clone_permission": true,
+          "submodule_policy": "explicit_consent_required"
+        },
+        {
+          "alias": "frontend",
+          "git_object_format": "sha1",
+          "lfs_policy": "fetch_from_origin_if_required",
+          "origin_hint": "git@github.com:acme/payments-frontend.git",
+          "origin_identity_hint": "acme/payments-frontend",
+          "repo_gid": "repo_frontend",
+          "requires_git_clone_permission": true,
+          "submodule_policy": "explicit_consent_required"
+        }
+      ],
+      "schema_version": 1,
+      "share_id": "share_demo_payments_01",
+      "snapshot_version": 4
+    },
+    "history": {
+      "created_at": "2026-10-13T08:00:00Z",
+      "history_cursor": "cursor_demo_220",
+      "include_future_descendants": true,
+      "publisher_device_id": "device_alice_demo",
+      "root_thread_gids": [
+        "thread_main"
+      ],
+      "schema_version": 1,
+      "scope": "subtree",
+      "share_id": "share_demo_payments_01",
+      "snapshot_version": 4,
+      "threads": [
+        {
+          "fork_origin": null,
+          "kind": "main",
+          "message_slice": "slice_thread_main",
+          "parent_gid": null,
+          "thread_gid": "thread_main",
+          "title": "Main Thread"
+        },
+        {
+          "fork_origin": {
+            "checkpoint_id": "checkpoint_thread_auth",
+            "parent_thread_gid": "thread_main"
+          },
+          "kind": "child",
+          "message_slice": "slice_thread_auth",
+          "parent_gid": "thread_main",
+          "thread_gid": "thread_auth",
+          "title": "Auth"
+        },
+        {
+          "fork_origin": {
+            "checkpoint_id": "checkpoint_thread_review",
+            "parent_thread_gid": "thread_auth"
+          },
+          "kind": "review",
+          "message_slice": "slice_thread_review",
+          "parent_gid": "thread_auth",
+          "thread_gid": "thread_review",
+          "title": "Auth Review"
+        }
+      ]
+    }
+  },
+  "history_envelope": {
+    "alg": "ed25519",
+    "key_id": "key_alice_demo_1",
+    "payload_bytes": "eyJjcmVhdGVkX2F0IjoiMjAyNi0xMC0xM1QwODowMDowMFoiLCJoaXN0b3J5X2N1cnNvciI6ImN1cnNvcl9kZW1vXzIyMCIsImluY2x1ZGVfZnV0dXJlX2Rlc2NlbmRhbnRzIjp0cnVlLCJwdWJsaXNoZXJfZGV2aWNlX2lkIjoiZGV2aWNlX2FsaWNlX2RlbW8iLCJyb290X3RocmVhZF9naWRzIjpbInRocmVhZF9tYWluIl0sInNjaGVtYV92ZXJzaW9uIjoxLCJzY29wZSI6InN1YnRyZWUiLCJzaGFyZV9pZCI6InNoYXJlX2RlbW9fcGF5bWVudHNfMDEiLCJzbmFwc2hvdF92ZXJzaW9uIjo0LCJ0aHJlYWRzIjpbeyJmb3JrX29yaWdpbiI6bnVsbCwia2luZCI6Im1haW4iLCJtZXNzYWdlX3NsaWNlIjoic2xpY2VfdGhyZWFkX21haW4iLCJwYXJlbnRfZ2lkIjpudWxsLCJ0aHJlYWRfZ2lkIjoidGhyZWFkX21haW4iLCJ0aXRsZSI6Ik1haW4gVGhyZWFkIn0seyJmb3JrX29yaWdpbiI6eyJjaGVja3BvaW50X2lkIjoiY2hlY2twb2ludF90aHJlYWRfYXV0aCIsInBhcmVudF90aHJlYWRfZ2lkIjoidGhyZWFkX21haW4ifSwia2luZCI6ImNoaWxkIiwibWVzc2FnZV9zbGljZSI6InNsaWNlX3RocmVhZF9hdXRoIiwicGFyZW50X2dpZCI6InRocmVhZF9tYWluIiwidGhyZWFkX2dpZCI6InRocmVhZF9hdXRoIiwidGl0bGUiOiJBdXRoIn0seyJmb3JrX29yaWdpbiI6eyJjaGVja3BvaW50X2lkIjoiY2hlY2twb2ludF90aHJlYWRfcmV2aWV3IiwicGFyZW50X3RocmVhZF9naWQiOiJ0aHJlYWRfYXV0aCJ9LCJraW5kIjoicmV2aWV3IiwibWVzc2FnZV9zbGljZSI6InNsaWNlX3RocmVhZF9yZXZpZXciLCJwYXJlbnRfZ2lkIjoidGhyZWFkX2F1dGgiLCJ0aHJlYWRfZ2lkIjoidGhyZWFkX3JldmlldyIsInRpdGxlIjoiQXV0aCBSZXZpZXcifV19",
+    "payload_type": "trama.history_manifest.v1",
+    "signature": "bDDQ0szKG+8MpeME9KihB0b9ZZON9QgmNIwKeXTo8sapeL3PrsPcIeQFt0/PUYExnup3ibPgZ1kCzNIwj335Bw=="
+  },
+  "signing_key": {
+    "alg": "ed25519",
+    "device_id": "device_alice_demo",
+    "key_id": "key_alice_demo_1",
+    "public_key": "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw="
+  }
+}
