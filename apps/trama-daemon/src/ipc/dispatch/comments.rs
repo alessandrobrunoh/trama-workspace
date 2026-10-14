@@ -66,6 +66,19 @@ pub(super) async fn handle(msg: ClientMessage, ctx: &mut Ctx<'_>) -> Result<Conn
                 let _ = out_tx.send(DaemonMessage::CommentUpdated(snapshot));
             }
         }
+        // Detaching is local: the comment stays for everyone, it just does
+        // not go out with this person's next send.
+        ClientMessage::DetachComment { comment_id: ref id }
+        | ClientMessage::AttachComment { comment_id: ref id } => {
+            let detach = matches!(msg, ClientMessage::DetachComment { .. });
+            let comment_id = id.clone();
+            let snapshots = sessions.set_comment_detached(&comment_id, detach).await?;
+            for snapshot in snapshots {
+                if !subscriptions.contains_key(&snapshot.thread_id) {
+                    let _ = out_tx.send(DaemonMessage::CommentUpdated(snapshot));
+                }
+            }
+        }
         ClientMessage::DeleteComment { comment_id } => {
             let (thread_id, comment_ids) = sessions.delete_comment(&comment_id).await?;
             collab.publish_delete(thread_id.clone(), comment_ids.clone());

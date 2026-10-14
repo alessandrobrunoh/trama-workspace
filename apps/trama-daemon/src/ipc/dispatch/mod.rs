@@ -68,6 +68,8 @@ fn family(msg: &ClientMessage) -> Family {
         | ClientMessage::ListComments { .. }
         | ClientMessage::ResolveComment { .. }
         | ClientMessage::ReopenComment { .. }
+        | ClientMessage::DetachComment { .. }
+        | ClientMessage::AttachComment { .. }
         | ClientMessage::DeleteComment { .. } => Family::Comments,
         ClientMessage::OpenTerminal { .. }
         | ClientMessage::TerminalInput { .. }

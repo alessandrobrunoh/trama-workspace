@@ -181,8 +181,11 @@ pub(super) fn plain_kind() -> SubthreadKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommentState {
-    /// Not yet sent to the agent.
+    /// Not yet sent to the agent; goes out with the next send.
     Pending,
+    /// Not yet sent, and taken off the next send by its author. Stays in
+    /// the thread until it is attached again or deleted.
+    Detached { detached_at: DateTime<Utc> },
     /// Sent with the user prompt `message_id` (turn `turn`);
     /// `answer_message_id` is set once that turn's reply is stored.
     Delivered(CommentDelivery),

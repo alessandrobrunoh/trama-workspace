@@ -142,6 +142,16 @@ pub enum ClientMessage {
     ReopenComment {
         comment_id: CommentId,
     },
+    /// Take one of your own pending comments (with its pending replies) off
+    /// the next send without deleting it. Answered with `CommentUpdated`.
+    DetachComment {
+        comment_id: CommentId,
+    },
+    /// Put a detached comment (with its detached replies) back on the next
+    /// send. Answered with `CommentUpdated`.
+    AttachComment {
+        comment_id: CommentId,
+    },
     /// Delete one of your own pending comments (with its pending replies).
     /// Answered with `CommentDeleted`.
     DeleteComment {

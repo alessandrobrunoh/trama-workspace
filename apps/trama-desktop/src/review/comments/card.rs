@@ -61,6 +61,7 @@ pub(super) fn badge(badge: AnchorBadge, p: &Palette) -> impl IntoElement {
 pub(super) fn phase_color(phase: &Phase, p: &Palette) -> Hsla {
     match phase {
         Phase::Pending => p.accent,
+        Phase::Detached => p.text_muted,
         Phase::Delivered(_) => p.success,
         Phase::Resolved(_) => p.text_faint,
     }
@@ -69,6 +70,7 @@ pub(super) fn phase_color(phase: &Phase, p: &Palette) -> Hsla {
 pub(super) fn phase_summary(group: &CommentGroup) -> String {
     match group.phase() {
         Phase::Pending => "Sent with your next message".into(),
+        Phase::Detached => "Not in your next message".into(),
         Phase::Delivered(delivery) if delivery.answer_message_id.is_some() => {
             format!("Answered in turn {}", delivery.turn)
         }
@@ -162,6 +164,18 @@ pub fn render_card(
                     store.update(cx, |store, cx| store.delete(comment_id.clone(), cx));
                 })
         });
+        let attach = matches!(comment.state, CommentState::Detached { .. }).then(|| {
+            let store = handlers.store.clone();
+            let comment_id = comment.id.clone();
+            Button::new(SharedString::from(format!("{id}-attach-{}", comment.id)))
+                .ghost()
+                .xsmall()
+                .icon(IconName::ArrowUp)
+                .tooltip("Send with your next message")
+                .on_click(move |_, _, cx| {
+                    store.update(cx, |store, cx| store.attach(comment_id.clone(), cx));
+                })
+        });
         v_flex()
             .w_full()
             .gap(theme::sp(0.5))
@@ -193,7 +207,12 @@ pub fn render_card(
                                 .child("Pending"),
                         )
                     })
+                    .when(
+                        matches!(comment.state, CommentState::Detached { .. }),
+                        |this| this.child(div().text_color(p.text_faint).child("Not sent")),
+                    )
                     .child(div().flex_1())
+                    .children(attach)
                     .children(delete),
             )
             .child(
@@ -344,6 +363,7 @@ pub fn passage_color(phase: &Phase, p: &Palette) -> Option<Hsla> {
     match phase {
         Phase::Pending => Some(mark_color(p).opacity(0.22)),
         Phase::Delivered(_) => Some(mark_color(p).opacity(0.12)),
+        Phase::Detached => Some(mark_color(p).opacity(0.08)),
         Phase::Resolved(_) => None,
     }
 }
@@ -398,6 +418,7 @@ pub fn render_inline(
     let bar = match phase {
         Phase::Pending => mark_color(p),
         Phase::Delivered(_) => mark_color(p).opacity(0.55),
+        Phase::Detached => p.border_strong,
         Phase::Resolved(_) => p.border_strong,
     };
     let hover_group: SharedString = format!("{id}-card").into();
@@ -459,8 +480,21 @@ pub fn render_inline(
                 store.update(cx, |store, cx| store.delete(comment_id.clone(), cx));
             })
         });
+        let attach = matches!(comment.state, CommentState::Detached { .. }).then(|| {
+            let store = handlers.store.clone();
+            let comment_id = comment.id.clone();
+            action(
+                &format!("attach-{index}"),
+                IconName::ArrowUp,
+                "Send with your next message",
+            )
+            .on_click(move |_, _, cx| {
+                store.update(cx, |store, cx| store.attach(comment_id.clone(), cx));
+            })
+        });
         let state = match &comment.state {
             CommentState::Pending => Some(("Pending", p.text_muted)),
+            CommentState::Detached { .. } => Some(("Not sent", p.text_faint)),
             _ => None,
         };
         h_flex()
@@ -489,6 +523,7 @@ pub fn render_inline(
                     .text_color(color)
                     .child(label)
             }))
+            .children(attach)
             .children(delete)
     };
     let answer = answer.map(|(message_id, excerpt)| {
@@ -516,6 +551,7 @@ pub fn render_inline(
             delivery.turn
         )),
         Phase::Resolved(_) => Some("Resolved".to_string()),
+        Phase::Detached => Some("Not in your next message".to_string()),
         _ => None,
     };
     h_flex()

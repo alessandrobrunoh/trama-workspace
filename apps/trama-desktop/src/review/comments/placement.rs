@@ -242,7 +242,11 @@ pub fn author_label(actor: &Actor) -> &'static str {
 
 /// Only your own pending comments can be deleted.
 pub fn can_delete(comment: &CommentSnapshot) -> bool {
-    matches!(comment.author, Actor::Human { .. }) && comment.state == CommentState::Pending
+    matches!(comment.author, Actor::Human { .. })
+        && matches!(
+            comment.state,
+            CommentState::Pending | CommentState::Detached { .. }
+        )
 }
 
 /// "just now", "5m ago", "3h ago", "2d ago", "4w ago".

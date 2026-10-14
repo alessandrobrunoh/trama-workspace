@@ -563,3 +563,28 @@ fn labels_are_short_and_human() {
     sent.state = serde_json::from_value(delivered(1, None)).unwrap();
     assert!(!can_delete(&sent));
 }
+
+#[test]
+fn detached_comments_leave_the_tray_but_stay_and_sent_copies_survive() {
+    let detached = json!({"kind": "detached", "detached_at": TIME});
+    let comments = vec![
+        snap("sent", None, on_message("m1", 0, 4), delivered(1, None)),
+        snap("later", None, on_code("src/a.rs", 1, 1), detached.clone()),
+        snap("next", None, on_code("src/b.rs", 1, 1), pending()),
+        // A reply taken off the send under a sent comment.
+        snap("r", Some("sent"), on_message("m1", 0, 4), detached),
+    ];
+    let groups = group_comments(&comments);
+    assert_eq!(groups.len(), 3);
+    assert!(matches!(groups[0].phase(), Phase::Delivered(_)));
+    assert_eq!(groups[1].phase(), Phase::Detached);
+    assert_eq!(groups[2].phase(), Phase::Pending);
+    assert_eq!(pending_total(&groups), 1, "only the next send counts");
+    assert!(can_delete(&groups[1].root));
+    assert!(!can_delete(&groups[0].root));
+
+    let sent = delivered_with(&groups, &MessageId::from("u1"));
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].id, CommentId::from("sent"));
+    assert!(delivered_with(&groups, &MessageId::from("u2")).is_empty());
+}

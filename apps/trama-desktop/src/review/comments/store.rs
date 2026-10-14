@@ -95,6 +95,17 @@ impl CommentStore {
         self.send(ClientMessage::ReopenComment { comment_id }, cx);
     }
 
+    /// Take a pending comment (and its pending replies) off the next send.
+    /// It stays in the thread; nothing is deleted.
+    pub fn detach(&mut self, comment_id: CommentId, cx: &mut Context<Self>) {
+        self.send(ClientMessage::DetachComment { comment_id }, cx);
+    }
+
+    /// Put a detached comment back on the next send.
+    pub fn attach(&mut self, comment_id: CommentId, cx: &mut Context<Self>) {
+        self.send(ClientMessage::AttachComment { comment_id }, cx);
+    }
+
     pub fn delete(&mut self, comment_id: CommentId, cx: &mut Context<Self>) {
         self.send(ClientMessage::DeleteComment { comment_id }, cx);
     }
@@ -171,6 +182,9 @@ pub struct CommentGroup {
 pub enum Phase {
     /// Something in it waits for the next prompt.
     Pending,
+    /// Nothing waits for the next prompt and nothing was sent: the author
+    /// took it off the send. It stays in the thread.
+    Detached,
     /// Everything was sent; the latest delivery.
     Delivered(CommentDelivery),
     /// A person resolved the root; the latest delivery, if any.
@@ -204,7 +218,7 @@ impl CommentGroup {
             .filter_map(|c| match &c.state {
                 CommentState::Delivered(delivery) => Some(delivery.clone()),
                 CommentState::Resolved { delivery, .. } => delivery.clone(),
-                CommentState::Pending => None,
+                CommentState::Pending | CommentState::Detached { .. } => None,
             })
             .max_by_key(|delivery| delivery.turn)
     }
@@ -216,8 +230,13 @@ impl CommentGroup {
         if self.pending_count() > 0 {
             return Phase::Pending;
         }
+        let detached = self
+            .all()
+            .any(|c| matches!(c.state, CommentState::Detached { .. }));
         match self.latest_delivery() {
+            // A reply taken off the send does not hide what was sent.
             Some(delivery) => Phase::Delivered(delivery),
+            None if detached => Phase::Detached,
             None => Phase::Pending,
         }
     }
@@ -261,6 +280,27 @@ pub fn group_comments(comments: &[CommentSnapshot]) -> Vec<CommentGroup> {
         }
     }
     groups
+}
+
+/// Comments delivered with the user prompt `message_id`, oldest first:
+/// the copy shown on a sent message. Detaching or clearing pending comments
+/// never touches these.
+pub fn delivered_with<'a>(
+    groups: &'a [CommentGroup],
+    message_id: &MessageId,
+) -> Vec<&'a CommentSnapshot> {
+    groups
+        .iter()
+        .flat_map(CommentGroup::all)
+        .filter(|c| match &c.state {
+            CommentState::Delivered(delivery) => &delivery.message_id == message_id,
+            CommentState::Resolved {
+                delivery: Some(delivery),
+                ..
+            } => &delivery.message_id == message_id,
+            _ => false,
+        })
+        .collect()
 }
 
 /// Pending comments across all threads (roots and replies).

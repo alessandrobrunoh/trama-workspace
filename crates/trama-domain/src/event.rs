@@ -156,6 +156,17 @@ pub enum DomainEvent {
         thread_id: ThreadId,
         comment_id: CommentId,
     },
+    /// Pending comments taken off the next send by their author. They stay
+    /// in the thread and are skipped by delivery until attached again.
+    CommentsDetached {
+        thread_id: ThreadId,
+        comment_ids: Vec<CommentId>,
+    },
+    /// Detached comments put back on the next send.
+    CommentsAttached {
+        thread_id: ThreadId,
+        comment_ids: Vec<CommentId>,
+    },
     /// Pending comments removed by their author (a root with its replies).
     CommentsDeleted {
         thread_id: ThreadId,
@@ -255,6 +266,8 @@ impl DomainEvent {
             Self::CommentDeliveryFailed { .. } => "comment.delivery_failed",
             Self::CommentResolved { .. } => "comment.resolved",
             Self::CommentReopened { .. } => "comment.reopened",
+            Self::CommentsDetached { .. } => "comment.detached",
+            Self::CommentsAttached { .. } => "comment.attached",
             Self::CommentsDeleted { .. } => "comment.deleted",
             Self::CheckpointCreated { .. } => "checkpoint.created",
             Self::SubthreadForked { .. } => "subthread.forked",

@@ -16,11 +16,13 @@ use trama_domain::message::Message;
 pub struct CommentRecord {
     pub comment: Comment,
     pub delivery: Option<CommentDelivery>,
+    /// Set while a pending comment is taken off the next send.
+    pub detached_at: Option<DateTime<Utc>>,
 }
 
 const COLUMNS: &str = "id, thread_id, parent_comment_id, author_json, target_json, body, excerpt,
      created_at, resolved_at, delivered_message_id, delivered_turn, delivered_at,
-     answer_message_id";
+     answer_message_id, detached_at";
 
 fn record_from_row(row: &Row<'_>) -> Result<CommentRecord> {
     let get_text = |idx: usize| row.get::<_, String>(idx).map_err(sql_err);
@@ -52,6 +54,7 @@ fn record_from_row(row: &Row<'_>) -> Result<CommentRecord> {
             resolved_at: get_opt(8)?.map(|raw| parse_rfc3339(&raw)).transpose()?,
         },
         delivery,
+        detached_at: get_opt(13)?.map(|raw| parse_rfc3339(&raw)).transpose()?,
     })
 }
 
@@ -168,6 +171,34 @@ impl TramaDb {
         .await
     }
 
+    /// Take pending comments off the next send (`Some`) or put them back
+    /// (`None`). Delivered comments are left unchanged: their copy on the
+    /// prompt that carried them is history.
+    pub async fn set_comments_detached(
+        &self,
+        ids: &[CommentId],
+        detached_at: Option<DateTime<Utc>>,
+        event: &EventRecord,
+    ) -> Result<()> {
+        let ids: Vec<String> = ids.iter().map(ToString::to_string).collect();
+        let event = event.clone();
+        self.blocking_mut(move |conn| {
+            let tx = conn.transaction().map_err(sql_err)?;
+            for id in &ids {
+                tx.execute(
+                    "UPDATE thread_comments SET detached_at = ?2
+                     WHERE id = ?1 AND delivered_message_id IS NULL",
+                    params![id, detached_at.map(rfc3339)],
+                )
+                .map_err(sql_err)?;
+            }
+            insert_event(&tx, &event)?;
+            tx.commit().map_err(sql_err)?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Number of user prompts stored on `thread_id` (its own messages only).
     pub async fn count_user_prompts(&self, thread_id: &ThreadId) -> Result<u32> {
         let thread_id = thread_id.to_string();
@@ -205,7 +236,7 @@ impl TramaDb {
                     "UPDATE thread_comments
                      SET delivered_message_id = ?2, delivered_turn = ?3, delivered_at = ?4,
                          answer_message_id = NULL
-                     WHERE id = ?1 AND delivered_message_id IS NULL",
+                     WHERE id = ?1 AND delivered_message_id IS NULL AND detached_at IS NULL",
                     params![
                         id,
                         message.id.to_string(),
@@ -424,6 +455,35 @@ mod tests {
         .await
         .unwrap();
 
+        let skipped = comment(&tid, None, "later");
+        db.create_comment(
+            &skipped,
+            &event(
+                &tid,
+                DomainEvent::CommentCreated {
+                    comment: skipped.clone(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let detach = |ids: Vec<CommentId>| {
+            event(
+                &tid,
+                DomainEvent::CommentsDetached {
+                    thread_id: tid.clone(),
+                    comment_ids: ids,
+                },
+            )
+        };
+        db.set_comments_detached(
+            std::slice::from_ref(&skipped.id),
+            Some(Utc::now()),
+            &detach(vec![skipped.id.clone()]),
+        )
+        .await
+        .unwrap();
+
         let prompt = Message::new_user(tid.clone(), "user", "go");
         let ids = vec![root.id.clone(), reply.id.clone()];
         assert_eq!(db.count_user_prompts(&tid).await.unwrap(), 0);
@@ -445,6 +505,22 @@ mod tests {
         .unwrap();
         assert_eq!(db.count_user_prompts(&tid).await.unwrap(), 1);
         assert_eq!(db.comments_delivered_with(&prompt.id).await.unwrap(), ids);
+        // Delivered comments cannot be detached.
+        db.set_comments_detached(
+            std::slice::from_ref(&root.id),
+            Some(Utc::now()),
+            &detach(vec![root.id.clone()]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.get_comment(&root.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .detached_at
+                .is_none()
+        );
         let answer = MessageId::from("answer");
         db.record_comment_answer(
             &prompt.id,
@@ -479,8 +555,10 @@ mod tests {
 
         let db = TramaDb::open(&path).unwrap();
         let listed = db.list_comments(&tid).await.unwrap();
-        assert_eq!(listed.len(), 2);
+        assert_eq!(listed.len(), 3);
         assert_eq!(listed[0].comment.id, root.id);
+        assert!(listed[2].detached_at.is_some());
+        assert!(listed[2].delivery.is_none());
         assert_eq!(listed[0].comment.excerpt, root.excerpt);
         assert!(listed[0].comment.resolved_at.is_some());
         assert_eq!(listed[1].comment.parent_id.as_ref(), Some(&root.id));
@@ -529,7 +607,10 @@ mod tests {
                 "comment.created",
                 "comment.created",
                 "comment.deleted",
+                "comment.created",
+                "comment.detached",
                 "comment.delivered",
+                "comment.detached",
                 "comment.answered",
                 "comment.resolved",
                 "comment.delivery_failed"

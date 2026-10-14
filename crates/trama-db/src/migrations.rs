@@ -21,6 +21,7 @@ pub(crate) fn migrations() -> Migrations<'static> {
         M::up(include_str!("../migrations/0014_share_e2ee.sql")),
         M::up(include_str!("../migrations/0015_share_message_state.sql")),
         M::up(include_str!("../migrations/0016_share_warnings.sql")),
+        M::up(include_str!("../migrations/0017_comment_detach.sql")),
     ])
 }
 

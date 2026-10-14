@@ -779,6 +779,7 @@ impl ChatPanel {
                         ),
                 ),
             )
+            .children(self.sent_comment_rows(message_id, p, cx))
             .when(open, |this| {
                 this.child(
                     div()
@@ -797,6 +798,69 @@ impl ChatPanel {
                 )
             })
             .into_any_element()
+    }
+
+    /// The comments that went out with this prompt, from the store: the
+    /// copy that stays on the sent message whatever happens to the pending
+    /// tray afterwards.
+    fn sent_comment_rows(
+        &self,
+        message_id: &MessageId,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let groups = self.comments.read(cx).groups();
+        let sent = comments::delivered_with(&groups, message_id);
+        if sent.is_empty() {
+            return None;
+        }
+        Some(
+            v_flex()
+                .w_full()
+                .gap(theme::sp(1.))
+                .children(sent.into_iter().map(|comment| {
+                    let reveal = match &comment.target {
+                        CommentTarget::MessageRange { message_id, .. } => Some(message_id.clone()),
+                        _ => None,
+                    };
+                    h_flex()
+                        .id(SharedString::from(format!(
+                            "sent-comment-{message_id}-{}",
+                            comment.id
+                        )))
+                        .w_full()
+                        .gap(theme::sp(1.5))
+                        .items_start()
+                        .text_size(theme::text_xs())
+                        .text_color(p.text_muted)
+                        .when_some(reveal, |this, target| {
+                            this.cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.reveal_message(target.clone(), cx);
+                                }))
+                        })
+                        .child(
+                            Icon::new(if comment.parent_comment_id.is_some() {
+                                IconName::Undo2
+                            } else {
+                                IconName::MessageSquare
+                            })
+                            .with_size(px(11.))
+                            .text_color(p.text_faint),
+                        )
+                        .child(div().flex_shrink_0().text_color(p.text_faint).child(
+                            comments::one_line(&comments::target_label(&comment.target), 40),
+                        ))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(p.text)
+                                .child(comment.body.clone()),
+                        )
+                }))
+                .into_any_element(),
+        )
     }
 
     /// Pending comments above the composer, with "Send comments only".
@@ -833,14 +897,21 @@ impl ChatPanel {
                 tip = format!("{tip}\n{}", comments::one_line(excerpt, 120));
             }
             let tooltip: SharedString = tip.into();
-            let delete = comments::can_delete(root).then(|| {
+            // Removing a chip only takes the comment off the next send: it
+            // stays in the chat (and in shared threads), and can be sent
+            // later or deleted from its card.
+            let detach = matches!(root.author, trama_protocol::Actor::Human { .. }).then(|| {
                 let store = store.clone();
                 let comment_id = root.id.clone();
                 div()
                     .id(SharedString::from(format!(
-                        "pending-chip-delete-{}",
+                        "pending-chip-detach-{}",
                         root.id
                     )))
+                    .tooltip(|window, cx| {
+                        Tooltip::new("Don't send with the next message (the comment stays)")
+                            .build(window, cx)
+                    })
                     .size(px(16.))
                     .flex()
                     .items_center()
@@ -850,7 +921,7 @@ impl ChatPanel {
                     .hover(|style| style.bg(p.hover))
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
-                        store.update(cx, |store, cx| store.delete(comment_id.clone(), cx));
+                        store.update(cx, |store, cx| store.detach(comment_id.clone(), cx));
                     })
                     .child(
                         Icon::new(IconName::Close)
@@ -900,7 +971,7 @@ impl ChatPanel {
                         )
                     },
                 )
-                .children(delete)
+                .children(detach)
         };
         Some(
             v_flex()
