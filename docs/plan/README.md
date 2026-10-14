@@ -41,7 +41,7 @@ Requisito trasversale aggiunto: l'app deve essere **cross-platform**
 | M2 | Full-workspace builds on Linux/Windows/macOS; `trama-ipc` (Unix sockets / Windows named pipes); ConPTY terminals on Windows; per-OS data dir; `dunce` paths; CI on 3 OSes | done |
 | Restructure | Codebase grouped into area modules, large files split, transitional re-exports removed ([restructure.md](restructure.md)) | done |
 | M3 | Repository DB `trama-db::share`, manifest firmato (`SignedEnvelope`), protocollo vNext/discovery | fatto |
-| M4 | Trasporto, E2EE MLS/openmls (dopo security review), wizard Share/Join | in corso: trasporto `/v3`, MLS, Share/Join, history (anche pre-share), revoca, retry durevole, binding chiavi di firma, oggetti cifrati, contenuto dei checkout con restore come checkout gestito del thread, stato/warning degli share (protocollo 18) fatti; mancano security review, rotazione key package, formato link/invito vNext |
+| M4 | Trasporto, E2EE MLS/openmls (dopo security review), wizard Share/Join | in corso: trasporto `/v3`, MLS, Share/Join, history (anche pre-share), revoca, retry durevole, binding chiavi di firma, oggetti cifrati, contenuto dei checkout con restore come checkout gestito del thread, stato/warning degli share (protocollo 18), aggiornamenti dei checkout su richiesta (protocollo 19) fatti; mancano security review, rotazione key package, formato link/invito vNext |
 
 ## Decisioni M3 (DB share e manifest firmati)
 
@@ -114,3 +114,11 @@ Scelte conservative prese dove la spec lascia aperto:
 - **Cache del content manifest**: come per la history, il content manifest decifrato è sigillato a riposo (`content:<share>`, per versione): un messaggio MLS si decifra una sola volta e senza cache il retry fallirebbe.
 - **Stato share** (protocollo 18): `GetShareStatus{share_id}` → `ShareStatusReport{restore: not_requested|no_content|restored|failed, restore_error, checkouts, warnings}`. Lo stato del restore è in `share_restore:<share>`; i warning in `share_warnings` (migrazione 0016, ultimi 50, più recenti prima). Oggi l'unico warning è `content_skipped`.
 - **RetryShareRestore**: solo per un joiner con `read_code` (l'owner riceve `invalid`); riverifica l'ultimo snapshot, ripristina e allega ciò che manca e risponde con `ShareStatusReport`. Nessun retry automatico.
+
+## Decisioni M4k (sorgenti condivise, aggiornamenti su richiesta)
+
+- **Una sorgente per repository**: lo staging è per `(share, repo_gid)` (nome breve: 16 hex di SHA-256, per il limite di 260 caratteri di Windows) e non più per generazione. Prima di crearne uno si riusa un repository registrato con lo stesso `canonical_remote` (= `origin_hint`) il cui `local_path` è una sorgente di share sotto `<app dir>/share-checkouts/`. Non si riusa mai un clone dell'utente: la sorgente viene resettata e spostata a ogni restore. Senza origin la sorgente si ritrova per percorso, quindi un retry non crea doppioni.
+- **Cartella cancellata**: se il checkout allegato non esiste più, viene rimaterializzato nello stesso posto (stesso checkout id, nessun nuovo allegato). La materializzazione è idempotente: un checkout esistente già nello stato atteso viene restituito, uno in un altro stato rifiutato.
+- **Aggiornamenti** (protocollo 19): un nuovo snapshot non viene mai applicato da solo. `GetShareStatus` riporta `update_available = Some(versione)` quando la versione sul server è più recente del restore e almeno un checkout allegato ha HEAD, index o working tree diversi (verifica best effort, timeout 10 s, nessun download dei bundle). `ApplyShareUpdate` rifiuta (`invalid`, nulla viene toccato) se un checkout è cambiato localmente dal restore: HEAD, `write-tree` e albero completo del working state vengono confrontati con quelli registrati. Altrimenti porta la sorgente al nuovo stato e ripristina il checkout sul posto. I checkout di thread non ancora mappati vengono saltati.
+- **Desktop**: banner «Update available: the shared code changed.» con «Apply» (una richiesta alla volta); un rifiuto appare inline («not applied: …») e il toast `Error` collegato viene soppresso.
+- **CI**: confronti di percorso canonici (`dunce`) nei test (macOS `/private/var`).
