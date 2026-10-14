@@ -458,6 +458,8 @@ pub struct ThreadCollab {
     pub unshared: HashSet<MessageId>,
     /// vNext: why the share ended (closed or revoked), if it did.
     pub ended: Option<String>,
+    /// vNext: writer lease of the thread ("Take lease").
+    pub lease: vnext::LeaseView,
 }
 
 pub struct CollabStore {
@@ -604,6 +606,7 @@ impl CollabStore {
             remote_turns: self.remote_turns.get(thread).cloned().unwrap_or_default(),
             unshared: self.vnext.history.unshared(thread),
             ended: self.vnext.history.ended(thread),
+            lease: self.lease_view(thread),
         }
     }
 

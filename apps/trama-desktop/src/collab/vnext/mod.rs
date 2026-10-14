@@ -15,6 +15,8 @@ use super::wizard::route::{Correlation, WizardOp, route};
 mod history;
 use super::wizard::share_flow::ShareFlow;
 pub use history::ShareHistory;
+mod lease;
+pub use lease::{LeaseView, Leases};
 
 /// How long Share/Join waits for the server check before using v2.
 pub const SERVER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -59,6 +61,8 @@ pub struct VNextState {
     corr: Correlation,
     /// Per-thread share state shown in the transcript.
     pub history: ShareHistory,
+    /// Thread shares and writer-lease requests.
+    pub leases: Leases,
 }
 
 impl VNextState {
@@ -177,6 +181,22 @@ impl VNextState {
                 return (true, Vec::new());
             }
             DaemonMessage::Shares(list) => self.history.apply_shares(list),
+            DaemonMessage::ThreadShare { thread_id, share } => {
+                self.leases.apply_thread_share(thread_id, share.clone());
+                return (true, Vec::new());
+            }
+            DaemonMessage::ShareFailed {
+                operation,
+                share_id,
+                correlation_id,
+                message,
+                ..
+            } if operation == "acquire_share_lease" => {
+                if self.leases.fail(share_id.as_deref(), message.clone()) {
+                    self.corr.swallow_error(correlation_id);
+                    return (true, Vec::new());
+                }
+            }
             _ => {}
         }
         let r = route(
@@ -266,12 +286,31 @@ impl CollabStore {
         cx.notify();
     }
 
+    /// "Take lease" on a thread whose turns were not shared.
+    pub fn take_lease(&mut self, thread: &ThreadId, cx: &mut Context<Self>) {
+        if let Some(message) = self.vnext.leases.take(thread)
+            && !self.send(message)
+        {
+            self.vnext
+                .leases
+                .fail(None, "The daemon is not connected.".into());
+        }
+        cx.notify();
+    }
+
+    pub fn lease_view(&self, thread: &ThreadId) -> LeaseView {
+        self.vnext.leases.view(thread, self.username())
+    }
+
     /// Per-message share state of the selected thread (vNext servers).
     pub(super) fn request_history(&mut self, cx: &mut Context<Self>) {
         if !self.vnext.supported() {
             return;
         }
         if let Some(thread_id) = self.selected.clone() {
+            self.send(ClientMessage::GetThreadShare {
+                thread_id: thread_id.clone(),
+            });
             self.send(ClientMessage::GetShareHistoryStatus { thread_id });
             cx.notify();
         }
@@ -289,6 +328,14 @@ impl CollabStore {
                 self.arm_check_timeout(cx);
             }
             return false;
+        }
+        if let DaemonMessage::ShareLease(lease) = message
+            && let Some(thread_id) = self.vnext.leases.apply_lease(lease)
+        {
+            // Refresh the per-message state of that thread; not consumed:
+            // other lease users may also want the reply.
+            self.send(ClientMessage::GetShareHistoryStatus { thread_id });
+            cx.notify();
         }
         let was_checking = self.vnext.support() == ServerSupport::Checking;
         let (handled, follow_ups) = self.vnext.apply(message);

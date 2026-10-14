@@ -496,20 +496,33 @@ pub fn ended_banner(p: &Palette, why: &str) -> AnyElement {
 }
 
 /// Under a message written without the writer lease: it never reached
-/// the share.
-pub fn unshared_badge(p: &Palette) -> AnyElement {
+/// the share. `action` is the "Take lease" button, when offered.
+pub fn unshared_badge(
+    p: &Palette,
+    lease: &crate::collab::vnext::LeaseView,
+    action: Option<AnyElement>,
+) -> AnyElement {
+    let status = if lease.taking {
+        Some("Taking the lease…".to_owned())
+    } else if let Some(error) = &lease.error {
+        Some(format!("Could not take the lease: {error}"))
+    } else {
+        lease.holder.as_ref().map(|h| format!("Lease held by {h}"))
+    };
     h_flex()
-        .gap(theme::sp(1.))
+        .gap(theme::sp(1.5))
         .items_center()
         .pl(theme::sp(3.))
         .text_size(theme::text_xs())
         .text_color(p.warning)
         .child(Icon::new(IconName::TriangleAlert).with_size(px(11.)))
         .child(UNSHARED_LABEL)
+        .children(status.map(|s| div().text_color(p.text_muted).child(s)))
+        .children(action)
         .into_any_element()
 }
 
-pub const UNSHARED_LABEL: &str = "Not shared: take the lease to publish your turns";
+pub const UNSHARED_LABEL: &str = "Not shared: you did not hold the writer lease.";
 
 /// The subtle line under the composer of a shared thread (ADR 0008).
 pub fn shared_footer(p: &Palette, runner_online: bool) -> AnyElement {

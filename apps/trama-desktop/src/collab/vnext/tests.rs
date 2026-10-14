@@ -247,3 +247,75 @@ fn history_marks_unleased_messages_and_closed_shares() {
     v.apply(&DaemonMessage::Shares(vec![share(ShareStatus::Ready)]));
     assert!(v.history.ended(&t).is_none());
 }
+
+#[test]
+fn take_lease_uses_the_thread_share_and_reports_failures() {
+    use trama_protocol::{ShareLeaseSnapshot, ShareRole, ShareStatus, ThreadShareInfo};
+    let mut v = VNextState::default();
+    let t = ThreadId::from("t");
+    assert!(
+        v.leases.take(&t).is_none(),
+        "unknown share: nothing to send"
+    );
+    let info = |role, holder: Option<&str>| ThreadShareInfo {
+        share_id: "s1".into(),
+        status: ShareStatus::Ready,
+        role,
+        thread_gid: "g".into(),
+        lease_holder: holder.map(Into::into),
+    };
+    v.apply(&DaemonMessage::ThreadShare {
+        thread_id: t.clone(),
+        share: Some(info(ShareRole::Reader, None)),
+    });
+    assert!(
+        !v.leases.view(&t, Some("me")).can_take,
+        "readers cannot write"
+    );
+    v.apply(&DaemonMessage::ThreadShare {
+        thread_id: t.clone(),
+        share: Some(info(ShareRole::Writer, Some("bob"))),
+    });
+    let view = v.leases.view(&t, Some("me"));
+    assert!(view.can_take && view.holder.as_deref() == Some("bob"));
+    assert!(matches!(
+        v.leases.take(&t),
+        Some(ClientMessage::AcquireShareLease { share_id, thread_id, .. }) if share_id == "s1" && thread_id == t
+    ));
+    assert!(v.leases.take(&t).is_none(), "one request at a time");
+    assert!(v.leases.view(&t, Some("me")).taking);
+
+    let failed = DaemonMessage::ShareFailed {
+        operation: "acquire_share_lease".into(),
+        share_id: Some("s1".into()),
+        correlation_id: "c7".into(),
+        code: "busy".into(),
+        message: "held by bob".into(),
+    };
+    assert!(v.apply(&failed).0);
+    let dup = DaemonMessage::Error {
+        code: "busy".into(),
+        message: "held by bob [ref c7]".into(),
+    };
+    assert!(v.apply(&dup).0, "paired error swallowed");
+    let view = v.leases.view(&t, Some("me"));
+    assert!(!view.taking && view.error.as_deref() == Some("held by bob"));
+
+    v.leases.take(&t);
+    let lease = ShareLeaseSnapshot {
+        share_id: "s1".into(),
+        thread_id: Some(t.clone()),
+        thread_gid: "g".into(),
+        holder: "me".into(),
+        device_id: "d".into(),
+        expires_at: 0,
+    };
+    assert_eq!(v.leases.apply_lease(&lease), Some(t.clone()));
+    let view = v.leases.view(&t, Some("me"));
+    assert!(!view.can_take && view.error.is_none(), "held by me now");
+    v.apply(&DaemonMessage::ThreadShare {
+        thread_id: t.clone(),
+        share: None,
+    });
+    assert_eq!(v.leases.view(&t, Some("me")), LeaseView::default());
+}

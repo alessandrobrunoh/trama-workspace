@@ -37,6 +37,11 @@ impl Correlation {
     pub fn sent(&mut self, op: WizardOp) {
         self.pending = Some(op);
     }
+
+    /// A `ShareFailed` handled elsewhere: drop its paired `Error`.
+    pub fn swallow_error(&mut self, correlation_id: &str) {
+        self.swallow = Some(correlation_id.to_owned());
+    }
 }
 
 /// Wizard of a share command, by its client message tag.

@@ -187,7 +187,24 @@ impl Render for ChatPanel {
                 .into_any_element();
         }
 
-        for id in &shared.unshared {
+        let lease_button = |cx: &mut Context<Self>, key: usize| -> Option<AnyElement> {
+            let offer = shared.lease.can_take && !shared.lease.taking;
+            offer.then(|| {
+                Button::new(("take-lease", key))
+                    .xsmall()
+                    .ghost()
+                    .label("Take lease")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let (Some(collab), Some(thread)) =
+                            (this.collab.clone(), this.selected_thread.clone())
+                        {
+                            collab.update(cx, |collab, cx| collab.take_lease(&thread, cx));
+                        }
+                    }))
+                    .into_any_element()
+            })
+        };
+        for (key, id) in shared.unshared.iter().enumerate() {
             if let Some(&index) = row_of.get(id)
                 && let Some(slot) = rows.get_mut(index)
             {
@@ -196,7 +213,11 @@ impl Render for ChatPanel {
                     .w_full()
                     .flex_shrink_0()
                     .child(element)
-                    .child(crate::collab::presence::unshared_badge(&p))
+                    .child(crate::collab::presence::unshared_badge(
+                        &p,
+                        &shared.lease,
+                        lease_button(cx, key),
+                    ))
                     .into_any_element();
             }
         }
