@@ -417,6 +417,8 @@ pub fn ansi(n: u8, p: &Palette) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `gpui_kit::*` brings GPUI's own `test` attribute into scope.
+    use core::prelude::v1::test;
 
     #[test]
     fn appearance_pref_resolves_against_the_os() {
