@@ -16,8 +16,8 @@ use trama_protocol::{ClientMessage, ShareInvite, ShareRole, ShareScope, ShareSta
 
 use super::blockers::report_view;
 use super::route::WizardOp;
-use super::share_flow::{ShareFlow, ShareStep, invite_capabilities};
-use super::widgets::{choice, note, section};
+use super::share_flow::{SHARE_STEP_LABELS, ShareFlow, ShareStep, invite_capabilities};
+use super::widgets::{choice, note, section, steps};
 use crate::app::theme::{self, Palette};
 use crate::collab::CollabStore;
 
@@ -357,6 +357,7 @@ impl Render for ShareWizard {
                     .child(Icon::new(IconName::Share).with_size(px(13.)))
                     .child(div().min_w_0().truncate().child(flow.title.clone())),
             )
+            .child(steps(&p, &SHARE_STEP_LABELS, flow.step.index()))
             .child(body)
             .when(flow.step == ShareStep::People, |this| {
                 this.when_some(flow.error.clone(), |this, e| {

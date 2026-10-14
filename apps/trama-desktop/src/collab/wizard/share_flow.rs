@@ -23,6 +23,24 @@ pub enum ShareStep {
     Failed(String),
 }
 
+/// Labels of the share wizard's steps, in order.
+pub const SHARE_STEP_LABELS: [&str; 4] = ["Scope", "People", "Checks", "Shared"];
+
+impl ShareStep {
+    /// Index into [`SHARE_STEP_LABELS`].
+    pub fn index(&self) -> usize {
+        match self {
+            ShareStep::Scope => 0,
+            ShareStep::People => 1,
+            ShareStep::Checking
+            | ShareStep::Checked(_)
+            | ShareStep::Creating
+            | ShareStep::Failed(_) => 2,
+            ShareStep::Shared(_) => 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ShareFlow {
     pub thread_id: ThreadId,
@@ -388,5 +406,21 @@ impl ShareFlow {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod step_label_tests {
+    use super::*;
+
+    #[test]
+    fn every_step_maps_to_a_label() {
+        assert_eq!(SHARE_STEP_LABELS[ShareStep::Scope.index()], "Scope");
+        assert_eq!(SHARE_STEP_LABELS[ShareStep::People.index()], "People");
+        assert_eq!(SHARE_STEP_LABELS[ShareStep::Checking.index()], "Checks");
+        assert_eq!(
+            SHARE_STEP_LABELS[ShareStep::Failed("x".into()).index()],
+            "Checks"
+        );
     }
 }
