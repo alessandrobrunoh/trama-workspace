@@ -59,6 +59,8 @@ pub enum SidebarEvent {
     Requests(Vec<OnboardingRequest>),
     NewThread,
     ManageProjects,
+    /// The '+' next to Projects: Manage projects, focused on a new project.
+    CreateProject,
     QuickSwitch,
     /// Open (or join) a thread from "Shared with me".
     OpenShared(SharedThreadListing),
@@ -259,7 +261,10 @@ impl Render for SidebarPanel {
                     .ghost()
                     .small()
                     .icon(IconName::Search)
-                    .tooltip("Jump to thread (\u{2318}K)")
+                    .tooltip(format!(
+                        "Jump to thread ({})",
+                        crate::app::keymap::label("secondary-k")
+                    ))
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::QuickSwitch))),
             )
             .child(
@@ -274,7 +279,10 @@ impl Render for SidebarPanel {
                             .small()
                             .icon(IconName::SquarePen)
                             .disabled(!connected)
-                            .tooltip("New thread (\u{2318}N)")
+                            .tooltip(format!(
+                                "New thread ({})",
+                                crate::app::keymap::label("secondary-n")
+                            ))
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewThread))),
                     ),
             );
@@ -328,9 +336,9 @@ impl Render for SidebarPanel {
                             .ghost()
                             .xsmall()
                             .icon(IconName::Plus)
-                            .tooltip("Manage projects (\u{2318},)")
+                            .tooltip("New project")
                             .on_click(
-                                cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ManageProjects)),
+                                cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::CreateProject)),
                             ),
                     ),
             );
@@ -349,7 +357,7 @@ impl Render for SidebarPanel {
                             .small()
                             .label("Create a project")
                             .on_click(
-                                cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ManageProjects)),
+                                cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::CreateProject)),
                             ),
                     ),
             );

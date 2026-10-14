@@ -508,7 +508,10 @@ impl Workspace {
         };
         let Some(draft) = self.chat.update(cx, |chat, cx| chat.take_draft(window, cx)) else {
             window.push_notification(
-                Notification::info("Write a prompt first, then press \u{2318}\u{21e7}Enter."),
+                Notification::info(format!(
+                    "Write a prompt first, then press {}.",
+                    crate::app::keymap::label("secondary-shift-enter")
+                )),
                 cx,
             );
             return;
@@ -640,6 +643,7 @@ impl Workspace {
             }
             SidebarEvent::NewThread => self.open_new_thread(window, cx),
             SidebarEvent::ManageProjects => self.open_projects(window, cx),
+            SidebarEvent::CreateProject => self.open_projects_with(true, window, cx),
             SidebarEvent::QuickSwitch => self.open_palette(window, cx),
             SidebarEvent::OpenShared(listing) => self.open_shared(listing.clone(), window, cx),
             SidebarEvent::RefreshShared => {

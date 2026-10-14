@@ -171,7 +171,7 @@ impl ChatPanel {
                         cx.notify();
                     }))
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        this.click_turn(index, event.modifiers().platform, cx);
+                        this.click_turn(index, event.modifiers().secondary(), cx);
                     }))
                     .child(
                         div()
@@ -262,7 +262,7 @@ impl ChatPanel {
                 .border_color(p.border_strong)
                 .bg(p.bg)
                 .text_color(p.text_muted)
-                .child(label)
+                .child(crate::app::keymap::label(label))
         };
         let hint = |keys: &'static str, label: &'static str| {
             h_flex()
@@ -402,8 +402,8 @@ impl ChatPanel {
                     .bg(p.panel)
                     .text_size(theme::text_xs())
                     .text_color(p.text_faint)
-                    .child(hint("\u{2318}", "click to bookmark"))
-                    .child(hint("\u{2325}", "scroll by marker")),
+                    .child(hint("secondary", "click to bookmark"))
+                    .child(hint("alt", "scroll by marker")),
             )
             .into_any_element()
     }

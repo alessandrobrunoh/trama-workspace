@@ -410,6 +410,24 @@ impl Onboarding {
         Some(OnboardingRequest::MigrateLegacyThread { thread_id })
     }
 
+    /// Drop validation errors left from an earlier attempt (dialog reopened,
+    /// another project selected, path edited). Progress and success notes stay.
+    pub fn clear_form_errors(&mut self) {
+        if matches!(self.repo_feedback, Some(Feedback::Error(_))) {
+            self.repo_feedback = None;
+        }
+        if matches!(self.workspace_feedback, Some(Feedback::Error(_))) {
+            self.workspace_feedback = None;
+        }
+    }
+
+    /// Clear the repository error only (the path or alias was edited).
+    pub fn clear_repo_error(&mut self) {
+        if matches!(self.repo_feedback, Some(Feedback::Error(_))) {
+            self.repo_feedback = None;
+        }
+    }
+
     pub fn note_picker_failure(&mut self, message: impl Into<String>) {
         self.repo_feedback = Some(Feedback::Error(message.into()));
     }
@@ -419,6 +437,7 @@ impl Onboarding {
             self.selected_workspace = Some(id.clone());
             self.repositories.clear();
             self.repositories_for = None;
+            self.clear_form_errors();
             self.threads.clear();
             self.selected_thread = None;
             if self.pending != Some(Pending::Migration) {
@@ -658,6 +677,17 @@ pub fn protocol_mismatch_guidance(daemon_protocol: u32) -> String {
     format!(
         "Protocol mismatch: the daemon speaks v{daemon_protocol} and this app speaks v{PROTOCOL_VERSION}. Quit and restart both TramaWorkspace and the local daemon (`cargo run -p trama-daemon`) together. Do not start a second daemon. This only updates the transport handshake -- stored threads, workspace ids, and messages are not migrated. Workspace, repository, and thread changes stay disabled."
     )
+}
+
+/// Alias suggested for a repository path: its folder name, ignoring trailing
+/// separators. `None` for an empty path or a filesystem root.
+pub fn default_alias(path: &str) -> Option<String> {
+    let trimmed = path.trim().trim_end_matches(['/', '\\']);
+    let name = trimmed.rsplit(['/', '\\']).next()?.trim();
+    if name.is_empty() || name.ends_with(':') || name == "~" || name == "." || name == ".." {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// Turn a typed or picked path into the directory the daemon should store.
@@ -1214,5 +1244,38 @@ mod tests {
         assert!(!onboarding.database_actions_enabled());
         assert!(onboarding.workspace_feedback.as_ref().unwrap().is_error());
         assert_eq!(onboarding.banner(), guidance);
+    }
+
+    #[test]
+    fn default_alias_is_the_folder_name() {
+        assert_eq!(default_alias("/home/me/code/api"), Some("api".into()));
+        assert_eq!(default_alias("/home/me/code/api/"), Some("api".into()));
+        assert_eq!(default_alias("C:\\src\\web\\"), Some("web".into()));
+        assert_eq!(default_alias("~/payments"), Some("payments".into()));
+        assert_eq!(default_alias(""), None);
+        assert_eq!(default_alias("/"), None);
+        assert_eq!(default_alias("C:\\"), None);
+        assert_eq!(default_alias("~"), None);
+    }
+
+    #[test]
+    fn selecting_another_project_clears_stale_errors() {
+        let mut onboarding = online();
+        onboarding.repo_feedback = Some(Feedback::Error("not a repo".into()));
+        onboarding.select_workspace(wid("other"));
+        assert!(onboarding.repo_feedback.is_none());
+    }
+
+    #[test]
+    fn form_errors_clear_but_progress_stays() {
+        let mut onboarding = Onboarding::default();
+        onboarding.repo_feedback = Some(Feedback::Error("bad".into()));
+        onboarding.workspace_feedback = Some(Feedback::Error("bad".into()));
+        onboarding.clear_form_errors();
+        assert!(onboarding.repo_feedback.is_none());
+        assert!(onboarding.workspace_feedback.is_none());
+        onboarding.repo_feedback = Some(Feedback::Progress("adding".into()));
+        onboarding.clear_form_errors();
+        assert!(onboarding.repo_feedback.is_some());
     }
 }

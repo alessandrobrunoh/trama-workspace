@@ -9,10 +9,10 @@ impl ChatPanel {
         } else if let Some(pick) = self.patch_pick.clone() {
             self.open_patch_draft(pick, None, window, cx);
         } else if self.uses_daemon() {
-            self.connection_error = Some(
-                "Select text anywhere in the transcript, then type your comment (or press \u{2318}\u{2325}M)."
-                    .into(),
-            );
+            self.connection_error = Some(format!(
+                "Select text anywhere in the transcript, then type your comment (or press {}).",
+                crate::app::keymap::label("secondary-alt-m")
+            ));
             cx.notify();
         }
     }

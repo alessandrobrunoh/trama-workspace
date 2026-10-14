@@ -344,7 +344,10 @@ impl Composer {
                         .primary()
                         .small()
                         .icon(IconName::ArrowUp)
-                        .tooltip("Send (Enter) · \u{2318}\u{21e7}Enter sends to a new subthread")
+                        .tooltip(format!(
+                            "Send (Enter) · {} sends to a new subthread",
+                            crate::app::keymap::label("secondary-shift-enter")
+                        ))
                         .disabled(!can_send)
                         .on_click(on_send),
                 )

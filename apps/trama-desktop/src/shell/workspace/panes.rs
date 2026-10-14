@@ -117,6 +117,17 @@ impl Workspace {
     }
 
     pub(super) fn open_projects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_projects_with(false, window, cx);
+    }
+
+    /// Open Manage projects with a fresh form; `create_project` focuses the
+    /// new project name.
+    pub(super) fn open_projects_with(
+        &mut self,
+        create_project: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.close_all_dialogs(cx);
         let view = self.projects.clone();
         window.open_dialog(cx, move |dialog, _, _| {
@@ -125,8 +136,9 @@ impl Workspace {
                 .w(px(600.))
                 .child(view.clone())
         });
-        self.projects
-            .update(cx, |projects, cx| projects.focus_first(window, cx));
+        self.projects.update(cx, |projects, cx| {
+            projects.reset_for_open(create_project, window, cx)
+        });
     }
 
     // -- disk usage and archiving -----------------------------------------

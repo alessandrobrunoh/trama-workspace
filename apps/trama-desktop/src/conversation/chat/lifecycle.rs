@@ -349,7 +349,7 @@ pub(super) fn render_approval(
                 ApprovalState::Sending(decision) => Some(decision),
                 _ => None,
             };
-            let button = |id: &'static str, label: &'static str, keys: &'static str, decision| {
+            let button = |id: &'static str, label: &'static str, keys: String, decision| {
                 let request_id = card.request_id.clone();
                 let mut button =
                     Button::new(SharedString::from(format!("{id}-{}", card.request_id)))
@@ -374,19 +374,19 @@ pub(super) fn render_approval(
                 .child(button(
                     "approve-once",
                     "Allow once",
-                    "\u{2318}Y",
+                    crate::app::keymap::label("secondary-y"),
                     ApprovalDecision::AllowOnce,
                 ))
                 .child(button(
                     "approve-session",
                     "Allow for session",
-                    "\u{2318}\u{21e7}Y",
+                    crate::app::keymap::label("secondary-shift-y"),
                     ApprovalDecision::AllowSession,
                 ))
                 .child(button(
                     "approve-deny",
                     "Deny",
-                    "\u{2318}\u{21e7}N",
+                    crate::app::keymap::label("secondary-shift-n"),
                     ApprovalDecision::Deny,
                 ))
                 .child(div().flex_1())
@@ -394,9 +394,12 @@ pub(super) fn render_approval(
                     div()
                         .text_size(theme::text_xs())
                         .text_color(p.text_faint)
-                        .child(
-                            "\u{2318}Y allow · \u{2318}\u{21e7}Y session · \u{2318}\u{21e7}N deny",
-                        ),
+                        .child(format!(
+                            "{} allow · {} session · {} deny",
+                            crate::app::keymap::label("secondary-y"),
+                            crate::app::keymap::label("secondary-shift-y"),
+                            crate::app::keymap::label("secondary-shift-n"),
+                        )),
                 )
                 .into_any_element()
         }

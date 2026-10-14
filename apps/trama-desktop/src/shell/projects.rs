@@ -32,6 +32,8 @@ pub struct ProjectsPanel {
     workspace_name: Entity<InputState>,
     repo_path: Entity<InputState>,
     repo_alias: Entity<InputState>,
+    /// The user typed an alias; stop deriving it from the path.
+    alias_edited: bool,
     picker_open: bool,
     _picker: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -43,8 +45,9 @@ impl ProjectsPanel {
     pub fn new(sidebar: Entity<SidebarPanel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let workspace_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("Project name, e.g. Payments"));
-        let repo_path =
-            cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/an/existing/local/repo"));
+        let repo_path = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Local repository folder, e.g. ~/code/api")
+        });
         let repo_alias = cx.new(|cx| InputState::new(window, cx).placeholder("Alias, e.g. api"));
         let subscriptions = vec![
             cx.observe(&sidebar, |_, _, cx| cx.notify()),
@@ -53,9 +56,23 @@ impl ProjectsPanel {
                     this.submit_workspace(window, cx);
                 }
             }),
-            cx.subscribe_in(&repo_alias, window, |this, _, event, window, cx| {
-                if let InputEvent::PressEnter { shift: false, .. } = event {
-                    this.submit_repository(window, cx);
+            cx.subscribe_in(
+                &repo_alias,
+                window,
+                |this, alias, event, window, cx| match event {
+                    InputEvent::PressEnter { shift: false, .. } => {
+                        this.submit_repository(window, cx)
+                    }
+                    InputEvent::Change => {
+                        this.alias_edited = !alias.read(cx).value().trim().is_empty();
+                        this.clear_repo_error(cx);
+                    }
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(&repo_path, window, |this, _, event, window, cx| {
+                if let InputEvent::Change = event {
+                    this.path_changed(window, cx);
                 }
             }),
         ];
@@ -64,10 +81,63 @@ impl ProjectsPanel {
             workspace_name,
             repo_path,
             repo_alias,
+            alias_edited: false,
             picker_open: false,
             _picker: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Fresh form for a new opening of the dialog: empty repository fields,
+    /// no errors left from an earlier attempt. With `create_project`, focus the
+    /// project name; otherwise the first useful field.
+    pub fn reset_for_open(
+        &mut self,
+        create_project: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.repo_path
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.repo_alias
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.alias_edited = false;
+        if create_project {
+            self.workspace_name
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.onboarding.clear_form_errors();
+            cx.notify();
+        });
+        if create_project {
+            self.workspace_name
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
+        } else {
+            self.focus_first(window, cx);
+        }
+    }
+
+    fn clear_repo_error(&mut self, cx: &mut Context<Self>) {
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.onboarding.clear_repo_error();
+            cx.notify();
+        });
+    }
+
+    /// The path changed (typed or picked): drop the stale error and keep the
+    /// alias in step with the folder name until the user types their own.
+    fn path_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_repo_error(cx);
+        if self.alias_edited {
+            return;
+        }
+        let path = self.repo_path.read(cx).value().to_string();
+        let alias = crate::shell::onboarding::default_alias(&path).unwrap_or_default();
+        self.repo_alias
+            .update(cx, |input, cx| input.set_value(alias, window, cx));
     }
 
     pub fn focus_first(&self, window: &mut Window, cx: &mut App) {
@@ -130,6 +200,7 @@ impl ProjectsPanel {
                         this.repo_path.update(cx, |input, cx| {
                             input.set_value(text, window, cx);
                         });
+                        this.path_changed(window, cx);
                     }
                     crate::app::dialog::PickerOutcome::Failed(message) => {
                         this.sidebar.update(cx, |sidebar, cx| {
@@ -169,6 +240,7 @@ impl ProjectsPanel {
                 .update(cx, |input, cx| input.set_value("", window, cx));
             self.repo_alias
                 .update(cx, |input, cx| input.set_value("", window, cx));
+            self.alias_edited = false;
         }
     }
 }

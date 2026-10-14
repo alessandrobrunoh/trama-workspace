@@ -37,6 +37,13 @@ gpui_kit::actions!(
     ]
 );
 
+/// ⌘V on macOS; Ctrl+Shift+V elsewhere so Ctrl+V still reaches the PTY.
+const PASTE_KEYS: &str = if cfg!(target_os = "macos") {
+    "cmd-v"
+} else {
+    "ctrl-shift-v"
+};
+
 /// Keys that other contexts would otherwise take from a focused terminal,
 /// and the window-wide ⌃` toggle.
 pub fn bind(cx: &mut App) {
@@ -44,7 +51,7 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("tab", SendTab, Some(CONTEXT)),
         KeyBinding::new("shift-tab", SendBackTab, Some(CONTEXT)),
         KeyBinding::new("escape", SendEscape, Some(CONTEXT)),
-        KeyBinding::new("cmd-v", PasteToTerminal, Some(CONTEXT)),
+        KeyBinding::new(PASTE_KEYS, PasteToTerminal, Some(CONTEXT)),
         KeyBinding::new("ctrl-`", ToggleTerminal, Some(crate::app::keymap::CONTEXT)),
     ]);
 }

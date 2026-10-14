@@ -1518,7 +1518,10 @@ pub fn render_drawer(
                         .ghost()
                         .xsmall()
                         .icon(IconName::Close)
-                        .tooltip("Close drawer (\u{2318}R)")
+                        .tooltip(format!(
+                            "Close drawer ({})",
+                            crate::app::keymap::label("secondary-r")
+                        ))
                         .disabled(false)
                         .on_click(on_close),
                 ),

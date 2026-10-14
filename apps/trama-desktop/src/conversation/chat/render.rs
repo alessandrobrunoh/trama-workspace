@@ -94,9 +94,9 @@ impl Render for ChatPanel {
                     "No thread selected",
                     "Pick a thread in the sidebar or start a new one.",
                     &[
-                        ("cmd-n", "New thread"),
-                        ("cmd-k", "Jump to thread"),
-                        ("cmd-/", "Shortcuts"),
+                        ("secondary-n", "New thread"),
+                        ("secondary-k", "Jump to thread"),
+                        ("secondary-/", "Shortcuts"),
                     ],
                 )
             }));

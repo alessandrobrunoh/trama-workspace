@@ -115,7 +115,7 @@ impl Workspace {
                                         .icon(IconName::Share2)
                                         .label("Share")
                                         .toggled(shared_thread)
-                                        .tooltip("Share this thread (\u{2318}\u{21e7}S)")
+                                        .tooltip(format!("Share this thread ({})", crate::app::keymap::label("secondary-shift-s")))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.open_share(window, cx);
                                         })),
@@ -148,7 +148,7 @@ impl Workspace {
                                     .ghost()
                                     .small()
                                     .icon(IconName::Search)
-                                    .tooltip("Jump to thread (\u{2318}K)")
+                                    .tooltip(format!("Jump to thread ({})", crate::app::keymap::label("secondary-k")))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.open_palette(window, cx);
                                     })),
@@ -163,7 +163,7 @@ impl Workspace {
                                         IconName::PanelRightOpen
                                     })
                                     .toggled(drawer_open)
-                                    .tooltip("Changes and copies (\u{2318}R)")
+                                    .tooltip(format!("Changes and copies ({})", crate::app::keymap::label("secondary-r")))
                                     .on_click(cx.listener(|this, _, _, cx| this.toggle_drawer(cx))),
                             )
                             .child(
@@ -225,6 +225,19 @@ impl Workspace {
             )
             .child(counts)
             .child(div().flex_1())
-            .child("\u{2318}K jump · \u{2318}N new · \u{2318}\u{21e7}\u{23ce} subthread · \u{2318}\u{21e7}S share · \u{2318}R changes · \u{2318}/ shortcuts")
+            .child(
+                [
+                    ("secondary-k", "jump"),
+                    ("secondary-n", "new"),
+                    ("secondary-shift-enter", "subthread"),
+                    ("secondary-shift-s", "share"),
+                    ("secondary-r", "changes"),
+                    ("secondary-/", "shortcuts"),
+                ]
+                .iter()
+                .map(|(keys, what)| format!("{} {what}", crate::app::keymap::label(keys)))
+                .collect::<Vec<_>>()
+                .join(" · "),
+            )
     }
 }
