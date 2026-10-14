@@ -88,44 +88,87 @@ pub fn prepare_staging(dir: &Path, format: ObjectFormat, origin: Option<&str>) -
     Ok(())
 }
 
-/// Turns a restored staging repository into the source of a regular
-/// repo-local managed checkout carrying the exact shared state: the staging
-/// is reset to a clean `HEAD`, a managed checkout is provisioned from it,
-/// and the captured index/working state is restored into that checkout
-/// from a full local bundle of the share refs (verified as usual).
-pub fn materialize_share_checkout(
-    manager: &CheckoutManager,
-    staging: &Path,
-    thread: &ThreadId,
-    repository: &RepositoryId,
-    checkout: &CheckoutId,
-    expected: &ExpectedState,
-) -> Result<ProvisionedCheckout> {
-    let destination = manager
-        .repo_local_path(staging, thread, checkout)
-        .map_err(ShareGitError::from)?;
-    if !destination.exists() {
+/// `HEAD`, staged tree and full working-state tree of a checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalState {
+    pub head: String,
+    pub index_tree: String,
+    pub working_tree: String,
+}
+
+fn text_of(dir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(CheckoutError::from)?;
+    if !output.status.success() {
+        return Err(CheckoutError::Git {
+            args: args.iter().map(|a| (*a).to_owned()).collect(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        }
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+pub fn local_state(checkout: &Path) -> Result<LocalState> {
+    Ok(LocalState {
+        head: text_of(checkout, &["rev-parse", "HEAD"])?,
+        index_tree: text_of(checkout, &["write-tree"])?,
+        working_tree: crate::git::changes::snapshot_tree(checkout)?,
+    })
+}
+
+fn expected_local(expected: &ExpectedState) -> LocalState {
+    LocalState {
+        head: expected.head_commit.clone(),
+        index_tree: expected.index_tree.clone(),
+        working_tree: expected.working_tree.clone(),
+    }
+}
+
+/// Drops staged and working changes (never ignored files or `.trama`).
+fn reset_clean(dir: &Path) -> Result<()> {
+    run(
+        Some(dir),
+        &[
+            "read-tree".as_ref(),
+            "--reset".as_ref(),
+            "-u".as_ref(),
+            "HEAD".as_ref(),
+        ],
+    )?;
+    run(Some(dir), &["clean".as_ref(), "-fdq".as_ref()])
+}
+
+/// Brings an existing staging back to a clean `HEAD` and refreshes its
+/// view of `origin` (user's credentials), ready for another restore.
+pub fn refresh_staging(dir: &Path, origin: Option<&str>) -> Result<()> {
+    reset_clean(dir)?;
+    if let Some(origin) = origin {
+        if origin.starts_with('-') {
+            return Err(ShareGitError::InvalidComponent(origin.to_owned()));
+        }
         run(
-            Some(staging),
+            Some(dir),
             &[
-                "read-tree".as_ref(),
-                "--reset".as_ref(),
-                "-u".as_ref(),
-                "HEAD".as_ref(),
+                "fetch".as_ref(),
+                "--quiet".as_ref(),
+                "--no-tags".as_ref(),
+                origin.as_ref(),
+                "+refs/heads/*:refs/remotes/origin/*".as_ref(),
             ],
         )?;
-        run(Some(staging), &["clean".as_ref(), "-fdq".as_ref()])?;
     }
-    let provisioned = manager
-        .provision_repo_local(staging, thread, repository, checkout)
-        .map_err(ShareGitError::from)?;
-    if provisioned.base_revision != expected.head_commit {
-        return Err(ShareGitError::Mismatch {
-            what: "provisioned base",
-            expected: expected.head_commit.clone(),
-            actual: provisioned.base_revision,
-        });
-    }
+    Ok(())
+}
+
+/// Restores `expected` into `checkout` from the share refs in `staging`
+/// (full local bundle; `checkout` is reset first).
+fn apply_from_staging(staging: &Path, checkout: &Path, expected: &ExpectedState) -> Result<()> {
     let bundle = staging.join(".git").join("trama-share-local.bundle");
     run(
         Some(staging),
@@ -138,10 +181,67 @@ pub fn materialize_share_checkout(
             expected.working_ref.as_ref(),
         ],
     )?;
-    let restored = super::share_git::restore(&provisioned.path, &bundle, expected);
+    let restored =
+        reset_clean(checkout).and_then(|()| super::share_git::restore(checkout, &bundle, expected));
     let _ = std::fs::remove_file(&bundle);
-    restored?;
+    restored
+}
+
+/// Turns a restored staging repository into the source of a regular
+/// repo-local managed checkout carrying the exact shared state: the staging
+/// is reset to a clean `HEAD`, a managed checkout is provisioned from it,
+/// and the captured index/working state is restored into that checkout
+/// from a full local bundle of the share refs (verified as usual).
+/// Idempotent: an existing checkout already in `expected` is returned; a
+/// missing one (folder deleted) is provisioned again at the same place.
+pub fn materialize_share_checkout(
+    manager: &CheckoutManager,
+    staging: &Path,
+    thread: &ThreadId,
+    repository: &RepositoryId,
+    checkout: &CheckoutId,
+    expected: &ExpectedState,
+) -> Result<ProvisionedCheckout> {
+    let destination = manager
+        .repo_local_path(staging, thread, checkout)
+        .map_err(ShareGitError::from)?;
+    if destination.exists() {
+        let provisioned = manager
+            .provision_repo_local(staging, thread, repository, checkout)
+            .map_err(ShareGitError::from)?;
+        if local_state(&provisioned.path)? != expected_local(expected) {
+            return Err(ShareGitError::StagingDirty(provisioned.path));
+        }
+        return Ok(provisioned);
+    }
+    reset_clean(staging)?;
+    let provisioned = manager
+        .provision_repo_local(staging, thread, repository, checkout)
+        .map_err(ShareGitError::from)?;
+    if provisioned.base_revision != expected.head_commit {
+        return Err(ShareGitError::Mismatch {
+            what: "provisioned base",
+            expected: expected.head_commit.clone(),
+            actual: provisioned.base_revision,
+        });
+    }
+    apply_from_staging(staging, &provisioned.path, expected)?;
     Ok(provisioned)
+}
+
+/// Moves an attached share checkout from `previous` to `expected` (whose
+/// refs `staging` already holds). Refuses with `StagingDirty` when the
+/// checkout changed locally since `previous` was restored.
+pub fn update_share_checkout(
+    staging: &Path,
+    checkout: &Path,
+    previous: &LocalState,
+    expected: &ExpectedState,
+) -> Result<()> {
+    if &local_state(checkout)? != previous {
+        return Err(ShareGitError::StagingDirty(checkout.to_path_buf()));
+    }
+    apply_from_staging(staging, checkout, expected)
 }
 
 #[cfg(test)]
@@ -236,8 +336,32 @@ mod tests {
             String::from_utf8(o.stdout).unwrap()
         };
         assert_eq!(staged(&managed.path), staged(&src));
-        // A second run refuses: the managed checkout now carries the state.
-        materialize_share_checkout(&manager, &alone, &thread, &repo, &co, &expected).unwrap_err();
+        // Idempotent, and recreated when the folder is gone.
+        materialize_share_checkout(&manager, &alone, &thread, &repo, &co, &expected).unwrap();
+        std::fs::remove_dir_all(&managed.path).unwrap();
+        let again =
+            materialize_share_checkout(&manager, &alone, &thread, &repo, &co, &expected).unwrap();
+        assert_eq!(again.path, managed.path);
+        let state = local_state(&again.path).unwrap();
+        assert_eq!(state.index_tree, captured.index_tree);
+        assert_eq!(state.working_tree, captured.working_tree);
+
+        // An update: new commit at the source, restored into the same checkout.
+        std::fs::write(src.join("c.txt"), "two\n").unwrap();
+        git(&src, &["add", "c.txt"]);
+        git(&src, &["commit", "-qm", "two"]);
+        let next = capture(&src, "sh1", "v2").unwrap();
+        let next_expected = ExpectedState::from(&next);
+        let next_bundle = tmp.path().join("next.bundle");
+        export_bundle(&src, &next, &[], &next_bundle).unwrap();
+        refresh_staging(&alone, None).unwrap();
+        restore(&alone, &next_bundle, &next_expected).unwrap();
+        std::fs::write(again.path.join("local.txt"), "mine\n").unwrap();
+        assert!(update_share_checkout(&alone, &again.path, &state, &next_expected).is_err());
+        std::fs::remove_file(again.path.join("local.txt")).unwrap();
+        update_share_checkout(&alone, &again.path, &state, &next_expected).unwrap();
+        assert_eq!(rev(&again.path, "HEAD"), next.head_commit);
+        assert_eq!(std::fs::read(again.path.join("c.txt")).unwrap(), b"two\n");
 
         let thin = tmp.path().join("thin.bundle");
         let head = captured.head_commit.clone();
