@@ -15,6 +15,7 @@
 pub(crate) mod account;
 pub(crate) mod presence;
 pub(crate) mod share_dialog;
+pub(crate) mod status_banner;
 pub(crate) mod vnext;
 pub(crate) mod wizard;
 
@@ -460,6 +461,10 @@ pub struct ThreadCollab {
     pub ended: Option<String>,
     /// vNext: writer lease of the thread ("Take lease").
     pub lease: vnext::LeaseView,
+    /// vNext: share of the thread with its persisted warnings and restore
+    /// state ("Retry restore").
+    pub share_id: Option<String>,
+    pub status: vnext::StatusView,
 }
 
 pub struct CollabStore {
@@ -607,6 +612,13 @@ impl CollabStore {
             unshared: self.vnext.history.unshared(thread),
             ended: self.vnext.history.ended(thread),
             lease: self.lease_view(thread),
+            share_id: self.vnext.leases.share_id(thread).map(str::to_owned),
+            status: self
+                .vnext
+                .leases
+                .share_id(thread)
+                .map(|id| self.share_status(id))
+                .unwrap_or_default(),
         }
     }
 

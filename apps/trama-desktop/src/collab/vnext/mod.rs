@@ -16,7 +16,9 @@ mod history;
 use super::wizard::share_flow::ShareFlow;
 pub use history::ShareHistory;
 mod lease;
+mod status;
 pub use lease::{LeaseView, Leases};
+pub use status::{ShareStatuses, StatusView, warning_text};
 
 /// How long Share/Join waits for the server check before using v2.
 pub const SERVER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -63,6 +65,8 @@ pub struct VNextState {
     pub history: ShareHistory,
     /// Thread shares and writer-lease requests.
     pub leases: Leases,
+    /// Persisted warnings and restore state, by share id.
+    pub statuses: ShareStatuses,
 }
 
 impl VNextState {
@@ -185,6 +189,25 @@ impl VNextState {
                 self.leases.apply_thread_share(thread_id, share.clone());
                 return (true, Vec::new());
             }
+            DaemonMessage::ShareStatusReport(report) => {
+                self.statuses.apply(report);
+                return (true, Vec::new());
+            }
+            DaemonMessage::ShareFailed {
+                operation,
+                share_id,
+                correlation_id,
+                message,
+                ..
+            } if operation == "retry_share_restore" => {
+                if self
+                    .statuses
+                    .fail_retry(share_id.as_deref(), message.clone())
+                {
+                    self.corr.swallow_error(correlation_id);
+                    return (true, Vec::new());
+                }
+            }
             DaemonMessage::ShareFailed {
                 operation,
                 share_id,
@@ -298,6 +321,18 @@ impl CollabStore {
         cx.notify();
     }
 
+    /// "Retry restore" for a joined share whose restore failed.
+    pub fn retry_restore(&mut self, share_id: &str, cx: &mut Context<Self>) {
+        if let Some(message) = self.vnext.statuses.retry(share_id) {
+            self.send(message);
+            cx.notify();
+        }
+    }
+
+    pub fn share_status(&self, share_id: &str) -> StatusView {
+        self.vnext.statuses.view(share_id)
+    }
+
     pub fn lease_view(&self, thread: &ThreadId) -> LeaseView {
         self.vnext.leases.view(thread, self.username())
     }
@@ -339,6 +374,16 @@ impl CollabStore {
         }
         let was_checking = self.vnext.support() == ServerSupport::Checking;
         let (handled, follow_ups) = self.vnext.apply(message);
+        if let DaemonMessage::ThreadShare {
+            share: Some(share), ..
+        } = message
+        {
+            // Warnings and restore state shown for the selected thread.
+            self.send(ShareStatuses::request(&share.share_id));
+        }
+        if let Some(share_id) = status_trigger(message) {
+            self.send(ShareStatuses::request(share_id));
+        }
         if let DaemonMessage::ShareFailed {
             share_id: Some(_), ..
         } = message
@@ -363,6 +408,19 @@ impl CollabStore {
             cx.notify();
         }
         handled
+    }
+}
+
+/// Replies after which a share's persisted status may have changed.
+fn status_trigger(message: &DaemonMessage) -> Option<&str> {
+    match message {
+        DaemonMessage::ShareJoined(j) | DaemonMessage::ShareCreated(j) => Some(&j.share_id),
+        DaemonMessage::ShareFailed {
+            share_id: Some(id),
+            code,
+            ..
+        } if code == "content_skipped" => Some(id),
+        _ => None,
     }
 }
 

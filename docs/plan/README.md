@@ -101,3 +101,9 @@ Scelte conservative prese dove la spec lascia aperto:
 - **Codici errore share** (`ShareFailed.code`, e `Error.code`): `access_revoked` quando lo share è già chiuso localmente o il server risponde not found per lo share (che viene chiuso localmente); altrimenti il codice generico del daemon (`not_found`, `invalid`, `collab`, `busy`, …). Solo not found chiude; forbidden no. `not_a_member` non viene emesso dal daemon (il desktop lo tratta come `access_revoked`). `content_skipped` è solo un warning.
 - **Share per thread** (protocollo 17): `GetThreadShare{thread_id}` → `ThreadShare{share: Option<ThreadShareInfo{share_id, status, role, thread_gid, lease_holder}>}`; `lease_holder` è best effort (assente offline). Basta per un "prendi lease" con un click (`AcquireShareLease`).
 - **Warning inutilizzati**: `bind_signing_key`, `put_part`, `get_part` sono ora usati (binding chiave, slice e bundle); nessun `allow(dead_code)` aggiunto.
+
+### M4j desktop decisions (share lease and status)
+
+- "Take lease" sits under not-shared messages only. It is offered when `GetThreadShare` reports a share and the lease is free or held by someone else. It sends `AcquireShareLease` with the default TTL, and the daemon arbitrates. If it fails, the reason shows inline.
+- `GetShareStatus` is asked for after `ThreadShare` (selected thread), `ShareCreated`/`ShareJoined` and a `content_skipped` warning. Warnings ("Published without code: …") and restore failures show as transcript banners of the thread. The owner wizard does not repeat them.
+- "Retry restore" is shown only when `restore` is `failed`, and only one request runs at a time. A `ShareFailed{retry_share_restore}` is shown inline next to the restore error and its follow-up `Error` toast is swallowed.

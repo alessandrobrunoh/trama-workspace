@@ -81,6 +81,11 @@ impl Leases {
         !threads.is_empty()
     }
 
+    /// Share id of a local thread, once `GetThreadShare` answered.
+    pub fn share_id(&self, thread: &ThreadId) -> Option<&str> {
+        self.shares.get(thread).map(|info| info.share_id.as_str())
+    }
+
     pub fn view(&self, thread: &ThreadId, me: Option<&str>) -> LeaseView {
         let Some(info) = self.shares.get(thread) else {
             return LeaseView::default();
