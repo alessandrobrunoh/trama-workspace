@@ -449,7 +449,7 @@ impl Workspace {
             PaletteTarget::PrepareCheckout => {
                 crate::shell::projects::open_prepare_confirm(self.sidebar.clone(), window, cx);
             }
-            PaletteTarget::ToggleAppearance => self.toggle_appearance(cx),
+            PaletteTarget::ToggleAppearance => self.toggle_appearance(window, cx),
             PaletteTarget::Shortcuts => self.open_shortcuts(window, cx),
             PaletteTarget::Review => self.start_review(window, cx),
             PaletteTarget::Land => self.confirm_land(window, cx),
@@ -475,13 +475,17 @@ impl Workspace {
         cx.notify();
     }
 
-    pub(super) fn toggle_appearance(&mut self, cx: &mut Context<Self>) {
-        let mode = if cx.theme_is_dark() {
-            ThemeMode::Light
+    pub(super) fn toggle_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let appearance = if cx.theme_is_dark() {
+            theme::AppearancePref::Light
         } else {
-            ThemeMode::Dark
+            theme::AppearancePref::Dark
         };
-        theme::apply(mode, cx);
+        let prefs = theme::ThemePrefs {
+            appearance,
+            ..theme::prefs(cx)
+        };
+        theme::set_prefs(prefs, window.appearance(), cx);
         cx.notify();
     }
 

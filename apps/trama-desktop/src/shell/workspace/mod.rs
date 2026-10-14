@@ -26,7 +26,6 @@ use gpui_kit::component::{
     h_flex,
     kbd::Kbd,
     notification::Notification,
-    theme::ThemeMode,
     tooltip::Tooltip,
     v_flex,
 };
@@ -331,7 +330,10 @@ impl Workspace {
             }),
             cx.observe_window_appearance(window, |_, window, cx| {
                 if crate::app::devhooks::appearance().is_none() {
-                    theme::apply(theme::mode_for(window.appearance()), cx);
+                    theme::apply(
+                        theme::resolve_mode(theme::prefs(cx).appearance, window.appearance()),
+                        cx,
+                    );
                 }
             }),
         ];

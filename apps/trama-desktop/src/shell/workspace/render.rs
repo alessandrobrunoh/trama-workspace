@@ -118,9 +118,11 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &keymap::ArchiveThread, window, cx| {
                 this.archive_selected(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &keymap::ToggleAppearance, _, cx| {
-                this.toggle_appearance(cx);
-            }))
+            .on_action(
+                cx.listener(|this, _: &keymap::ToggleAppearance, window, cx| {
+                    this.toggle_appearance(window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &keymap::CloseOverlay, window, cx| {
                 this.close_overlay(window, cx);
             }))
@@ -164,7 +166,7 @@ impl Render for Workspace {
                 },
             ))
             .size_full()
-            .bg(p.bg)
+            .bg(p.canvas)
             .text_color(p.text)
             .font_family(theme::UI_FONT)
             .text_size(theme::text_ui())
@@ -218,34 +220,45 @@ impl Render for Workspace {
                             .w(theme::sidebar_width())
                             .h_full()
                             .flex_shrink_0()
-                            .border_r_1()
-                            .border_color(p.border)
                             .child(self.sidebar.clone()),
                     )
-                    .when(!center_hidden, |this| {
-                        this.child(div().flex_1().min_w_0().h_full().child(center))
-                    })
-                    .children(pane)
-                    .when(self.drawer_open, |this| {
-                        let body: AnyView = match self.drawer_tab {
-                            DrawerTab::Changes => self.changes.clone().into(),
-                            DrawerTab::Copies => self.copies.clone().into(),
-                        };
-                        let weak = cx.weak_entity();
-                        this.child(render_drawer(
-                            self.drawer_tab,
-                            body,
-                            move |tab, _, cx| {
-                                let _ = weak.update(cx, |this, cx| {
-                                    this.drawer_tab = tab;
-                                    this.refresh_changes(cx);
-                                    cx.notify();
-                                });
-                            },
-                            cx.listener(|this, _, _, cx| this.toggle_drawer(cx)),
-                            cx,
-                        ))
-                    }),
+                    .child(
+                        // Content card: rounded, bordered, inset from the canvas.
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .mr(theme::card_inset())
+                            .rounded(theme::radius_card())
+                            .border_1()
+                            .border_color(p.border)
+                            .bg(p.bg)
+                            .overflow_hidden()
+                            .when(!center_hidden, |this| {
+                                this.child(div().flex_1().min_w_0().h_full().child(center))
+                            })
+                            .children(pane)
+                            .when(self.drawer_open, |this| {
+                                let body: AnyView = match self.drawer_tab {
+                                    DrawerTab::Changes => self.changes.clone().into(),
+                                    DrawerTab::Copies => self.copies.clone().into(),
+                                };
+                                let weak = cx.weak_entity();
+                                this.child(render_drawer(
+                                    self.drawer_tab,
+                                    body,
+                                    move |tab, _, cx| {
+                                        let _ = weak.update(cx, |this, cx| {
+                                            this.drawer_tab = tab;
+                                            this.refresh_changes(cx);
+                                            cx.notify();
+                                        });
+                                    },
+                                    cx.listener(|this, _, _, cx| this.toggle_drawer(cx)),
+                                    cx,
+                                ))
+                            }),
+                    ),
             )
             .child(self.render_status_bar(cx))
     }

@@ -46,8 +46,8 @@ impl Workspace {
 
         TitleBar::new()
             .h(theme::title_bar_height())
-            .bg(p.panel)
-            .border_color(p.border)
+            .bg(p.canvas)
+            .border_color(p.canvas)
             .child(
                 h_flex()
                     .size_full()
@@ -213,9 +213,7 @@ impl Workspace {
             .px(theme::sp(3.))
             .gap(theme::sp(3.))
             .items_center()
-            .bg(p.panel)
-            .border_t_1()
-            .border_color(p.border)
+            .bg(p.canvas)
             .text_size(theme::text_xs())
             .text_color(p.text_faint)
             .child(

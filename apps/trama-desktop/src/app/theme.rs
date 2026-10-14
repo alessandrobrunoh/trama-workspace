@@ -5,13 +5,17 @@
 //! (buttons, inputs, dialogs, the command palette) match the custom chrome.
 
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::h_flex;
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::*;
 
 /// Semantic color tokens for one appearance.
 #[derive(Debug, Clone, Copy)]
 pub struct Palette {
-    /// Center canvas behind the transcript.
+    /// Window backdrop: the area around the content card (sidebar, title
+    /// and status bars sit directly on it).
+    pub canvas: Hsla,
+    /// Content card behind the transcript, lists and panes.
     pub bg: Hsla,
     /// Sidebar, drawer, title and status bars.
     pub panel: Hsla,
@@ -47,13 +51,14 @@ fn hexa(value: u32, alpha: f32) -> Hsla {
 
 pub fn dark() -> Palette {
     Palette {
-        bg: hex(0x161718),
-        panel: hex(0x1b1c1e),
-        elevated: hex(0x212225),
-        hover: hex(0x26282b),
-        selected: hex(0x2c2f34),
-        border: hex(0x2a2c30),
-        border_strong: hex(0x383b40),
+        canvas: hex(0x101112),
+        bg: hex(0x18191b),
+        panel: hex(0x101112),
+        elevated: hex(0x1f2023),
+        hover: hex(0x232427),
+        selected: hex(0x2a2b2f),
+        border: hex(0x26272a),
+        border_strong: hex(0x34363a),
         text: hex(0xe6e7e9),
         text_muted: hex(0xa1a5ab),
         text_faint: hex(0x6d7177),
@@ -73,16 +78,17 @@ pub fn dark() -> Palette {
 
 pub fn light() -> Palette {
     Palette {
+        canvas: hex(0xf4f4f5),
         bg: hex(0xffffff),
-        panel: hex(0xf7f7f8),
+        panel: hex(0xf4f4f5),
         elevated: hex(0xffffff),
-        hover: hex(0xefeff1),
-        selected: hex(0xe6e7ea),
-        border: hex(0xe4e5e8),
-        border_strong: hex(0xd3d5d9),
-        text: hex(0x1b1c1f),
-        text_muted: hex(0x5d6168),
-        text_faint: hex(0x989ca3),
+        hover: hex(0xeaeaec),
+        selected: hex(0xe3e3e6),
+        border: hex(0xe6e6e9),
+        border_strong: hex(0xd6d6da),
+        text: hex(0x1f2023),
+        text_muted: hex(0x5f6168),
+        text_faint: hex(0x8f9299),
         accent: hex(0x4e66e8),
         accent_soft: hexa(0x4e66e8, 0.12),
         accent_text: hex(0x3b52d1),
@@ -97,13 +103,156 @@ pub fn light() -> Palette {
     }
 }
 
+/// Light, dark, or follow the OS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppearancePref {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+/// Accent hues offered by the Appearance setting.
+#[allow(dead_code)] // Picked by the Appearance setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Accent {
+    #[default]
+    Indigo,
+    Blue,
+    Violet,
+    Green,
+    Orange,
+    Pink,
+}
+
+#[allow(dead_code)] // Read by the Appearance setting.
+impl Accent {
+    pub const ALL: [Accent; 6] = [
+        Accent::Indigo,
+        Accent::Blue,
+        Accent::Violet,
+        Accent::Green,
+        Accent::Orange,
+        Accent::Pink,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Accent::Indigo => "Indigo",
+            Accent::Blue => "Blue",
+            Accent::Violet => "Violet",
+            Accent::Green => "Green",
+            Accent::Orange => "Orange",
+            Accent::Pink => "Pink",
+        }
+    }
+
+    /// (accent, accent_text) for the given appearance.
+    pub fn colors(self, dark: bool) -> (Hsla, Hsla) {
+        let (light_hex, dark_hex) = match self {
+            Accent::Indigo => (0x5e6ad2, 0x8b95f0),
+            Accent::Blue => (0x2f6fde, 0x6ea0ff),
+            Accent::Violet => (0x8b4fd6, 0xb38cf2),
+            Accent::Green => (0x1f8f5a, 0x4cc38a),
+            Accent::Orange => (0xd2691e, 0xf0a05a),
+            Accent::Pink => (0xd1427f, 0xf07aab),
+        };
+        if dark {
+            (hex(dark_hex), hex(dark_hex))
+        } else {
+            (hex(light_hex), hex(light_hex))
+        }
+    }
+}
+
+/// User-facing theme preferences. Store it with [`set_prefs`]; every
+/// [`palette`] read reflects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ThemePrefs {
+    pub appearance: AppearancePref,
+    pub accent: Accent,
+}
+
+impl Global for ThemePrefs {}
+
+/// Current preferences (defaults when never set).
+pub fn prefs(cx: &App) -> ThemePrefs {
+    cx.try_global::<ThemePrefs>().copied().unwrap_or_default()
+}
+
+/// Store preferences and re-apply the theme. `os` is the window's current
+/// appearance, used when the preference is [`AppearancePref::System`].
+pub fn set_prefs(prefs: ThemePrefs, os: WindowAppearance, cx: &mut App) {
+    cx.set_global(prefs);
+    apply(resolve_mode(prefs.appearance, os), cx);
+    cx.refresh_windows();
+}
+
+/// The mode a preference resolves to under the given OS appearance.
+pub fn resolve_mode(pref: AppearancePref, os: WindowAppearance) -> ThemeMode {
+    match pref {
+        AppearancePref::System => mode_for(os),
+        AppearancePref::Light => ThemeMode::Light,
+        AppearancePref::Dark => ThemeMode::Dark,
+    }
+}
+
+fn with_accent(mut p: Palette, accent: Accent, dark: bool) -> Palette {
+    let (a, text) = accent.colors(dark);
+    p.accent = a;
+    p.accent_text = text;
+    p.accent_soft = a.opacity(if dark { 0.16 } else { 0.12 });
+    p.diff_hunk_bg = a.opacity(if dark { 0.08 } else { 0.06 });
+    p
+}
+
+/// Palette for a mode with the stored accent.
+pub fn palette_for(mode: ThemeMode, cx: &App) -> Palette {
+    let is_dark = mode.is_dark();
+    let base = if is_dark { dark() } else { light() };
+    with_accent(base, prefs(cx).accent, is_dark)
+}
+
 /// Palette for the active appearance.
 pub fn palette(cx: &App) -> Palette {
-    if cx.theme().is_dark() {
-        dark()
-    } else {
-        light()
-    }
+    palette_for(
+        if cx.theme().is_dark() {
+            ThemeMode::Dark
+        } else {
+            ThemeMode::Light
+        },
+        cx,
+    )
+}
+
+#[allow(dead_code)] // Shared building block for label chips.
+/// A small rounded label chip with a colored dot (issue-label style).
+pub fn pill(label: impl Into<SharedString>, color: Hsla, p: &Palette) -> Div {
+    h_flex()
+        .flex_shrink_0()
+        .h(px(20.))
+        .px(sp(2.))
+        .gap(sp(1.5))
+        .items_center()
+        .rounded_full()
+        .border_1()
+        .border_color(p.border_strong)
+        .bg(p.bg)
+        .text_size(text_xs())
+        .text_color(p.text_muted)
+        .child(div().size(px(6.)).rounded_full().bg(color))
+        .child(label.into())
+}
+
+#[allow(dead_code)] // Shared building block for list ids.
+/// A compact mono identifier (thread ids, short hashes).
+pub fn mono_id(id: impl Into<SharedString>, p: &Palette) -> Div {
+    div()
+        .flex_shrink_0()
+        .font_family(MONO_FONT)
+        .text_size(text_xs())
+        .text_color(p.text_faint)
+        .child(id.into())
 }
 
 // Type. UI chrome uses the system face at small sizes; transcript prose is
@@ -143,10 +292,22 @@ pub fn radius() -> Pixels {
 pub fn radius_lg() -> Pixels {
     px(10.)
 }
+/// Corner radius of the main content card.
+pub fn radius_card() -> Pixels {
+    px(8.)
+}
+/// Gap between the window edge / sidebar and the content card.
+pub fn card_inset() -> Pixels {
+    px(8.)
+}
+/// Height of list rows (sidebar nav, thread list).
+pub fn row_height() -> Pixels {
+    px(28.)
+}
 
 // Layout.
 pub fn sidebar_width() -> Pixels {
-    px(264.)
+    px(240.)
 }
 pub fn drawer_width() -> Pixels {
     px(440.)
@@ -164,7 +325,7 @@ pub fn status_bar_height() -> Pixels {
 /// Switch appearance and restyle the Kit theme from the palette.
 pub fn apply(mode: ThemeMode, cx: &mut App) {
     Theme::change(mode, None, cx);
-    let p = if mode.is_dark() { dark() } else { light() };
+    let p = palette_for(mode, cx);
     Theme::update(cx, |theme| {
         theme.radius = radius();
         theme.radius_lg = radius_lg();
@@ -250,5 +411,28 @@ pub fn ansi(n: u8, p: &Palette) -> Hsla {
             bright
         }
         _ => base,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appearance_pref_resolves_against_the_os() {
+        assert!(resolve_mode(AppearancePref::System, WindowAppearance::Dark).is_dark());
+        assert!(!resolve_mode(AppearancePref::System, WindowAppearance::Light).is_dark());
+        assert!(resolve_mode(AppearancePref::Dark, WindowAppearance::Light).is_dark());
+        assert!(!resolve_mode(AppearancePref::Light, WindowAppearance::Dark).is_dark());
+    }
+
+    #[test]
+    fn accent_overrides_only_accent_tokens() {
+        let base = light();
+        let tinted = with_accent(base, Accent::Green, false);
+        assert_eq!(tinted.accent, Accent::Green.colors(false).0);
+        assert_eq!(tinted.bg, base.bg);
+        assert_eq!(tinted.text, base.text);
+        assert_eq!(Accent::ALL.len(), 6);
     }
 }
