@@ -662,6 +662,11 @@ impl SidebarPanel {
             )
             .children(subagent)
             .child(div().flex_1().min_w_0().truncate().child(title))
+            .child(
+                div()
+                    .group_hover(group.clone(), |style| style.opacity(0.))
+                    .child(theme::mono_id(theme::short_id(&id.to_string()), p)),
+            )
             .when_some(marker, |this, marker| {
                 let tooltip: SharedString = format!("Nested {marker} levels deep").into();
                 this.child(

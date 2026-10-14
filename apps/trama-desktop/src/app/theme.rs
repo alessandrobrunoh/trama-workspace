@@ -244,7 +244,13 @@ pub fn pill(label: impl Into<SharedString>, color: Hsla, p: &Palette) -> Div {
         .child(label.into())
 }
 
-#[allow(dead_code)] // Shared building block for list ids.
+/// Short form of an id for dense lists: the last 6 characters (ULIDs
+/// start with a timestamp, so their tail is what tells them apart).
+pub fn short_id(id: &str) -> String {
+    let chars: Vec<char> = id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    chars[chars.len().saturating_sub(6)..].iter().collect()
+}
+
 /// A compact mono identifier (thread ids, short hashes).
 pub fn mono_id(id: impl Into<SharedString>, p: &Palette) -> Div {
     div()
@@ -338,7 +344,7 @@ pub fn apply(mode: ThemeMode, cx: &mut App) {
         theme.radius = radius();
         theme.radius_lg = radius_lg();
         theme.mono_font_family = MONO_FONT.into();
-        theme.shadow = false;
+        theme.shadow = true;
         theme.font_size = text_ui();
 
         let c = &mut theme.colors;
@@ -366,6 +372,12 @@ pub fn apply(mode: ThemeMode, cx: &mut App) {
         c.secondary_active = p.selected;
         c.secondary_foreground = p.text;
         c.popover = p.elevated;
+        // Dialogs: a light scrim so the card behind stays readable.
+        c.overlay = if mode.is_dark() {
+            hsla(0., 0., 0., 0.45)
+        } else {
+            hsla(240. / 360., 0.1, 0.1, 0.18)
+        };
         c.popover_foreground = p.text;
         c.list = p.elevated;
         c.list_hover = p.hover;
@@ -427,6 +439,12 @@ mod tests {
     use super::*;
     // `gpui_kit::*` brings GPUI's own `test` attribute into scope.
     use core::prelude::v1::test;
+
+    #[test]
+    fn short_id_keeps_the_random_tail() {
+        assert_eq!(short_id("01JZ8QK3M4ABCDEF"), "ABCDEF");
+        assert_eq!(short_id("abc"), "abc");
+    }
 
     #[test]
     fn appearance_pref_resolves_against_the_os() {
