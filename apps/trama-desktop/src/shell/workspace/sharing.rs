@@ -470,6 +470,14 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Open the drawer on `tab` (header chips).
+    pub(super) fn show_drawer_tab(&mut self, tab: DrawerTab, cx: &mut Context<Self>) {
+        self.drawer_tab = tab;
+        self.drawer_open = true;
+        self.refresh_changes(cx);
+        cx.notify();
+    }
+
     pub(super) fn toggle_drawer(&mut self, cx: &mut Context<Self>) {
         self.drawer_open = !self.drawer_open;
         self.refresh_changes(cx);

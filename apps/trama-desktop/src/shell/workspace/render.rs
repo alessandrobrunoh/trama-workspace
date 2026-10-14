@@ -79,6 +79,7 @@ impl Render for Workspace {
         let center = if online {
             v_flex()
                 .size_full()
+                .child(self.render_card_header(cx))
                 .child(self.subthread_bar.clone())
                 .child(div().flex_1().min_h_0().child(self.chat.clone()))
                 .into_any_element()

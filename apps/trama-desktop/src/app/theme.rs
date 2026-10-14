@@ -318,6 +318,14 @@ pub fn transcript_width() -> Pixels {
 pub fn title_bar_height() -> Pixels {
     px(38.)
 }
+/// Height of the header at the top of the content card.
+pub fn card_header_height() -> Pixels {
+    px(40.)
+}
+/// Room left of the title bar content for the macOS traffic lights.
+pub fn traffic_light_inset() -> Pixels {
+    px(80.)
+}
 pub fn status_bar_height() -> Pixels {
     px(24.)
 }
