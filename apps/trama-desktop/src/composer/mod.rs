@@ -94,7 +94,7 @@ impl Composer {
     pub fn new(window: &mut Window, cx: &mut App) -> Self {
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("Ask the agent to do something…")
+                .placeholder("Write the next message…")
                 .rows(3)
                 .submit_on_enter(true)
         });
@@ -229,8 +229,7 @@ impl Composer {
         });
         let footer_row = h_flex()
             .w_full()
-            .px(theme::sp(1.5))
-            .pb(theme::sp(1.5))
+            .ml(px(-8.))
             .gap(theme::sp(1.))
             .items_center()
             .children(footer.tools)
@@ -351,19 +350,17 @@ impl Composer {
                 )
             });
 
+        // Inline block of the transcript document: no card chrome, the
+        // text sits in the prose column and the controls stay quiet until
+        // the composer has focus.
         v_flex()
             .w_full()
-            .rounded(theme::radius_lg())
-            .border_1()
-            .border_color(if focused { p.border_strong } else { p.border })
-            .bg(p.elevated)
             .when(!footer.header.is_empty(), |this| {
                 this.child(
                     h_flex()
                         .w_full()
                         .flex_wrap()
-                        .px(theme::sp(2.5))
-                        .pt(theme::sp(2.))
+                        .pb(theme::sp(1.5))
                         .gap(theme::sp(1.5))
                         .children(footer.header),
                 )
@@ -371,17 +368,24 @@ impl Composer {
             .child(
                 div()
                     .w_full()
-                    .px(theme::sp(1.))
-                    .pt(theme::sp(1.))
+                    .mt(px(-4.))
                     .text_size(theme::text_prose())
                     .child(
                         Textarea::new(&self.input)
                             .appearance(false)
-                            .h(px(64.))
+                            .h(px(44.))
                             .token(mentions::render_token),
                     ),
             )
-            .child(footer_row)
+            .child(
+                div()
+                    .w_full()
+                    .pt(theme::sp(1.))
+                    .border_t_1()
+                    .border_color(if focused { p.border } else { p.bg })
+                    .opacity(if focused || running { 1. } else { 0.6 })
+                    .child(footer_row),
+            )
     }
 }
 

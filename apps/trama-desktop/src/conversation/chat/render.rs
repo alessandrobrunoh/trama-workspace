@@ -263,6 +263,60 @@ impl Render for ChatPanel {
             ));
         }
 
+        let session_model = self.model.clone();
+        self.model_picker
+            .update(cx, |picker, _| picker.session_model = session_model);
+        let (composer_tools, composer_header) = self.composer_extras(&p, cx);
+        let footer = ComposerFooter {
+            model: self.model.clone(),
+            status_label: self.status_pill(&p).0,
+            status_color: self.status_pill(&p).1,
+            usage: self.usage.clone(),
+            cost_usd_micros: self.cost_usd_micros,
+            turns: self.turns,
+            billing: self.session_info.as_ref().map(billing_badge),
+            model_picker: (uses_daemon && !self.pane_mode)
+                .then(|| self.model_picker.clone().into_any_element()),
+            tools: composer_tools,
+            header: composer_header,
+        };
+        let terminals_open = uses_daemon && !self.pane_mode && self.terminals.read(cx).is_open();
+        let strip = if show_composer && uses_daemon {
+            self.pending_strip(&card_ctx.groups, &p, cx)
+        } else {
+            None
+        };
+        let live_drafts = crate::collab::presence::drafts_block(&p, &shared.drafts);
+        let shared_footer = (shared.linked && !shared.revoked)
+            .then(|| crate::collab::presence::shared_footer(&p, shared.runner_online));
+
+        // The composer is the next block of the document: right under the
+        // last output, with the user's avatar in the gutter, scrolling with
+        // the transcript instead of sitting pinned to the bottom.
+        if show_composer {
+            let block = v_flex()
+                .w_full()
+                .children(live_drafts)
+                .children(strip)
+                .when(terminals_open, |this| this.child(self.terminals.clone()))
+                .child(
+                    self.composer_key_handlers(div().w_full(), cx)
+                        .child(self.composer.render(
+                            running,
+                            stoppable,
+                            footer,
+                            cx.listener(|this, _, window, cx| this.submit(window, cx)),
+                            cx.listener(|this, _, _, cx| this.stop(cx)),
+                            window,
+                            cx,
+                        )),
+                )
+                .child(self.popup.clone())
+                .children(shared_footer);
+            let avatar = self.avatar(&AuthorKey::Me, card_ctx.me.as_deref(), rows.len(), &p);
+            rows.push(doc_row(Some(avatar), block.into_any_element(), pad));
+        }
+
         let row_count = rows.len();
         let transcript = v_flex()
             .id("chat-messages")
@@ -272,7 +326,7 @@ impl Render for ChatPanel {
             .track_scroll(&self.scroll)
             .track_focus(&self.doc_focus)
             .pt(theme::sp(8.))
-            .pb(theme::sp(6.))
+            .pb(theme::sp(24.))
             .gap(theme::sp(2.))
             .on_mouse_down(
                 MouseButton::Left,
@@ -387,33 +441,6 @@ impl Render for ChatPanel {
                 .with_priority(1)
             });
 
-        let session_model = self.model.clone();
-        self.model_picker
-            .update(cx, |picker, _| picker.session_model = session_model);
-        let (composer_tools, composer_header) = self.composer_extras(&p, cx);
-        let footer = ComposerFooter {
-            model: self.model.clone(),
-            status_label: self.status_pill(&p).0,
-            status_color: self.status_pill(&p).1,
-            usage: self.usage.clone(),
-            cost_usd_micros: self.cost_usd_micros,
-            turns: self.turns,
-            billing: self.session_info.as_ref().map(billing_badge),
-            model_picker: (uses_daemon && !self.pane_mode)
-                .then(|| self.model_picker.clone().into_any_element()),
-            tools: composer_tools,
-            header: composer_header,
-        };
-        let terminals_open = uses_daemon && !self.pane_mode && self.terminals.read(cx).is_open();
-        let strip = if show_composer && uses_daemon {
-            self.pending_strip(&card_ctx.groups, &p, cx)
-        } else {
-            None
-        };
-        let live_drafts = crate::collab::presence::drafts_block(&p, &shared.drafts);
-        let shared_footer = (shared.linked && !shared.revoked)
-            .then(|| crate::collab::presence::shared_footer(&p, shared.runner_online));
-
         v_flex()
             .size_full()
             .bg(p.bg)
@@ -432,33 +459,6 @@ impl Render for ChatPanel {
             )
             .children(rail_card)
             .children(floating)
-            .when(show_composer, |this| {
-                this.child(
-                    h_flex().w_full().justify_center().child(
-                        v_flex()
-                            .w_full()
-                            .max_w(theme::transcript_width())
-                            .px(theme::sp(6.))
-                            .pb(theme::sp(4.))
-                            .children(live_drafts)
-                            .children(strip)
-                            .when(terminals_open, |this| this.child(self.terminals.clone()))
-                            .child(self.composer_key_handlers(div().w_full(), cx).child(
-                                self.composer.render(
-                                    running,
-                                    stoppable,
-                                    footer,
-                                    cx.listener(|this, _, window, cx| this.submit(window, cx)),
-                                    cx.listener(|this, _, _, cx| this.stop(cx)),
-                                    window,
-                                    cx,
-                                ),
-                            ))
-                            .child(self.popup.clone())
-                            .children(shared_footer),
-                    ),
-                )
-            })
     }
 }
 
