@@ -70,6 +70,8 @@ TramaWorkspace does not ship an agent and does not call the Anthropic API itself
 - **No credential handling.** TramaWorkspace never reads, stores or proxies your Claude.ai login or tokens.
 - **Everyone uses their own Claude.** In a shared thread, a turn always runs on the machine of the person who pressed Send, with that person's own `claude` login. The collaboration service replicates the conversation; it never forwards one person's prompt into another person's Claude session, and a runner can only claim its own user's turns.
 
+**Other models (chat only).** In Settings > Providers you can add OpenAI or any OpenAI-compatible server: OpenRouter, Groq, Ollama, LM Studio and others. Then pick one of their models for a thread in the model picker. These turns are plain chat. They run no tools, read or edit no files and start no subagents; agent features stay with Claude Code. API keys are kept in the OS keychain, and those turns are billed only to the keys you add. See [ADR 0015](docs/adr/0015-model-providers.md).
+
 Usage rules can change. Check Anthropic's terms for your plan; this README is not legal advice.
 
 ## Quick start
@@ -214,6 +216,7 @@ Invariants every change keeps:
 | [0012](docs/adr/0012-copy-on-write-checkouts.md) | Copy-on-write checkouts, disk usage and archiving |
 | [0013](docs/adr/0013-shared-history-and-family.md) | Sharing a thread's full history and family |
 | [0014](docs/adr/0014-vps-deployment.md) | Running the collaboration service on a VPS: proxy trust and TLS client policy |
+| [0015](docs/adr/0015-model-providers.md) | Model providers (OpenAI-compatible chat) and the Settings area |
 
 ## Roadmap
 
