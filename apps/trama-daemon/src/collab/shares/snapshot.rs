@@ -287,7 +287,7 @@ impl CollabService {
         crate::log::warn(format!("share {share_id}: {message}"));
         let _ = self
             .db()
-            .set_collab_setting(&format!("share_content_warning:{share_id}"), &message)
+            .add_share_warning(share_id, "content_skipped", &message)
             .await;
         let root = rows
             .iter()
