@@ -41,7 +41,7 @@ Requisito trasversale aggiunto: l'app deve essere **cross-platform**
 | M2 | Full-workspace builds on Linux/Windows/macOS; `trama-ipc` (Unix sockets / Windows named pipes); ConPTY terminals on Windows; per-OS data dir; `dunce` paths; CI on 3 OSes | done |
 | Restructure | Codebase grouped into area modules, large files split, transitional re-exports removed ([restructure.md](restructure.md)) | done |
 | M3 | Repository DB `trama-db::share`, manifest firmato (`SignedEnvelope`), protocollo vNext/discovery | fatto |
-| M4 | Trasporto, E2EE MLS/openmls (dopo security review), wizard Share/Join | in corso: trasporto `/v3` (eventi, stream, manifest CAS, lease) fatto |
+| M4 | Trasporto, E2EE MLS/openmls (dopo security review), wizard Share/Join | in corso: trasporto `/v3`, MLS, Share/Join, history (anche pre-share), revoca, retry durevole, binding chiavi di firma, oggetti cifrati, contenuto dei checkout con restore come checkout gestito del thread, stato/warning degli share (protocollo 18) fatti; mancano security review, rotazione key package, formato link/invito vNext |
 
 ## Decisioni M3 (DB share e manifest firmati)
 
@@ -107,3 +107,10 @@ Scelte conservative prese dove la spec lascia aperto:
 - "Take lease" sits under not-shared messages only. It is offered when `GetThreadShare` reports a share and the lease is free or held by someone else. It sends `AcquireShareLease` with the default TTL, and the daemon arbitrates. If it fails, the reason shows inline.
 - `GetShareStatus` is asked for after `ThreadShare` (selected thread), `ShareCreated`/`ShareJoined` and a `content_skipped` warning. Warnings ("Published without code: …") and restore failures show as transcript banners of the thread. The owner wizard does not repeat them.
 - "Retry restore" is shown only when `restore` is `failed`, and only one request runs at a time. A `ShareFailed{retry_share_restore}` is shown inline next to the restore error and its follow-up `Error` toast is swallowed.
+
+## Decisioni M4j (checkout ripristinato come checkout del thread, stato share)
+
+- **Checkout reale del joiner**: lo staging ripristinato diventa un repository registrato (`local_path` = staging, `canonical_remote` = `origin_hint`, branch di default = branch del manifest), membro del workspace del thread con `default_enabled = false` (i nuovi thread non lo ricevono). Lo staging viene riportato a `HEAD` pulito, se ne crea un checkout gestito repo-local (`.trama/worktrees/<thread>/<checkout>`, come per ogni thread) e lo stato catturato (index e working tree) viene ripristinato lì da un bundle locale completo dei ref di share, con la stessa verifica byte per byte. L'allegato è `Isolated` con base = HEAD condiviso, quindi i turni dell'agente girano nel checkout ripristinato. Riprovare non sostituisce mai un checkout già allegato (`share_checkout:<share>:<thread_gid>:<repo_gid>`).
+- **Cache del content manifest**: come per la history, il content manifest decifrato è sigillato a riposo (`content:<share>`, per versione): un messaggio MLS si decifra una sola volta e senza cache il retry fallirebbe.
+- **Stato share** (protocollo 18): `GetShareStatus{share_id}` → `ShareStatusReport{restore: not_requested|no_content|restored|failed, restore_error, checkouts, warnings}`. Lo stato del restore è in `share_restore:<share>`; i warning in `share_warnings` (migrazione 0016, ultimi 50, più recenti prima). Oggi l'unico warning è `content_skipped`.
+- **RetryShareRestore**: solo per un joiner con `read_code` (l'owner riceve `invalid`); riverifica l'ultimo snapshot, ripristina e allega ciò che manca e risponde con `ShareStatusReport`. Nessun retry automatico.
