@@ -376,7 +376,7 @@ impl Composer {
                     .child(
                         Textarea::new(&self.input)
                             .appearance(false)
-                            .h(px(44.))
+                            .h(px(input_height(&self.input.read(cx).value())))
                             .token(mentions::render_token),
                     ),
             )
@@ -390,6 +390,19 @@ impl Composer {
                     .child(footer_row),
             )
     }
+}
+
+/// Composer height for `text`: grows a line at a time with the content,
+/// between two and twelve lines.
+pub fn input_height(text: &str) -> f32 {
+    const LINE: f32 = 21.;
+    let mut lines = text.split('\n').count().max(1);
+    // Long lines wrap at roughly 90 characters in the prose column.
+    lines += text
+        .split('\n')
+        .map(|line| line.chars().count() / 90)
+        .sum::<usize>();
+    (lines.clamp(2, 12) as f32) * LINE + 2.
 }
 
 pub fn format_tokens(n: u64) -> String {
@@ -413,7 +426,19 @@ pub fn format_cost(micros: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BillingBadge, BillingSource, format_cost, format_tokens};
+    use super::{BillingBadge, BillingSource, format_cost, format_tokens, input_height};
+
+    #[test]
+    fn composer_grows_with_its_lines() {
+        let two = input_height("");
+        assert_eq!(two, input_height("one line"));
+        assert!(input_height("a\nb\nc") > two);
+        assert_eq!(
+            input_height(&"x\n".repeat(50)),
+            input_height(&"x\n".repeat(11))
+        );
+        assert!(input_height(&"word ".repeat(40)) > two);
+    }
 
     #[test]
     fn api_key_billing_warns_and_explains_itself() {
