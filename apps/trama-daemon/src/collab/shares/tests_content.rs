@@ -163,7 +163,9 @@ async fn joiner_restores_the_owner_checkout_exactly() {
     );
     // The restored checkout is the thread's real (managed) checkout.
     let dst = checkout_of(&bob, &bob_root).await;
-    assert!(dst.starts_with(bob.app_dir().join("share-checkouts")));
+    // Stored paths are canonical (`/private/var` on macOS).
+    let base = dunce::canonicalize(bob.app_dir().join("share-checkouts")).unwrap();
+    assert!(dunce::canonicalize(&dst).unwrap().starts_with(&base));
     assert_eq!(
         out(&dst, &["rev-parse", "HEAD"]),
         out(&src, &["rev-parse", "HEAD"])

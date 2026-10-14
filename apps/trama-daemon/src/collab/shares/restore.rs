@@ -1,6 +1,6 @@
 //! Joiner restore of shared checkouts (docs/plan/04 §restore). Each
 //! checkout in the verified content manifest is materialized in its own
-//! staging repository under `<app dir>/share-checkouts/<share>/`: a fresh
+//! staging repository under `<app dir>/share-checkouts/<16 hex>/`: a fresh
 //! repository with the manifest's object format, filled from the
 //! `origin_hint` with the user's own Git credentials when there is one
 //! (the bundle then omits objects origin already has), otherwise from the
@@ -27,16 +27,15 @@ use super::super::transport::ShareClient;
 use super::snapshot::VerifiedSnapshot;
 use crate::error::{DaemonError, Result};
 
-/// One path component from an id: never a separator or `..`.
-fn component(id: &str) -> String {
-    id.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
+/// Short, stable staging directory name: managed checkouts nest under it
+/// (`.trama/worktrees/<thread>/<checkout>`), so long ids would overflow
+/// Windows' 260-character path limit.
+fn staging_name(share_id: &str, thread_gid: &str, repo_gid: &str, generation: u64) -> String {
+    let key = format!("{share_id}\n{thread_gid}\n{repo_gid}\n{generation}");
+    let digest = ring::digest::digest(&ring::digest::SHA256, key.as_bytes());
+    digest.as_ref()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
         .collect()
 }
 
@@ -86,7 +85,7 @@ impl CollabService {
         let root = self
             .credentials_path()?
             .parent()
-            .map(|p| p.join("share-checkouts").join(component(share_id)))
+            .map(|p| p.join("share-checkouts"))
             .ok_or_else(|| DaemonError::Invalid("no app directory".into()))?;
         let threads = self.db().share_threads(&ShareId::from(share_id)).await?;
         let mut restored = Vec::new();
@@ -98,10 +97,11 @@ impl CollabService {
                 .and_then(|r| r.local_thread_id.clone())
                 .map(ThreadId::from)
                 .ok_or_else(|| collab("checkout for an unmapped thread"))?;
-            let dir = root.join(component(&co.thread_gid.0)).join(format!(
-                "{}-v{}",
-                component(&co.repo_gid.0),
-                co.generation
+            let dir = root.join(staging_name(
+                share_id,
+                &co.thread_gid.0,
+                &co.repo_gid.0,
+                co.generation,
             ));
             let key = checkout_key(share_id, &co.thread_gid.0, &co.repo_gid.0);
             let attached = self.db().collab_setting_or_insert(&key, "").await?;
