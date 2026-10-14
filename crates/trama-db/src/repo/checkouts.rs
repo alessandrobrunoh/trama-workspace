@@ -63,6 +63,39 @@ impl TramaDb {
     }
 }
 
+impl TramaDb {
+    /// Attaches a repository checkout to an existing thread (e.g. a
+    /// restored share checkout). Fails if the thread already has that
+    /// repository attached.
+    pub async fn attach_thread_checkout(
+        &self,
+        thread_id: &ThreadId,
+        attachment: ThreadRepositoryAttachment,
+        location: CheckoutLocation,
+    ) -> Result<()> {
+        let thread = thread_id.to_string();
+        self.blocking_mut(move |conn| {
+            let tx = conn.transaction().map_err(sql_err)?;
+            tx.execute(
+                "INSERT INTO thread_repositories
+                    (thread_id, repository_id, base_revision, checkout_id, attach_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    thread,
+                    attachment.repository_id.to_string(),
+                    attachment.base_revision,
+                    attachment.checkout_id.as_ref().map(|id| id.to_string()),
+                    crate::codec::enum_text(&attachment.attach_mode)?,
+                ],
+            )
+            .map_err(sql_err)?;
+            insert_locations(&tx, &thread, &[attachment], &[location])?;
+            tx.commit().map_err(sql_err)
+        })
+        .await
+    }
+}
+
 pub(crate) fn insert_locations(
     tx: &Transaction<'_>,
     thread_id: &str,

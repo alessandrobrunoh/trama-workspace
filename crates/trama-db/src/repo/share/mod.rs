@@ -12,6 +12,7 @@ mod servers;
 mod shares;
 mod states;
 mod threads;
+mod warnings;
 
 #[cfg(test)]
 mod tests;
@@ -25,6 +26,7 @@ pub use servers::CollaborationServerRow;
 pub use shares::{ShareRow, ShareStatus};
 pub use states::{ShareMessageState, SharePendingOp};
 pub use threads::ShareThreadRow;
+pub use warnings::ShareWarningRow;
 
 use trama_domain::DomainError;
 

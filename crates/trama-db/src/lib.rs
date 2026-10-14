@@ -26,6 +26,7 @@ pub use repo::composer::AgentCommands;
 pub use repo::share::{
     CollaborationServerRow, ObjectState, ShareCheckoutStateRow, ShareDeviceHead, ShareMessageState,
     ShareObjectRow, SharePeerAck, SharePendingOp, ShareRow, ShareStatus, ShareThreadRow,
+    ShareWarningRow,
 };
 pub use repo::subthreads::{ReviewVerdictRecord, SubthreadFork};
 pub use store::TramaDb;
